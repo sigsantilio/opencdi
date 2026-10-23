@@ -8,7 +8,30 @@ pub const RETRO_API_VERSION: c_uint = 1;
 pub const RETRO_DEVICE_NONE: c_uint = 0;
 pub const RETRO_DEVICE_JOYPAD: c_uint = 1;
 pub const RETRO_DEVICE_MOUSE: c_uint = 2;
+pub const RETRO_DEVICE_ANALOG: c_uint = 5;
 pub const RETRO_DEVICE_POINTER: c_uint = 6;
+
+pub const RETRO_DEVICE_ID_JOYPAD_B: c_uint = 0;
+pub const RETRO_DEVICE_ID_JOYPAD_Y: c_uint = 1;
+pub const RETRO_DEVICE_ID_JOYPAD_UP: c_uint = 4;
+pub const RETRO_DEVICE_ID_JOYPAD_DOWN: c_uint = 5;
+pub const RETRO_DEVICE_ID_JOYPAD_LEFT: c_uint = 6;
+pub const RETRO_DEVICE_ID_JOYPAD_RIGHT: c_uint = 7;
+pub const RETRO_DEVICE_ID_JOYPAD_A: c_uint = 8;
+
+pub const RETRO_DEVICE_INDEX_ANALOG_LEFT: c_uint = 0;
+pub const RETRO_DEVICE_ID_ANALOG_X: c_uint = 0;
+pub const RETRO_DEVICE_ID_ANALOG_Y: c_uint = 1;
+
+pub const RETRO_DEVICE_ID_MOUSE_X: c_uint = 0;
+pub const RETRO_DEVICE_ID_MOUSE_Y: c_uint = 1;
+pub const RETRO_DEVICE_ID_MOUSE_LEFT: c_uint = 2;
+pub const RETRO_DEVICE_ID_MOUSE_RIGHT: c_uint = 3;
+pub const RETRO_DEVICE_ID_MOUSE_MIDDLE: c_uint = 6;
+
+pub const RETRO_DEVICE_ID_POINTER_X: c_uint = 0;
+pub const RETRO_DEVICE_ID_POINTER_Y: c_uint = 1;
+pub const RETRO_DEVICE_ID_POINTER_PRESSED: c_uint = 2;
 
 pub const RETRO_REGION_NTSC: c_uint = 0;
 pub const RETRO_REGION_PAL: c_uint = 1;
@@ -20,8 +43,10 @@ pub const RETRO_MEMORY_VIDEO_RAM: c_uint = 3;
 
 pub const RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY: c_uint = 9;
 pub const RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: c_uint = 10;
+pub const RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS: c_uint = 11;
 pub const RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME: c_uint = 18;
 pub const RETRO_ENVIRONMENT_GET_LOG_INTERFACE: c_uint = 27;
+pub const RETRO_ENVIRONMENT_SET_CONTROLLER_INFO: c_uint = 35;
 
 pub const RETRO_LOG_DEBUG: c_uint = 0;
 pub const RETRO_LOG_INFO: c_uint = 1;
@@ -83,6 +108,27 @@ pub struct retro_log_callback {
     pub log: retro_log_printf_t,
 }
 
+#[repr(C)]
+pub struct retro_input_descriptor {
+    pub port: c_uint,
+    pub device: c_uint,
+    pub index: c_uint,
+    pub id: c_uint,
+    pub description: *const c_char,
+}
+
+#[repr(C)]
+pub struct retro_controller_description {
+    pub desc: *const c_char,
+    pub id: c_uint,
+}
+
+#[repr(C)]
+pub struct retro_controller_info {
+    pub types: *const retro_controller_description,
+    pub num_types: c_uint,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +176,22 @@ mod tests {
         assert_eq!(align_of::<retro_system_av_info>(), a);
         #[cfg(target_arch = "x86_64")]
         assert_eq!(size_of::<retro_system_av_info>(), 40);
+    }
+
+    #[test]
+    fn input_descriptor_layout() {
+        assert_eq!(offset_of!(retro_input_descriptor, id), 12);
+        assert_eq!(offset_of!(retro_input_descriptor, description), 16usize.div_ceil(P) * P);
+        assert_eq!(size_of::<retro_input_descriptor>(), 16usize.div_ceil(P) * P + P);
+        assert_eq!(align_of::<retro_input_descriptor>(), P.max(4));
+    }
+
+    #[test]
+    fn controller_info_layout() {
+        assert_eq!(offset_of!(retro_controller_description, id), P);
+        assert_eq!(size_of::<retro_controller_description>(), 2 * P);
+        assert_eq!(offset_of!(retro_controller_info, num_types), P);
+        assert_eq!(size_of::<retro_controller_info>(), 2 * P);
     }
 
     #[test]

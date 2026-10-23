@@ -1,5 +1,7 @@
+mod input;
 pub mod libretro;
 
+use input::Input;
 use libretro::*;
 use opencdi::machine::Machine;
 use opencdi::mcd212::{VideoMode, SCREEN_HEIGHT, SCREEN_WIDTH};
@@ -37,6 +39,7 @@ struct Core {
     mix: Vec<(f32, f32)>,
     sfx: Vec<(f32, f32)>,
     pcm: Vec<i16>,
+    input: Input,
 }
 
 static CALLBACKS: Mutex<Callbacks> = Mutex::new(Callbacks {
@@ -54,6 +57,7 @@ static CORE: Mutex<Core> = Mutex::new(Core {
     mix: Vec::new(),
     sfx: Vec::new(),
     pcm: Vec::new(),
+    input: Input::new(),
 });
 static LOG: Mutex<retro_log_printf_t> = Mutex::new(None);
 static POISONED: AtomicBool = AtomicBool::new(false);
@@ -199,6 +203,8 @@ pub extern "C" fn retro_set_environment(cb: retro_environment_t) {
         // SAFETY: GET_LOG_INTERFACE fills a `retro_log_callback`.
         let ok = unsafe { env_call(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &mut lcb as *mut _ as *mut c_void) };
         *lock(&LOG) = if ok { lcb.log } else { None };
+        // SAFETY: SET_CONTROLLER_INFO reads a terminated `retro_controller_info` array; it is static.
+        unsafe { env_call(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, input::CONTROLLER_INFO.0.as_ptr() as *mut c_void) };
     })
 }
 
@@ -283,8 +289,14 @@ pub unsafe extern "C" fn retro_get_system_av_info(info: *mut retro_system_av_inf
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn retro_set_controller_port_device(_port: c_uint, _device: c_uint) {
-    guard("retro_set_controller_port_device", (), true, || {})
+pub extern "C" fn retro_set_controller_port_device(port: c_uint, device: c_uint) {
+    guard("retro_set_controller_port_device", (), true, || {
+        if port == 0 && input::supported(device) {
+            lock(&CORE).input.device = device;
+        } else {
+            log(RETRO_LOG_WARN, &format!("ignoring device {} on port {} (port 0: RetroPad, mouse or pointer)", device, port));
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -293,7 +305,10 @@ pub extern "C" fn retro_reset() {
         let mut core = lock(&CORE);
         let Some(spec) = core.spec.clone() else { return };
         match boot(&spec) {
-            Ok(m) => core.machine = Some(m),
+            Ok(m) => {
+                core.machine = Some(m);
+                core.input.reset();
+            }
             Err(e) => log(RETRO_LOG_ERROR, &format!("reset failed: {}", e)),
         }
     })
@@ -343,7 +358,9 @@ pub extern "C" fn retro_run() {
             unsafe { poll() };
         }
         let mut core = lock(&CORE);
-        let Some(m) = core.machine.as_mut() else { return };
+        let Core { machine, input, .. } = &mut *core;
+        let Some(m) = machine.as_mut() else { return };
+        input.apply(cb.input_state, &mut m.bus.slave);
         m.run_frame();
         if let Some(video) = cb.video {
             let fb = m.framebuffer();
@@ -407,6 +424,8 @@ fn load(game: *const retro_game_info) -> Result<(), String> {
     if !unsafe { env_call(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &mut fmt as *mut c_uint as *mut c_void) } {
         return Err("frontend refused XRGB8888".into());
     }
+    // SAFETY: SET_INPUT_DESCRIPTORS reads a NULL-terminated static descriptor array.
+    unsafe { env_call(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, input::DESCRIPTORS.0.as_ptr() as *mut c_void) };
     let mut spec = LoadSpec { bios, disc, mode: VideoMode::Pal };
     let mut m = boot(&spec)?;
     if let Some(d) = &spec.disc {
@@ -425,6 +444,7 @@ fn load(game: *const retro_game_info) -> Result<(), String> {
     core.machine = Some(m);
     core.spec = Some(spec);
     core.temp_disc = temp;
+    core.input.reset();
     Ok(())
 }
 
