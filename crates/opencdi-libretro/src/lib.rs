@@ -40,6 +40,7 @@ struct Core {
     sfx: Vec<(f32, f32)>,
     pcm: Vec<i16>,
     input: Input,
+    uart_line: Vec<u8>,
 }
 
 static CALLBACKS: Mutex<Callbacks> = Mutex::new(Callbacks {
@@ -56,6 +57,7 @@ static CORE: Mutex<Core> = Mutex::new(Core {
     temp_disc: None,
     mix: Vec::new(),
     sfx: Vec::new(),
+    uart_line: Vec::new(),
     pcm: Vec::new(),
     input: Input::new(),
 });
@@ -162,7 +164,37 @@ fn boot(spec: &LoadSpec) -> Result<Machine, String> {
     }
     m.set_video_mode(spec.mode);
     m.reset();
+    m.bus.uart_capture = Some(Vec::new());
     Ok(m)
+}
+
+const UART_LINE_MAX: usize = 256;
+
+// Sends complete BIOS UART lines to the log; control bytes other than tab are shown as [XX] like the stdout path.
+fn drain_uart(bytes: &mut Vec<u8>, line: &mut Vec<u8>) {
+    for b in bytes.drain(..) {
+        match b {
+            b'\n' => flush_uart_line(line),
+            b'\r' => {}
+            _ => {
+                if b == b'\t' || (0x20..0x7f).contains(&b) {
+                    line.push(b);
+                } else {
+                    line.extend_from_slice(format!("[{:02X}]", b).as_bytes());
+                }
+                if line.len() >= UART_LINE_MAX {
+                    flush_uart_line(line);
+                }
+            }
+        }
+    }
+}
+
+fn flush_uart_line(line: &mut Vec<u8>) {
+    if !line.is_empty() {
+        log(RETRO_LOG_INFO, &format!("UART {}", String::from_utf8_lossy(line)));
+        line.clear();
+    }
 }
 
 fn spill_to_temp(data: &[u8]) -> Result<PathBuf, String> {
@@ -202,7 +234,10 @@ pub extern "C" fn retro_set_environment(cb: retro_environment_t) {
         let mut lcb = retro_log_callback { log: None };
         // SAFETY: GET_LOG_INTERFACE fills a `retro_log_callback`.
         let ok = unsafe { env_call(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &mut lcb as *mut _ as *mut c_void) };
-        *lock(&LOG) = if ok { lcb.log } else { None };
+        // A later call without a log interface must not drop the one already received.
+        if ok && lcb.log.is_some() {
+            *lock(&LOG) = lcb.log;
+        }
         // SAFETY: SET_CONTROLLER_INFO reads a terminated `retro_controller_info` array; it is static.
         unsafe { env_call(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, input::CONTROLLER_INFO.0.as_ptr() as *mut c_void) };
     })
@@ -358,10 +393,13 @@ pub extern "C" fn retro_run() {
             unsafe { poll() };
         }
         let mut core = lock(&CORE);
-        let Core { machine, input, .. } = &mut *core;
+        let Core { machine, input, uart_line, .. } = &mut *core;
         let Some(m) = machine.as_mut() else { return };
         input.apply(cb.input_state, &mut m.bus.slave);
         m.run_frame();
+        if let Some(buf) = m.bus.uart_capture.as_mut() {
+            drain_uart(buf, uart_line);
+        }
         if let Some(video) = cb.video {
             let fb = m.framebuffer();
             // SAFETY: `fb` is SCREEN_WIDTH * SCREEN_HEIGHT XRGB8888 pixels, valid for the duration of the call.
@@ -450,6 +488,7 @@ fn load(game: *const retro_game_info) -> Result<(), String> {
 
 fn unload() {
     let mut core = lock(&CORE);
+    flush_uart_line(&mut core.uart_line);
     core.machine = None;
     core.spec = None;
     if let Some(p) = core.temp_disc.take() {
