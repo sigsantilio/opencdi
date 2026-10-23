@@ -60,3 +60,10 @@ m68k = { path = "crates/m68k" }
 
 [build-dependencies]
 winres = "0.1.12"
+
+# The libretro core relies on catch_unwind at every extern "C" entry; keep unwinding on.
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
