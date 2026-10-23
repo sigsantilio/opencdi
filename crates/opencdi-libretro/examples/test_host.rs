@@ -1,5 +1,7 @@
 // Headless libretro frontend: dlopens the core, runs N frames, prints the same FNV video hash as src/bin/harness.rs.
 use libloading::{Library, Symbol};
+use opencdi::input_script::{self, BTN_1, BTN_2, BTN_3, Event, Pad, PadButton};
+use opencdi::mcd212::{SCREEN_HEIGHT, SCREEN_WIDTH};
 use std::ffi::{CStr, CString, c_char, c_uint, c_void};
 use std::sync::Mutex;
 
@@ -12,6 +14,19 @@ const ENV_SET_SUPPORT_NO_GAME: c_uint = 18;
 const ENV_GET_LOG_INTERFACE: c_uint = 27;
 const PIXEL_FORMAT_XRGB8888: c_uint = 1;
 const MEMORY_SYSTEM_RAM: c_uint = 2;
+const DEVICE_JOYPAD: c_uint = 1;
+const DEVICE_POINTER: c_uint = 6;
+const JOYPAD_IDS: [(c_uint, PadButton); 7] = [
+    (0, PadButton::B),
+    (1, PadButton::Y),
+    (4, PadButton::Up),
+    (5, PadButton::Down),
+    (6, PadButton::Left),
+    (7, PadButton::Right),
+    (8, PadButton::A),
+];
+// Harness autoplay's shell-state long (0xC000 + 0xFFFF9172, wrapped) as an offset into plane A.
+const SHELL_STATE: usize = 0x5172;
 
 #[repr(C)]
 struct SystemInfo {
@@ -51,6 +66,9 @@ struct HostState {
     audio_frames: u64,
     pixel_format_ok: bool,
     no_game_ok: bool,
+    nonblack: usize,
+    pointer: (i16, i16, bool),
+    pad: Pad,
 }
 
 static HOST: Mutex<Option<HostState>> = Mutex::new(None);
@@ -101,6 +119,10 @@ unsafe extern "C" fn video_cb(data: *const c_void, width: c_uint, height: c_uint
         }
         h.video_all = all;
         h.video_last = v;
+        h.nonblack = (0..height as usize)
+            .map(|y| unsafe { std::slice::from_raw_parts((data as *const u8).add(y * pitch) as *const u32, width as usize) })
+            .map(|row| row.iter().filter(|&&p| p & 0x00FF_FFFF != 0).count())
+            .sum();
         h.frames += 1;
     })
 }
@@ -120,13 +142,103 @@ unsafe extern "C" fn audio_batch_cb(data: *const i16, frames: usize) -> usize {
 
 unsafe extern "C" fn input_poll_cb() {}
 
-unsafe extern "C" fn input_state_cb(_port: c_uint, _device: c_uint, _index: c_uint, _id: c_uint) -> i16 {
-    0
+unsafe extern "C" fn input_state_cb(port: c_uint, device: c_uint, _index: c_uint, id: c_uint) -> i16 {
+    if port != 0 {
+        return 0;
+    }
+    with_host(|h| match (device, id) {
+        (DEVICE_POINTER, 0) => h.pointer.0,
+        (DEVICE_POINTER, 1) => h.pointer.1,
+        (DEVICE_POINTER, 2) => h.pointer.2 as i16,
+        (DEVICE_JOYPAD, _) => JOYPAD_IDS.iter().find(|(i, _)| *i == id).is_some_and(|(_, b)| h.pad.held(*b)) as i16,
+        _ => 0,
+    })
 }
 
 fn usage() -> ! {
-    eprintln!("usage: test_host <core.so> <system_dir> [frames=600] [game_path]");
+    eprintln!("usage: test_host <core.so> <system_dir> [frames=600] [game_path|none] [--replay <script|@file> | --memory] [--sample <n>]");
     std::process::exit(2);
+}
+
+// Alternates between two raw values of the same pixel so a repeated event is still a pointer change.
+fn raw_pointer(x: i32, y: i32, pressed: bool, alt: &mut i16) -> (i16, i16, bool) {
+    *alt ^= 1;
+    let raw = |p: i32, size: usize| {
+        let n = input_script::pixel_to_norm(p, size as i32) + *alt;
+        assert_eq!(input_script::norm_to_pixel(n, size as i32), p.clamp(0, size as i32 - 1), "pointer inverse");
+        n
+    };
+    (raw(x, SCREEN_WIDTH), raw(y, SCREEN_HEIGHT), pressed)
+}
+
+// Replays a shared-format script through the core: pointer events via RETRO_DEVICE_POINTER, pad events via the RetroPad.
+struct Replay {
+    events: Vec<Event>,
+    next: usize,
+    alt: i16,
+    pointer: (i16, i16, bool),
+    pointer_pad: Pad,
+}
+
+impl Replay {
+    fn has_pointer(&self) -> bool {
+        self.events.iter().any(|e| matches!(e, Event::Pointer { .. }))
+    }
+
+    // Raw pointer and pad state the frontend reports for `frame`.
+    fn at(&mut self, frame: u64) -> ((i16, i16, bool), Pad) {
+        while let Some(&ev) = self.events.get(self.next) {
+            if ev.frame() > frame {
+                break;
+            }
+            self.next += 1;
+            if let Event::Pointer { x, y, buttons, .. } = ev {
+                self.pointer = raw_pointer(x, y, buttons & BTN_1 != 0, &mut self.alt);
+                let mut pad = Pad::default();
+                if buttons & BTN_2 != 0 { pad = pad.with(PadButton::Y); }
+                if buttons & BTN_3 != 0 { pad = pad.with(PadButton::A); }
+                self.pointer_pad = pad;
+            }
+        }
+        let held = self.events.iter().filter_map(|e| match *e {
+            Event::Pad { frame: f, button, len } if frame >= f && frame - f < len => Some(button),
+            _ => None,
+        });
+        (self.pointer, held.fold(self.pointer_pad, Pad::with))
+    }
+}
+
+// Harness autoplay decision from plane A through retro_get_memory_data; see doc/handover/status-and-todo.md for the launch substitute.
+struct Memory {
+    ready: u32,
+    launched: bool,
+    was_ready: bool,
+    alt: i16,
+    pointer: (i16, i16, bool),
+}
+
+impl Memory {
+    fn at(&mut self, frame: u64, ram: &[u8]) -> (i16, i16, bool) {
+        if self.launched {
+            return self.pointer;
+        }
+        let state = u32::from_be_bytes(ram[SHELL_STATE..SHELL_STATE + 4].try_into().unwrap());
+        if state >= 2 {
+            self.ready += 1;
+            match self.ready {
+                1 | 50 | 150 | 200 => self.pointer = raw_pointer(575, 335, false, &mut self.alt),
+                30 | 180 => self.pointer = raw_pointer(575, 335, true, &mut self.alt),
+                _ => {}
+            }
+        }
+        // No cpu.pc through libretro: the launch is taken as the shell state falling from ready (>= 2) back below 2.
+        let was_ready = std::mem::replace(&mut self.was_ready, state >= 2);
+        if was_ready && state < 2 && frame > 250 {
+            self.launched = true;
+            self.pointer = raw_pointer(384, 280, false, &mut self.alt);
+        }
+        self.pointer
+    }
 }
 
 fn main() {
@@ -135,7 +247,32 @@ fn main() {
         usage();
     }
     let frames: u64 = a.get(3).map(|s| s.parse().unwrap_or_else(|_| usage())).unwrap_or(600);
-    let game = a.get(4).map(|s| CString::new(s.as_str()).unwrap());
+    let game = a.get(4).filter(|s| !s.starts_with("--") && s.as_str() != "none").map(|s| CString::new(s.as_str()).unwrap());
+    let mut replay: Option<Replay> = None;
+    let mut memory: Option<Memory> = None;
+    let mut sample = 0u64;
+    let mut i = if a.len() > 4 && !a[4].starts_with("--") { 5 } else { 4 };
+    while i < a.len() {
+        match a[i].as_str() {
+            "--replay" => {
+                i += 1;
+                let s = a.get(i).unwrap_or_else(|| usage());
+                let text = match s.strip_prefix('@') {
+                    Some(f) => std::fs::read_to_string(f).expect("read input script"),
+                    None => s.clone(),
+                };
+                let events = input_script::parse(&text).unwrap_or_else(|e| panic!("input script: {}", e));
+                replay = Some(Replay { events, next: 0, alt: 0, pointer: (0, 0, false), pointer_pad: Pad::default() });
+            }
+            "--memory" => memory = Some(Memory { ready: 0, launched: false, was_ready: false, alt: 0, pointer: (0, 0, false) }),
+            "--sample" => { i += 1; sample = a.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage()); }
+            _ => usage(),
+        }
+        i += 1;
+    }
+    if (replay.is_some() && memory.is_some()) || (memory.is_some() && game.is_none()) {
+        usage();
+    }
     *HOST.lock().unwrap() = Some(HostState {
         sysdir: CString::new(a[2].as_str()).unwrap(),
         video_all: FNV_OFFSET,
@@ -145,6 +282,9 @@ fn main() {
         audio_frames: 0,
         pixel_format_ok: false,
         no_game_ok: false,
+        nonblack: 0,
+        pointer: (0, 0, false),
+        pad: Pad::default(),
     });
 
     unsafe {
@@ -171,6 +311,8 @@ fn main() {
         let run = sym!("retro_run", unsafe extern "C" fn());
         let mem_size = sym!("retro_get_memory_size", unsafe extern "C" fn(c_uint) -> usize);
         let region = sym!("retro_get_region", unsafe extern "C" fn() -> c_uint);
+        let mem_data = sym!("retro_get_memory_data", unsafe extern "C" fn(c_uint) -> *mut c_void);
+        let set_port = sym!("retro_set_controller_port_device", unsafe extern "C" fn(c_uint, c_uint));
 
         assert_eq!(api_version(), 1, "RETRO_API_VERSION");
         let mut si = SystemInfo {
@@ -206,15 +348,30 @@ fn main() {
             region(), mem_size(MEMORY_SYSTEM_RAM)
         );
 
-        for _ in 0..frames {
+        if memory.is_some() || replay.as_ref().is_some_and(Replay::has_pointer) {
+            set_port(0, DEVICE_POINTER);
+        }
+        for frame in 0..frames {
+            if let Some(r) = replay.as_mut() {
+                let (pointer, pad) = r.at(frame);
+                with_host(|h| (h.pointer, h.pad) = (pointer, pad));
+            }
+            if let Some(mm) = memory.as_mut() {
+                let ram = std::slice::from_raw_parts(mem_data(MEMORY_SYSTEM_RAM) as *const u8, mem_size(MEMORY_SYSTEM_RAM));
+                let pointer = mm.at(frame, ram);
+                with_host(|h| h.pointer = pointer);
+            }
             run();
+            if sample > 0 && (frame + 1) % sample == 0 {
+                eprintln!("SAMPLE frame={} nonblack={}", frame + 1, with_host(|h| h.nonblack));
+            }
         }
 
         with_host(|h| {
             assert!(h.pixel_format_ok && h.no_game_ok, "pixel format or no-game not negotiated");
             println!(
-                "HOST frames={} video_last={:016x} video_all={:016x} audio={:016x} audio_frames={}",
-                h.frames, h.video_last, h.video_all, h.audio, h.audio_frames
+                "HOST frames={} video_last={:016x} video_all={:016x} audio={:016x} audio_frames={} nonblack={}",
+                h.frames, h.video_last, h.video_all, h.audio, h.audio_frames, h.nonblack
             );
         });
         unload_game();
