@@ -1486,6 +1486,7 @@ dependencies = [
 name = "opencdi-libretro"
 version = "0.1.0"
 dependencies = [
+ "libloading",
  "opencdi",
 ]
 

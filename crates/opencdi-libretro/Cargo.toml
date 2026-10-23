@@ -9,3 +9,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 opencdi = { path = "../..", default-features = false }
+
+[dev-dependencies]
+libloading = "0.8"
