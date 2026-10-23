@@ -8,6 +8,7 @@ default = ["host"]
 host = ["dep:winit", "dep:softbuffer", "dep:cpal", "dep:gilrs", "dep:env_logger", "dep:png"]
 
 [workspace]
+members = ["crates/opencdi-libretro"]
 
 [[bin]]
 name = "opencdi"

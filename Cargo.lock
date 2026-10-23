@@ -1483,6 +1483,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "opencdi-libretro"
+version = "0.1.0"
+dependencies = [
+ "opencdi",
+]
+
+[[package]]
 name = "orbclient"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
