@@ -1,7 +1,7 @@
 mod input;
 pub mod libretro;
 
-use input::Input;
+use input::{Input, Table};
 use libretro::*;
 use opencdi::bios;
 use opencdi::machine::Machine;
@@ -15,6 +15,8 @@ use std::sync::{Mutex, MutexGuard};
 
 // Looked up case-insensitively in the system directory, in this order; Mono-IV images are reported, not booted.
 pub const BIOS_NAMES: &[&str] = &["cdi220b.rom", "cdi200.rom", "cdimono1.zip", "cdibios.zip", "cdi.rom", "cdi220.rom", "cdi490a.rom", "cdi490a.zip"];
+// Cartridge ROM, looked up the same way; the cdimono1.zip set carries vmpega.rom next to the system ROMs.
+pub const DVC_NAMES: &[&str] = &["vmpega.rom", "cdimono1.zip", "cdibios.zip"];
 const MESSAGE_FRAMES: c_uint = 360;
 const AUDIO_RATE: u32 = 37800;
 // Room above the size measured at the first serialize_size call, for buffers that grow later (DVC decoder, FIFOs).
@@ -34,9 +36,39 @@ struct Callbacks {
 #[derive(Clone)]
 struct LoadSpec {
     bios: PathBuf,
+    dvc: Option<PathBuf>,
     disc: Option<PathBuf>,
     mode: VideoMode,
 }
+
+const OPT_DVC: &CStr = c"opencdi_dvc";
+const NO_VALUE: retro_core_option_value = retro_core_option_value { value: std::ptr::null(), label: std::ptr::null() };
+
+const fn option_values(list: &[(&CStr, &CStr)]) -> [retro_core_option_value; RETRO_NUM_CORE_OPTION_VALUES_MAX] {
+    let mut out = [NO_VALUE; RETRO_NUM_CORE_OPTION_VALUES_MAX];
+    let mut i = 0;
+    while i < list.len() {
+        out[i] = retro_core_option_value { value: list[i].0.as_ptr(), label: list[i].1.as_ptr() };
+        i += 1;
+    }
+    out
+}
+
+// Core options v1, terminated by an empty entry; frontends without v1 get VARIABLES below.
+static OPTIONS: Table<[retro_core_option_definition; 2]> = Table([
+    retro_core_option_definition {
+        key: OPT_DVC.as_ptr(),
+        desc: c"DVC cartridge (restart)".as_ptr(),
+        info: c"auto fits the VMPEG Digital Video Cartridge when vmpega.rom (or cdimono1.zip holding it) is in the system directory. Needed by Digital Video titles; takes effect when content is loaded.".as_ptr(),
+        values: option_values(&[(c"auto", c"auto"), (c"off", c"off")]),
+        default_value: c"auto".as_ptr(),
+    },
+    retro_core_option_definition { key: std::ptr::null(), desc: std::ptr::null(), info: std::ptr::null(), values: [NO_VALUE; RETRO_NUM_CORE_OPTION_VALUES_MAX], default_value: std::ptr::null() },
+]);
+static VARIABLES: Table<[retro_variable; 2]> = Table([
+    retro_variable { key: OPT_DVC.as_ptr(), value: c"DVC cartridge (restart); auto|off".as_ptr() },
+    retro_variable { key: std::ptr::null(), value: std::ptr::null() },
+]);
 
 struct Core {
     machine: Option<Machine>,
@@ -145,11 +177,11 @@ fn show_message(msg: &str) {
     unsafe { env_call(RETRO_ENVIRONMENT_SET_MESSAGE, &mut m as *mut retro_message as *mut c_void) };
 }
 
-fn bios_candidates(dir: &Path) -> Vec<PathBuf> {
+fn candidates(dir: &Path, names: &[&str]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else { return out };
     let files: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
-    for name in BIOS_NAMES {
+    for name in names {
         let hit = |p: &&PathBuf| p.file_name().is_some_and(|f| f.to_string_lossy().eq_ignore_ascii_case(name));
         out.extend(files.iter().filter(hit).cloned());
     }
@@ -158,7 +190,7 @@ fn bios_candidates(dir: &Path) -> Vec<PathBuf> {
 
 // Checks candidates in order, logs each verdict, stops at the first good image and returns the best usable one.
 fn find_bios(dir: &Path) -> Result<PathBuf, String> {
-    let candidates = bios_candidates(dir);
+    let candidates = candidates(dir, BIOS_NAMES);
     if candidates.is_empty() {
         return Err(format!("no CD-i system ROM in {} (looked for {})", dir.display(), BIOS_NAMES.join(", ")));
     }
@@ -198,6 +230,40 @@ fn find_bios(dir: &Path) -> Result<PathBuf, String> {
     }
 }
 
+// Value of a core option, None when the frontend has no answer.
+fn option_value(key: &CStr) -> Option<String> {
+    let mut v = retro_variable { key: key.as_ptr(), value: std::ptr::null() };
+    // SAFETY: GET_VARIABLE fills `value` with a frontend-owned string or leaves it null.
+    let ok = unsafe { env_call(RETRO_ENVIRONMENT_GET_VARIABLE, &mut v as *mut retro_variable as *mut c_void) };
+    // SAFETY: non-null NUL-terminated string owned by the frontend.
+    (ok && !v.value.is_null()).then(|| unsafe { CStr::from_ptr(v.value) }.to_string_lossy().into_owned())
+}
+
+// Checks cartridge candidates in order and logs each verdict; only a known VMPEG dump is fitted.
+fn find_dvc(dir: &Path) -> Option<PathBuf> {
+    let candidates = candidates(dir, DVC_NAMES);
+    if candidates.is_empty() {
+        log(RETRO_LOG_INFO, &format!("no DVC cartridge ROM in {} (looked for {}); Digital Video titles will ask for the cartridge", dir.display(), DVC_NAMES.join(", ")));
+        return None;
+    }
+    for p in candidates {
+        match Machine::read_dvc(&p) {
+            Ok((entry, img)) => {
+                let r = &img.report;
+                let level = if r.status == bios::Status::Ok { RETRO_LOG_INFO } else { RETRO_LOG_WARN };
+                let inside = entry.map_or_else(String::new, |e| format!(" ({})", e));
+                log(level, &format!("DVC {}{} [{}]: {}", p.display(), inside, r.status, r.message));
+                if r.status == bios::Status::Ok {
+                    return Some(p);
+                }
+            }
+            Err(e) => log(RETRO_LOG_WARN, &format!("DVC {}: {}", p.display(), e)),
+        }
+    }
+    show_message("No usable DVC cartridge ROM (vmpega.rom); Digital Video titles will not play");
+    None
+}
+
 fn is_ntsc_name(path: &Path, machine: &Machine) -> bool {
     let name = path.file_stem().map(|s| s.to_string_lossy().to_uppercase()).unwrap_or_default();
     (name.contains("(USA)") || name.contains("(JAPAN)") || name.contains("NTSC"))
@@ -207,6 +273,13 @@ fn is_ntsc_name(path: &Path, machine: &Machine) -> bool {
 fn boot(spec: &LoadSpec) -> Result<Machine, String> {
     let mut m = Machine::new();
     m.load_bios(&spec.bios).map_err(|e| format!("cannot load BIOS {}: {}", spec.bios.display(), e))?;
+    if let Some(p) = &spec.dvc {
+        let (_, img) = Machine::read_dvc(p).map_err(|e| format!("cannot load DVC ROM {}: {}", p.display(), e))?;
+        if img.report.status != bios::Status::Ok {
+            return Err(format!("DVC ROM {} changed: {}", p.display(), img.report.message));
+        }
+        m.load_dvc_image(&img);
+    }
     if let Some(d) = &spec.disc {
         m.load_disc(d).map_err(|e| format!("cannot open disc {}: {}", d.display(), e))?;
     }
@@ -288,6 +361,13 @@ pub extern "C" fn retro_set_environment(cb: retro_environment_t) {
         }
         // SAFETY: SET_CONTROLLER_INFO reads a terminated `retro_controller_info` array; it is static.
         unsafe { env_call(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, input::CONTROLLER_INFO.0.as_ptr() as *mut c_void) };
+        let mut version: c_uint = 0;
+        // SAFETY: GET_CORE_OPTIONS_VERSION writes an `unsigned`.
+        let v1 = unsafe { env_call(RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION, &mut version as *mut c_uint as *mut c_void) } && version >= 1;
+        // SAFETY: both calls read a terminated static array during the call.
+        if !v1 || !unsafe { env_call(RETRO_ENVIRONMENT_SET_CORE_OPTIONS, OPTIONS.0.as_ptr() as *mut c_void) } {
+            unsafe { env_call(RETRO_ENVIRONMENT_SET_VARIABLES, VARIABLES.0.as_ptr() as *mut c_void) };
+        }
     })
 }
 
@@ -571,7 +651,13 @@ fn load(game: *const retro_game_info) -> Result<(), String> {
     }
     // SAFETY: SET_INPUT_DESCRIPTORS reads a NULL-terminated static descriptor array.
     unsafe { env_call(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, input::DESCRIPTORS.0.as_ptr() as *mut c_void) };
-    let mut spec = LoadSpec { bios, disc, mode: VideoMode::Pal };
+    let dvc = if option_value(OPT_DVC).as_deref() == Some("off") {
+        log(RETRO_LOG_INFO, "DVC cartridge off (core option)");
+        None
+    } else {
+        find_dvc(&dir)
+    };
+    let mut spec = LoadSpec { bios, dvc, disc, mode: VideoMode::Pal };
     let mut m = boot(&spec)?;
     if let Some(d) = &spec.disc {
         if is_ntsc_name(d, &m) {
@@ -580,8 +666,9 @@ fn load(game: *const retro_game_info) -> Result<(), String> {
         }
     }
     log(RETRO_LOG_INFO, &format!(
-        "BIOS {}, disc {}, {:?}",
+        "BIOS {}, DVC {}, disc {}, {:?}",
         spec.bios.display(),
+        spec.dvc.as_ref().map_or("none".into(), |d| d.display().to_string()),
         spec.disc.as_ref().map_or("none".into(), |d| d.display().to_string()),
         spec.mode
     ));
@@ -690,6 +777,15 @@ mod tests {
         let r = m.load_bios(d.join("CDI.ROM")).unwrap();
         assert!(r.word_swapped);
         assert_eq!(m.bus.rom[..], synthetic_rom()[..]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn find_dvc_fits_only_a_known_vmpega_dump() {
+        let d = temp_dir("dvc");
+        assert_eq!(find_dvc(&d), None);
+        std::fs::write(d.join("VMPEGA.ROM"), &synthetic_rom()[..bios::DVC_ROM_SIZE]).unwrap();
+        assert_eq!(find_dvc(&d), None);
         let _ = std::fs::remove_dir_all(&d);
     }
 

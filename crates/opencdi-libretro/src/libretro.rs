@@ -43,11 +43,16 @@ pub const RETRO_MEMORY_VIDEO_RAM: c_uint = 3;
 
 pub const RETRO_ENVIRONMENT_SET_MESSAGE: c_uint = 6;
 pub const RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY: c_uint = 9;
+pub const RETRO_ENVIRONMENT_GET_VARIABLE: c_uint = 15;
+pub const RETRO_ENVIRONMENT_SET_VARIABLES: c_uint = 16;
 pub const RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: c_uint = 10;
 pub const RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS: c_uint = 11;
 pub const RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME: c_uint = 18;
 pub const RETRO_ENVIRONMENT_GET_LOG_INTERFACE: c_uint = 27;
 pub const RETRO_ENVIRONMENT_SET_CONTROLLER_INFO: c_uint = 35;
+pub const RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION: c_uint = 52;
+pub const RETRO_ENVIRONMENT_SET_CORE_OPTIONS: c_uint = 53;
+pub const RETRO_NUM_CORE_OPTION_VALUES_MAX: usize = 128;
 
 pub const RETRO_LOG_DEBUG: c_uint = 0;
 pub const RETRO_LOG_INFO: c_uint = 1;
@@ -215,4 +220,26 @@ mod tests {
         assert_eq!(size_of::<retro_input_state_t>(), P);
         assert_eq!(size_of::<retro_log_printf_t>(), P);
     }
+}
+
+#[repr(C)]
+pub struct retro_variable {
+    pub key: *const c_char,
+    pub value: *const c_char,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct retro_core_option_value {
+    pub value: *const c_char,
+    pub label: *const c_char,
+}
+
+#[repr(C)]
+pub struct retro_core_option_definition {
+    pub key: *const c_char,
+    pub desc: *const c_char,
+    pub info: *const c_char,
+    pub values: [retro_core_option_value; RETRO_NUM_CORE_OPTION_VALUES_MAX],
+    pub default_value: *const c_char,
 }

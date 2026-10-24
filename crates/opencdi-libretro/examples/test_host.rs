@@ -12,6 +12,8 @@ const ENV_GET_SYSTEM_DIRECTORY: c_uint = 9;
 const ENV_SET_PIXEL_FORMAT: c_uint = 10;
 const ENV_SET_SUPPORT_NO_GAME: c_uint = 18;
 const ENV_GET_LOG_INTERFACE: c_uint = 27;
+const ENV_GET_VARIABLE: c_uint = 15;
+const ENV_SET_VARIABLES: c_uint = 16;
 const PIXEL_FORMAT_XRGB8888: c_uint = 1;
 const MEMORY_SYSTEM_RAM: c_uint = 2;
 const DEVICE_JOYPAD: c_uint = 1;
@@ -50,6 +52,12 @@ struct AvInfo {
 }
 
 #[repr(C)]
+struct Variable {
+    key: *const c_char,
+    value: *const c_char,
+}
+
+#[repr(C)]
 struct GameInfo {
     path: *const c_char,
     data: *const c_void,
@@ -69,6 +77,8 @@ struct HostState {
     nonblack: usize,
     pointer: (i16, i16, bool),
     pad: Pad,
+    options: Vec<(CString, CString)>,
+    audio_out: Option<Vec<u8>>,
 }
 
 static HOST: Mutex<Option<HostState>> = Mutex::new(None);
@@ -100,6 +110,18 @@ unsafe extern "C" fn env_cb(cmd: c_uint, data: *mut c_void) -> bool {
             true
         }
         ENV_GET_LOG_INTERFACE => false,
+        ENV_SET_VARIABLES => true,
+        ENV_GET_VARIABLE => {
+            let v = unsafe { &mut *(data as *mut Variable) };
+            let key = unsafe { CStr::from_ptr(v.key) };
+            match h.options.iter().find(|(k, _)| k.as_c_str() == key) {
+                Some((_, val)) => {
+                    v.value = val.as_ptr();
+                    true
+                }
+                None => false,
+            }
+        }
         _ => false,
     })
 }
@@ -135,6 +157,9 @@ unsafe extern "C" fn audio_batch_cb(data: *const i16, frames: usize) -> usize {
         for &x in s {
             h.audio = fnv(h.audio, &x.to_le_bytes());
         }
+        if let Some(out) = h.audio_out.as_mut() {
+            out.extend(s.iter().flat_map(|x| x.to_le_bytes()));
+        }
         h.audio_frames += frames as u64;
     });
     frames
@@ -156,7 +181,7 @@ unsafe extern "C" fn input_state_cb(port: c_uint, device: c_uint, _index: c_uint
 }
 
 fn usage() -> ! {
-    eprintln!("usage: test_host <core.so> <system_dir> [frames=600] [game_path|none] [--replay <script|@file> | --memory] [--sample <n>] [--roundtrip <frame>]");
+    eprintln!("usage: test_host <core.so> <system_dir> [frames=600] [game_path|none] [--replay <script|@file> | --memory] [--sample <n>] [--roundtrip <frame>] [--option <key>=<value>]... [--audio-out <file.s16>] [--state-out <frame> <file>] [--state-in <file>]");
     std::process::exit(2);
 }
 
@@ -254,6 +279,10 @@ fn main() {
     let mut memory: Option<Memory> = None;
     let mut sample = 0u64;
     let mut roundtrip: Option<u64> = None;
+    let mut options = Vec::new();
+    let mut audio_out: Option<String> = None;
+    let mut state_out: Option<(u64, String)> = None;
+    let mut state_in: Option<String> = None;
     let mut i = if a.len() > 4 && !a[4].starts_with("--") { 5 } else { 4 };
     while i < a.len() {
         match a[i].as_str() {
@@ -270,6 +299,18 @@ fn main() {
             "--memory" => memory = Some(Memory { ready: 0, launched: false, was_ready: false, alt: 0, pointer: (0, 0, false) }),
             "--sample" => { i += 1; sample = a.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage()); }
             "--roundtrip" => { i += 1; roundtrip = Some(a.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())); }
+            "--option" => {
+                i += 1;
+                let (k, v) = a.get(i).and_then(|s| s.split_once('=')).unwrap_or_else(|| usage());
+                options.push((CString::new(k).unwrap(), CString::new(v).unwrap()));
+            }
+            "--audio-out" => { i += 1; audio_out = Some(a.get(i).cloned().unwrap_or_else(|| usage())); }
+            "--state-out" => {
+                let at = a.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage());
+                state_out = Some((at, a.get(i + 2).cloned().unwrap_or_else(|| usage())));
+                i += 2;
+            }
+            "--state-in" => { i += 1; state_in = Some(a.get(i).cloned().unwrap_or_else(|| usage())); }
             _ => usage(),
         }
         i += 1;
@@ -289,6 +330,8 @@ fn main() {
         nonblack: 0,
         pointer: (0, 0, false),
         pad: Pad::default(),
+        options,
+        audio_out: audio_out.as_ref().map(|_| Vec::new()),
     });
 
     unsafe {
@@ -355,6 +398,12 @@ fn main() {
             region(), mem_size(MEMORY_SYSTEM_RAM)
         );
 
+        if let Some(f) = &state_in {
+            // A state from another setup must be refused without poisoning the core.
+            let bytes = std::fs::read(f).expect("read state");
+            let loaded = unserialize(bytes.as_ptr() as *const c_void, bytes.len());
+            println!("STATEIN {}", if loaded { "loaded" } else { "refused" });
+        }
         if memory.is_some() || replay.as_ref().is_some_and(Replay::has_pointer) {
             set_port(0, DEVICE_POINTER);
         }
@@ -369,6 +418,14 @@ fn main() {
                 with_host(|h| h.pointer = pointer);
             }
             run();
+            if let Some((at, f)) = &state_out {
+                if frame + 1 == *at {
+                    let size = serialize_size();
+                    let mut buf = vec![0u8; size];
+                    assert!(serialize(buf.as_mut_ptr() as *mut c_void, size), "retro_serialize failed");
+                    std::fs::write(f, &buf).expect("write state");
+                }
+            }
             if sample > 0 && (frame + 1) % sample == 0 {
                 eprintln!("SAMPLE frame={} nonblack={}", frame + 1, with_host(|h| h.nonblack));
             }
@@ -436,6 +493,9 @@ fn main() {
             return;
         }
 
+        if let Some(f) = &audio_out {
+            std::fs::write(f, with_host(|h| h.audio_out.take()).unwrap_or_default()).expect("write audio");
+        }
         with_host(|h| {
             assert!(h.pixel_format_ok && h.no_game_ok, "pixel format or no-game not negotiated");
             println!(
