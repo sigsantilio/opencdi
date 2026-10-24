@@ -92,6 +92,9 @@ impl Input {
     }
 }
 
+// Pointer position and last values sent to the slave go into the savestate; the port device is configuration.
+opencdi::impl_state!(Input { x, y, pointer_buttons, raw_pointer, sent } skip { device });
+
 const fn desc(device: c_uint, index: c_uint, id: c_uint, text: &'static std::ffi::CStr) -> retro_input_descriptor {
     retro_input_descriptor { port: 0, device, index, id, description: text.as_ptr() }
 }

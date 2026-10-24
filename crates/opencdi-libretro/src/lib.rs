@@ -5,6 +5,7 @@ use input::Input;
 use libretro::*;
 use opencdi::machine::Machine;
 use opencdi::mcd212::{VideoMode, SCREEN_HEIGHT, SCREEN_WIDTH};
+use opencdi::savestate::{Reader, State};
 use std::ffi::{CStr, CString, c_char, c_uint, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -14,6 +15,9 @@ use std::sync::{Mutex, MutexGuard};
 // Looked up in the frontend's system directory, in this order (cdi490a.rom is left out until Mono-IV exists).
 pub const BIOS_NAMES: &[&str] = &["cdi220b.rom", "cdi220.rom", "cdi200.rom", "cdi.rom"];
 const AUDIO_RATE: u32 = 37800;
+// Room above the size measured at the first serialize_size call, for buffers that grow later (DVC decoder, FIFOs).
+const STATE_HEADROOM: usize = 4 << 20;
+const STATE_ALIGN: usize = 64 << 10;
 
 #[derive(Clone, Copy)]
 struct Callbacks {
@@ -41,6 +45,8 @@ struct Core {
     pcm: Vec<i16>,
     input: Input,
     uart_line: Vec<u8>,
+    state_buf: Vec<u8>,
+    state_size: usize,
 }
 
 static CALLBACKS: Mutex<Callbacks> = Mutex::new(Callbacks {
@@ -60,6 +66,8 @@ static CORE: Mutex<Core> = Mutex::new(Core {
     uart_line: Vec::new(),
     pcm: Vec::new(),
     input: Input::new(),
+    state_buf: Vec::new(),
+    state_size: 0,
 });
 static LOG: Mutex<retro_log_printf_t> = Mutex::new(None);
 static POISONED: AtomicBool = AtomicBool::new(false);
@@ -409,19 +417,78 @@ pub extern "C" fn retro_run() {
     })
 }
 
+// Fills `core.state_buf` with the machine state plus the input translator's state.
+fn save_state(core: &mut Core) -> bool {
+    let Core { machine, input, state_buf, .. } = core;
+    let Some(m) = machine.as_ref() else { return false };
+    let mut fe = Vec::new();
+    input.save(&mut fe);
+    m.save_state(&fe, state_buf);
+    true
+}
+
+// Fixed per loaded game (rewind and runahead need a stable size): first measured size plus headroom.
 #[unsafe(no_mangle)]
 pub extern "C" fn retro_serialize_size() -> usize {
-    guard("retro_serialize_size", 0, true, || 0)
+    guard("retro_serialize_size", 0, true, || {
+        let mut core = lock(&CORE);
+        if core.state_size == 0 && save_state(&mut core) {
+            core.state_size = (core.state_buf.len() + STATE_HEADROOM).div_ceil(STATE_ALIGN) * STATE_ALIGN;
+            log(RETRO_LOG_INFO, &format!("savestate size {} bytes ({} used now)", core.state_size, core.state_buf.len()));
+        }
+        core.state_size
+    })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn retro_serialize(_data: *mut c_void, _len: usize) -> bool {
-    guard("retro_serialize", false, true, || false)
+pub extern "C" fn retro_serialize(data: *mut c_void, len: usize) -> bool {
+    guard("retro_serialize", false, true, || {
+        if data.is_null() {
+            return false;
+        }
+        let mut core = lock(&CORE);
+        if !save_state(&mut core) {
+            return false;
+        }
+        let n = core.state_buf.len();
+        if n > len {
+            log(RETRO_LOG_ERROR, &format!("savestate needs {} bytes, frontend buffer has {}", n, len));
+            return false;
+        }
+        // SAFETY: the frontend passes a writable buffer of `len` bytes.
+        let out = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, len) };
+        out[..n].copy_from_slice(&core.state_buf);
+        out[n..].fill(0);
+        true
+    })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn retro_unserialize(_data: *const c_void, _len: usize) -> bool {
-    guard("retro_unserialize", false, true, || false)
+pub extern "C" fn retro_unserialize(data: *const c_void, len: usize) -> bool {
+    guard("retro_unserialize", false, true, || {
+        if data.is_null() {
+            return false;
+        }
+        // SAFETY: the frontend passes a readable buffer of `len` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, len) };
+        let mut core = lock(&CORE);
+        let Core { machine, input, .. } = &mut *core;
+        let Some(m) = machine.as_mut() else { return false };
+        let fe = match m.load_state(bytes) {
+            Ok(fe) => fe,
+            Err(e) => {
+                log(RETRO_LOG_WARN, &format!("savestate rejected: {}", e));
+                return false;
+            }
+        };
+        let mut r = Reader::new(fe);
+        if let Err(e) = input.load(&mut r) {
+            log(RETRO_LOG_WARN, &format!("savestate input section: {}", e));
+            input.reset();
+            return false;
+        }
+        true
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -483,6 +550,7 @@ fn load(game: *const retro_game_info) -> Result<(), String> {
     core.spec = Some(spec);
     core.temp_disc = temp;
     core.input.reset();
+    core.state_size = 0;
     Ok(())
 }
 
@@ -491,6 +559,8 @@ fn unload() {
     flush_uart_line(&mut core.uart_line);
     core.machine = None;
     core.spec = None;
+    core.state_size = 0;
+    core.state_buf = Vec::new();
     if let Some(p) = core.temp_disc.take() {
         let _ = std::fs::remove_file(p);
     }
