@@ -94,7 +94,8 @@ fn main() {
     let mut recorded: Vec<Event> = Vec::new();
 
     let mut m = Machine::new();
-    m.load_bios(bios).unwrap_or_else(|e| panic!("load bios {}: {}", bios, e));
+    let report = m.load_bios(bios).unwrap_or_else(|e| panic!("load bios {}: {}", bios, e));
+    eprintln!("bios {}: {}", report.status, report.message);
     if let Some(p) = dvc {
         m.load_dvc_rom(p).unwrap_or_else(|e| panic!("load dvc {}: {}", p, e));
     }

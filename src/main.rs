@@ -1,7 +1,7 @@
 // OpenCDi Release Build - 2026-09-29 15:45
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 use std::path::{Path, PathBuf};
-use log::{info, error};
+use log::{info, error, warn};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -16,6 +16,7 @@ use opencdi::audio::HostAudioOutput;
 use opencdi::frontend::{pop_action, push_action, GuiAction, InputDeviceMode, KeyBindings};
 #[cfg(target_os = "windows")]
 use opencdi::gui;
+use opencdi::bios;
 use opencdi::machine::Machine;
 use opencdi::mcd212::{SCREEN_WIDTH, SCREEN_HEIGHT, VideoMode};
 
@@ -347,7 +348,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     match m.load_bios(&bios_path) {
-        Ok(()) => info!("Loaded system BIOS from {:?}", bios_path),
+        Ok(r) if r.status == bios::Status::Ok => info!("Loaded system BIOS from {:?}: {}", bios_path, r.message),
+        Ok(r) => warn!("Loaded system BIOS from {:?} [{}]: {}", bios_path, r.status, r.message),
         Err(e) => {
             error!("Cannot use system BIOS {:?}: {}", bios_path, e);
             eprintln!("Cannot use system BIOS {:?}: {}", bios_path, e);
