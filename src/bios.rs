@@ -294,6 +294,12 @@ fn tail_fill(d: &[u8]) -> (usize, u8) {
     (d.iter().rev().take_while(|&&b| b == fill).count(), fill)
 }
 
+/// Whether the last word holds the 16-bit sum of all other bytes (true for the Mono-I, Mono-II and Mono-IV dumps we hold).
+pub fn checksum_ok(d: &[u8]) -> bool {
+    let n = d.len();
+    n >= 2 && d[..n - 2].iter().fold(0u16, |s, &b| s.wrapping_add(b as u16)) == u16::from_be_bytes([d[n - 2], d[n - 1]])
+}
+
 fn report(status: Status, known: Option<&'static KnownRom>, board: Option<Board>, word_swapped: bool, sha1: String, message: String) -> Report {
     Report { status, known, board, word_swapped, sha1, message }
 }
@@ -367,8 +373,10 @@ pub fn inspect(mut data: Vec<u8>) -> BiosImage {
     }
     if tail >= TRUNCATED_TAIL {
         msg += &format!("; the last {} bytes are all 0x{:02X}, so the dump is probably truncated", tail, fill);
+    } else if checksum_ok(&data) {
+        msg += "; its built-in checksum is valid, but it may not boot";
     } else {
-        msg += "; it may not boot";
+        msg += "; its built-in checksum does not match (corrupt, patched or a board without one?), it may not boot";
     }
     BiosImage { report: report(Status::Warning, None, None, swap, sha, msg), data }
 }
@@ -520,6 +528,21 @@ mod tests {
         assert!(!img.report.word_swapped);
         assert!(img.report.usable());
         assert_eq!(img.data, synthetic());
+    }
+
+    #[test]
+    fn checksum_is_reported_for_unknown_images() {
+        let mut d = synthetic();
+        assert!(!checksum_ok(&d));
+        assert!(inspect(d.clone()).report.message.contains("does not match"));
+        let n = d.len();
+        let sum = d[..n - 2].iter().fold(0u16, |s, &b| s.wrapping_add(b as u16));
+        d[n - 2..].copy_from_slice(&sum.to_be_bytes());
+        assert!(checksum_ok(&d));
+        assert!(inspect(d.clone()).report.message.contains("checksum is valid"));
+        swap_words(&mut d);
+        let img = inspect(d);
+        assert!(img.report.word_swapped && img.report.message.contains("checksum is valid"));
     }
 
     #[test]
