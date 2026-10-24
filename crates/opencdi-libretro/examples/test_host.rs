@@ -156,7 +156,7 @@ unsafe extern "C" fn input_state_cb(port: c_uint, device: c_uint, _index: c_uint
 }
 
 fn usage() -> ! {
-    eprintln!("usage: test_host <core.so> <system_dir> [frames=600] [game_path|none] [--replay <script|@file> | --memory] [--sample <n>]");
+    eprintln!("usage: test_host <core.so> <system_dir> [frames=600] [game_path|none] [--replay <script|@file> | --memory] [--sample <n>] [--roundtrip <frame>]");
     std::process::exit(2);
 }
 
@@ -172,6 +172,7 @@ fn raw_pointer(x: i32, y: i32, pressed: bool, alt: &mut i16) -> (i16, i16, bool)
 }
 
 // Replays a shared-format script through the core: pointer events via RETRO_DEVICE_POINTER, pad events via the RetroPad.
+#[derive(Clone)]
 struct Replay {
     events: Vec<Event>,
     next: usize,
@@ -209,6 +210,7 @@ impl Replay {
 }
 
 // Harness autoplay decision from plane A through retro_get_memory_data; see doc/handover/status-and-todo.md for the launch substitute.
+#[derive(Clone)]
 struct Memory {
     ready: u32,
     launched: bool,
@@ -251,6 +253,7 @@ fn main() {
     let mut replay: Option<Replay> = None;
     let mut memory: Option<Memory> = None;
     let mut sample = 0u64;
+    let mut roundtrip: Option<u64> = None;
     let mut i = if a.len() > 4 && !a[4].starts_with("--") { 5 } else { 4 };
     while i < a.len() {
         match a[i].as_str() {
@@ -266,11 +269,12 @@ fn main() {
             }
             "--memory" => memory = Some(Memory { ready: 0, launched: false, was_ready: false, alt: 0, pointer: (0, 0, false) }),
             "--sample" => { i += 1; sample = a.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage()); }
+            "--roundtrip" => { i += 1; roundtrip = Some(a.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())); }
             _ => usage(),
         }
         i += 1;
     }
-    if (replay.is_some() && memory.is_some()) || (memory.is_some() && game.is_none()) {
+    if (replay.is_some() && memory.is_some()) || (memory.is_some() && game.is_none()) || roundtrip.is_some_and(|n| n >= frames) {
         usage();
     }
     *HOST.lock().unwrap() = Some(HostState {
@@ -313,6 +317,9 @@ fn main() {
         let region = sym!("retro_get_region", unsafe extern "C" fn() -> c_uint);
         let mem_data = sym!("retro_get_memory_data", unsafe extern "C" fn(c_uint) -> *mut c_void);
         let set_port = sym!("retro_set_controller_port_device", unsafe extern "C" fn(c_uint, c_uint));
+        let serialize_size = sym!("retro_serialize_size", unsafe extern "C" fn() -> usize);
+        let serialize = sym!("retro_serialize", unsafe extern "C" fn(*mut c_void, usize) -> bool);
+        let unserialize = sym!("retro_unserialize", unsafe extern "C" fn(*const c_void, usize) -> bool);
 
         assert_eq!(api_version(), 1, "RETRO_API_VERSION");
         let mut si = SystemInfo {
@@ -351,7 +358,7 @@ fn main() {
         if memory.is_some() || replay.as_ref().is_some_and(Replay::has_pointer) {
             set_port(0, DEVICE_POINTER);
         }
-        for frame in 0..frames {
+        let step = |frame: u64, replay: &mut Option<Replay>, memory: &mut Option<Memory>| {
             if let Some(r) = replay.as_mut() {
                 let (pointer, pad) = r.at(frame);
                 with_host(|h| (h.pointer, h.pad) = (pointer, pad));
@@ -365,6 +372,68 @@ fn main() {
             if sample > 0 && (frame + 1) % sample == 0 {
                 eprintln!("SAMPLE frame={} nonblack={}", frame + 1, with_host(|h| h.nonblack));
             }
+        };
+        let split = roundtrip.unwrap_or(frames);
+        for frame in 0..split {
+            step(frame, &mut replay, &mut memory);
+        }
+        if let Some(at) = roundtrip {
+            // Save at `at`, run to the end (A), load, run the same frames with the same input again (B); A and B must match.
+            let size = serialize_size();
+            assert!(size > 0, "retro_serialize_size returned 0");
+            let mut saved = vec![0u8; size];
+            assert!(serialize(saved.as_mut_ptr() as *mut c_void, size), "retro_serialize failed");
+            let used = saved.iter().rposition(|&b| b != 0).map_or(0, |p| p + 1);
+            let (replay0, memory0) = (replay.clone(), memory.clone());
+            let restart = || with_host(|h| {
+                (h.video_all, h.video_last, h.audio, h.audio_frames, h.frames) = (FNV_OFFSET, FNV_OFFSET, FNV_OFFSET, 0, 0);
+            });
+            let result = || with_host(|h| (h.video_all, h.video_last, h.audio, h.audio_frames, h.frames, h.nonblack));
+            restart();
+            for frame in at..frames {
+                step(frame, &mut replay, &mut memory);
+            }
+            let a = result();
+            let t = std::time::Instant::now();
+            assert!(unserialize(saved.as_ptr() as *const c_void, size), "retro_unserialize failed");
+            let load_ms = t.elapsed().as_secs_f64() * 1e3;
+            let mut again = vec![0u8; size];
+            let t = std::time::Instant::now();
+            assert!(serialize(again.as_mut_ptr() as *mut c_void, size), "retro_serialize after load failed");
+            let save_ms = t.elapsed().as_secs_f64() * 1e3;
+            let reser = if again == saved { "same" } else { "DIFF" };
+            (replay, memory) = (replay0, memory0);
+            restart();
+            for frame in at..frames {
+                step(frame, &mut replay, &mut memory);
+            }
+            let b = result();
+            let stable = serialize_size() == size;
+            // Rejections must return false without poisoning the core.
+            let mut bad = saved.clone();
+            bad[0] ^= 0xFF;
+            let mut reject = !unserialize(bad.as_ptr() as *const c_void, size);
+            reject &= !unserialize(saved.as_ptr() as *const c_void, used / 2);
+            bad = saved.clone();
+            bad[used / 2] ^= 0x01;
+            reject &= !unserialize(bad.as_ptr() as *const c_void, size);
+            reject &= serialize(again.as_mut_ptr() as *mut c_void, size);
+            eprintln!(
+                "ROUNDTRIP-DETAIL size={} used={} save_ms={:.2} load_ms={:.2} a=video_all:{:016x},video_last:{:016x},audio:{:016x},audio_frames:{},nonblack:{} b=video_all:{:016x},video_last:{:016x},audio:{:016x},audio_frames:{},nonblack:{}",
+                size, used, save_ms, load_ms, a.0, a.1, a.2, a.3, a.5, b.0, b.1, b.2, b.3, b.5
+            );
+            println!(
+                "ROUNDTRIP at={} frames={} reser={} video={} audio={} size_stable={} reject={}",
+                at, a.4,
+                reser,
+                if (a.0, a.1) == (b.0, b.1) { "match" } else { "DIFFER" },
+                if (a.2, a.3) == (b.2, b.3) { "match" } else { "DIFFER" },
+                if stable { "yes" } else { "NO" },
+                if reject { "ok" } else { "FAILED" }
+            );
+            unload_game();
+            deinit();
+            return;
         }
 
         with_host(|h| {
