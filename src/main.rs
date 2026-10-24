@@ -155,21 +155,36 @@ fn find_bios_rom() -> Option<PathBuf> {
     const BIOS_CANDIDATES: &[&str] = &[
         "bios/cdi220b.rom",
         "cdi220b.rom",
-        "bios/cdi220.rom",
-        "cdi220.rom",
         "bios/cdi200.rom",
         "cdi200.rom",
+        "bios/cdimono1.zip",
+        "cdimono1.zip",
+        "bios/cdibios.zip",
+        "cdibios.zip",
         "bios/cdi.rom",
         "cdi.rom",
+        "bios/cdi220.rom",
+        "cdi220.rom",
         "bios/cdi490a.rom",
         "cdi490a.rom",
+        "bios/cdi490a.zip",
+        "cdi490a.zip",
     ];
-    for &name in BIOS_CANDIDATES {
-        if let Some(p) = find_file(name) {
-            return Some(p);
+    // Each found file is checked; the best one wins.
+    let mut seen = HashSet::new();
+    let found = BIOS_CANDIDATES.iter().filter_map(|n| find_file(n)).filter(|p| seen.insert(p.clone())).filter_map(|p| {
+        match Machine::read_bios(&p) {
+            Ok((_, img)) => {
+                info!("BIOS candidate {:?} [{}]: {}", p, img.report.status, img.report.message);
+                Some((p, img))
+            }
+            Err(e) => {
+                warn!("BIOS candidate {:?}: {}", p, e);
+                None
+            }
         }
-    }
-    None
+    });
+    bios::best(found).filter(|(_, img)| img.report.status != bios::Status::Error).map(|(p, _)| p)
 }
 
 // First candidate that passes the cartridge check; refused files are logged with the reason.
@@ -314,13 +329,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let error_msg =
                 "OpenCDi - Required System BIOS Missing\n\
                 ======================================\n\n\
-                The emulator cannot start because no Philips CD-i system BIOS ROM was found.\n\n\
+                The emulator cannot start because no usable Philips CD-i system BIOS ROM was found (see the log).\n\n\
                 Recommended File:\n\
                   • cdi220b.rom (512 KB, Philips CD-i 220 European PAL BIOS)\n\
                     SHA-1: 53360A1F21DDAC952E95306CED64186A3FC0B93E\n\
                     MD5:   AC0D468BE366779C9DF633BE98DA250A\n\n\
                 Alternative Supported BIOSes:\n\
-                  • cdi220.rom, cdi200.rom, cdi490a.rom\n\n\
+                  • cdi200.rom, cdi.rom, cdimono1.zip / cdibios.zip\n\
+                  • cdi220.rom is a truncated dump; cdi490a.rom is not emulated yet\n\n\
                 Where to place the BIOS ROM:\n\
                   1. In a 'bios/' subfolder next to opencdi.exe\n\
                   2. OR directly in the same folder as opencdi.exe\n\
