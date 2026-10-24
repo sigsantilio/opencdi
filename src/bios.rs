@@ -381,6 +381,46 @@ pub fn inspect(mut data: Vec<u8>) -> BiosImage {
     BiosImage { report: report(Status::Warning, None, None, swap, sha, msg), data }
 }
 
+/// Size of the Digital Video Cartridge ROM (256 KB).
+pub const DVC_ROM_SIZE: usize = 256 * 1024;
+
+/// Checks a would-be DVC cartridge ROM; only the known VMPEG dump comes back `Ok`, since only VMPEG is emulated.
+pub fn inspect_dvc(data: Vec<u8>) -> BiosImage {
+    let sha = sha1_hex(&data);
+    let done = |data: Vec<u8>, status: Status, known: Option<&'static KnownRom>, msg: String| {
+        let board = if status == Status::Ok { known.map(|k| k.board) } else { None };
+        BiosImage { report: report(status, known, board, false, sha.clone(), msg), data }
+    };
+    if data.is_empty() {
+        return done(data, Status::Error, None, "file is empty".into());
+    }
+    if let Some((k, _)) = identify(&data) {
+        return match (k.kind, k.board) {
+            (Dvc, Mono1) => done(data, Status::Ok, Some(k), format!("{}, {}: known good dump", k.model, k.file)),
+            (Dvc, _) => done(data, Status::Error, Some(k), format!("{} ({}, {} board): only the VMPEG cartridge is emulated, not fitted", k.model, k.file, k.board.name())),
+            _ => done(data, Status::Error, Some(k), format!("this is the {} ROM, not a DVC cartridge ROM", k.model)),
+        };
+    }
+    if let Some(what) = foreign_format(&data) {
+        return done(data, Status::Error, None, format!("not a DVC cartridge ROM: this is {}", what));
+    }
+    if data.len() != DVC_ROM_SIZE {
+        let msg = format!("size is {} bytes, the VMPEG cartridge ROM is {} bytes", data.len(), DVC_ROM_SIZE);
+        return done(data, Status::Error, None, msg);
+    }
+    let msg = format!("unknown cartridge image (SHA-1 {} not in the table), not fitted; only the known VMPEG dump is used", sha);
+    done(data, Status::Warning, None, msg)
+}
+
+/// Checks every 256 KB entry of a zip (`cdimono1.zip` carries `vmpega.rom`) and returns the best one with its entry name.
+pub fn best_dvc_in_zip(zip: &[u8]) -> Result<(String, BiosImage), String> {
+    let mut found = Vec::new();
+    for e in zip_entries(zip)?.into_iter().filter(|e| e.size == DVC_ROM_SIZE) {
+        found.push((e.name.clone(), inspect_dvc(e.extract()?)));
+    }
+    best(found).ok_or_else(|| "zip holds no 256 KB cartridge ROM".into())
+}
+
 /// Picks the best image: highest rank, then table preference, then input order.
 pub fn best<T>(images: impl IntoIterator<Item = (T, BiosImage)>) -> Option<(T, BiosImage)> {
     let mut best: Option<(T, BiosImage)> = None;
@@ -684,6 +724,21 @@ mod tests {
         assert_eq!(name, "set/cdi490a.rom");
         assert!(img.report.word_swapped);
         assert_eq!(img.data, synthetic());
+    }
+
+    #[test]
+    fn dvc_check_refuses_system_and_unknown_images() {
+        assert_eq!(inspect_dvc(Vec::new()).report.status, Status::Error);
+        let sys = inspect_dvc(synthetic());
+        assert_eq!(sys.report.status, Status::Error);
+        assert!(sys.report.message.contains("bytes"), "{}", sys.report.message);
+        let unknown = inspect_dvc(synthetic()[..DVC_ROM_SIZE].to_vec());
+        assert_eq!(unknown.report.status, Status::Warning);
+        assert!(unknown.report.message.contains("not fitted"));
+        let z = zip_of(&[("cdi220b.rom", &synthetic(), false), ("vmpega.rom", &synthetic()[..DVC_ROM_SIZE], true)]);
+        let (name, img) = best_dvc_in_zip(&z).unwrap();
+        assert_eq!((name.as_str(), img.report.status), ("vmpega.rom", Status::Warning));
+        assert!(best_dvc_in_zip(&zip_of(&[("cdi220b.rom", &synthetic(), false)])).is_err());
     }
 
     #[test]

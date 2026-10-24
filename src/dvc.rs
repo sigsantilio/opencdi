@@ -630,6 +630,11 @@ impl Dvc {
 
     pub fn load_rom<P: AsRef<Path>>(&mut self, path: P) -> std::io::Result<()> {
         let data = std::fs::read(path)?;
+        self.load_rom_bytes(&data);
+        Ok(())
+    }
+
+    pub fn load_rom_bytes(&mut self, data: &[u8]) {
         let mut rom_buf: Box<[u8; 256 * 1024]> = vec![0xFFu8; 256 * 1024].into_boxed_slice().try_into().unwrap();
         let copy_len = data.len().min(256 * 1024);
         rom_buf[..copy_len].copy_from_slice(&data[..copy_len]);
@@ -638,7 +643,6 @@ impl Dvc {
         }
         self.rom = Some(rom_buf);
         info!("DVC ROM caricata ({} byte)", copy_len);
-        Ok(())
     }
 
     pub fn is_fitted(&self) -> bool {

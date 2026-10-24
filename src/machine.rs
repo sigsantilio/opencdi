@@ -53,6 +53,22 @@ impl Machine {
         self.bus.load_dvc_rom(path)
     }
 
+    /// Reads a DVC cartridge ROM (`.rom` or a zip holding `vmpega.rom`) and checks it; nothing is fitted.
+    pub fn read_dvc<P: AsRef<Path>>(path: P) -> std::io::Result<(Option<String>, BiosImage)> {
+        let data = std::fs::read(path)?;
+        if bios::is_zip(&data) {
+            let (entry, img) = bios::best_dvc_in_zip(&data).map_err(std::io::Error::other)?;
+            Ok((Some(entry), img))
+        } else {
+            Ok((None, bios::inspect_dvc(data)))
+        }
+    }
+
+    /// Fits a checked cartridge ROM.
+    pub fn load_dvc_image(&mut self, img: &BiosImage) {
+        self.bus.dvc.load_rom_bytes(&img.data);
+    }
+
     pub fn load_disc<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Box<dyn std::error::Error>> {
         self.bus.load_cdrom(path)
     }
