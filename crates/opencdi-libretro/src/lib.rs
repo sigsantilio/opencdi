@@ -3,6 +3,7 @@ pub mod libretro;
 
 use input::Input;
 use libretro::*;
+use opencdi::bios;
 use opencdi::machine::Machine;
 use opencdi::mcd212::{VideoMode, SCREEN_HEIGHT, SCREEN_WIDTH};
 use opencdi::savestate::{Reader, State};
@@ -12,8 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-// Looked up in the frontend's system directory, in this order (cdi490a.rom is left out until Mono-IV exists).
-pub const BIOS_NAMES: &[&str] = &["cdi220b.rom", "cdi220.rom", "cdi200.rom", "cdi.rom"];
+// Looked up case-insensitively in the system directory, in this order; Mono-IV images are reported, not booted.
+pub const BIOS_NAMES: &[&str] = &["cdi220b.rom", "cdi200.rom", "cdimono1.zip", "cdibios.zip", "cdi.rom", "cdi220.rom", "cdi490a.rom", "cdi490a.zip"];
+const MESSAGE_FRAMES: c_uint = 360;
 const AUDIO_RATE: u32 = 37800;
 // Room above the size measured at the first serialize_size call, for buffers that grow later (DVC decoder, FIFOs).
 const STATE_HEADROOM: usize = 4 << 20;
@@ -135,27 +137,65 @@ fn system_directory() -> Option<PathBuf> {
     if s.is_empty() { None } else { Some(PathBuf::from(s)) }
 }
 
-// Mono-I BIOS images start with the initial SSP 0x00001500; a byte-swapped dump reads 0x00000015.
-const BIOS_FIRST_LONG: u32 = 0x0000_1500;
-
-fn first_long(p: &Path) -> Option<u32> {
-    use std::io::Read;
-    let mut b = [0u8; 4];
-    std::fs::File::open(p).ok()?.read_exact(&mut b).ok()?;
-    Some(u32::from_be_bytes(b))
+// Shows a short on-screen message (SET_MESSAGE); the full text also goes to the log.
+fn show_message(msg: &str) {
+    let Ok(c) = CString::new(msg) else { return };
+    let mut m = retro_message { msg: c.as_ptr(), frames: MESSAGE_FRAMES };
+    // SAFETY: SET_MESSAGE reads a `retro_message` during the call; `c` outlives it.
+    unsafe { env_call(RETRO_ENVIRONMENT_SET_MESSAGE, &mut m as *mut retro_message as *mut c_void) };
 }
 
-fn find_bios(dir: &Path) -> Option<PathBuf> {
-    for p in BIOS_NAMES.iter().map(|n| dir.join(n)).filter(|p| p.is_file()) {
-        match first_long(&p) {
-            Some(BIOS_FIRST_LONG) => return Some(p),
-            v => log(RETRO_LOG_WARN, &format!(
-                "skipping {}: first long {}, expected {:08x} (byte-swapped or not a CD-i BIOS?)",
-                p.display(), v.map_or("unreadable".into(), |x| format!("{:08x}", x)), BIOS_FIRST_LONG
-            )),
+fn bios_candidates(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else { return out };
+    let files: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+    for name in BIOS_NAMES {
+        let hit = |p: &&PathBuf| p.file_name().is_some_and(|f| f.to_string_lossy().eq_ignore_ascii_case(name));
+        out.extend(files.iter().filter(hit).cloned());
+    }
+    out
+}
+
+// Checks candidates in order, logs each verdict, stops at the first good image and returns the best usable one.
+fn find_bios(dir: &Path) -> Result<PathBuf, String> {
+    let candidates = bios_candidates(dir);
+    if candidates.is_empty() {
+        return Err(format!("no CD-i system ROM in {} (looked for {})", dir.display(), BIOS_NAMES.join(", ")));
+    }
+    let mut checked = Vec::new();
+    for p in candidates {
+        let (entry, img) = match Machine::read_bios(&p) {
+            Ok(x) => x,
+            Err(e) => {
+                log(RETRO_LOG_WARN, &format!("BIOS {}: {}", p.display(), e));
+                continue;
+            }
+        };
+        let r = &img.report;
+        let level = match r.rank() {
+            3 => RETRO_LOG_INFO,
+            0 => RETRO_LOG_ERROR,
+            _ => RETRO_LOG_WARN,
+        };
+        let inside = entry.map_or_else(String::new, |e| format!(" ({})", e));
+        log(level, &format!("BIOS {}{} [{}]: {}", p.display(), inside, r.status, r.message));
+        let good = r.rank() == 3;
+        checked.push((p, img));
+        if good {
+            break;
         }
     }
-    None
+    let file = |p: &Path| p.file_name().map_or_else(String::new, |f| f.to_string_lossy().into_owned());
+    match bios::best(checked) {
+        Some((p, img)) if img.report.usable() => {
+            if img.report.status != bios::Status::Ok {
+                show_message(&format!("CD-i BIOS {}: {}", file(&p), img.report.message));
+            }
+            Ok(p)
+        }
+        Some((p, img)) => Err(format!("no usable CD-i system ROM; best candidate {}: {}", file(&p), img.report.message)),
+        None => Err(format!("no readable CD-i system ROM in {}", dir.display())),
+    }
 }
 
 fn is_ntsc_name(path: &Path, machine: &Machine) -> bool {
@@ -504,7 +544,7 @@ pub extern "C" fn retro_cheat_set(_index: c_uint, _enabled: bool, _code: *const 
 fn load(game: *const retro_game_info) -> Result<(), String> {
     unload();
     let dir = system_directory().ok_or("frontend gave no system directory")?;
-    let bios = find_bios(&dir).ok_or_else(|| format!("no BIOS in {} (looked for {})", dir.display(), BIOS_NAMES.join(", ")))?;
+    let bios = find_bios(&dir).inspect_err(|e| show_message(e))?;
     let mut temp = None;
     let disc = if game.is_null() {
         None
@@ -621,6 +661,37 @@ mod tests {
     use super::*;
 
     static SERIAL: Mutex<()> = Mutex::new(());
+
+    // Synthetic Mono-I style image (reset vector plus filler), never real ROM bytes.
+    fn synthetic_rom() -> Vec<u8> {
+        let mut d: Vec<u8> = (0..bios::SYSTEM_ROM_SIZE as u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8 | 1).collect();
+        d[..8].copy_from_slice(&[0x00, 0x00, 0x15, 0x00, 0x00, 0x40, 0x04, 0xB8]);
+        d
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("opencdi-bios-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn find_bios_skips_bad_images_and_matches_names_case_insensitively() {
+        let d = temp_dir("pick");
+        assert!(find_bios(&d).unwrap_err().contains("no CD-i system ROM"));
+        std::fs::write(d.join("cdi220b.rom"), vec![0xFFu8; 1000]).unwrap();
+        assert!(find_bios(&d).unwrap_err().contains("no usable"));
+        let mut swapped = synthetic_rom();
+        bios::swap_words(&mut swapped);
+        std::fs::write(d.join("CDI.ROM"), &swapped).unwrap();
+        assert_eq!(find_bios(&d).unwrap(), d.join("CDI.ROM"));
+        let mut m = Machine::new();
+        let r = m.load_bios(d.join("CDI.ROM")).unwrap();
+        assert!(r.word_swapped);
+        assert_eq!(m.bus.rom[..], synthetic_rom()[..]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn guard_catches_panic_and_returns_fallback() {

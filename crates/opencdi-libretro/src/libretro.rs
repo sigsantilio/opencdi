@@ -41,6 +41,7 @@ pub const RETRO_MEMORY_RTC: c_uint = 1;
 pub const RETRO_MEMORY_SYSTEM_RAM: c_uint = 2;
 pub const RETRO_MEMORY_VIDEO_RAM: c_uint = 3;
 
+pub const RETRO_ENVIRONMENT_SET_MESSAGE: c_uint = 6;
 pub const RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY: c_uint = 9;
 pub const RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: c_uint = 10;
 pub const RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS: c_uint = 11;
@@ -101,6 +102,12 @@ pub struct retro_system_timing {
 pub struct retro_system_av_info {
     pub geometry: retro_game_geometry,
     pub timing: retro_system_timing,
+}
+
+#[repr(C)]
+pub struct retro_message {
+    pub msg: *const c_char,
+    pub frames: c_uint,
 }
 
 #[repr(C)]
