@@ -97,7 +97,8 @@ fn main() {
     let report = m.load_bios(bios).unwrap_or_else(|e| panic!("load bios {}: {}", bios, e));
     eprintln!("bios {}: {}", report.status, report.message);
     if let Some(p) = dvc {
-        m.load_dvc_rom(p).unwrap_or_else(|e| panic!("load dvc {}: {}", p, e));
+        let report = m.load_dvc(p).unwrap_or_else(|e| panic!("load dvc {}: {}", p, e));
+        eprintln!("dvc {}: {}", report.status, report.message);
     }
     if disc != "none" {
         m.load_disc(disc).expect("load disc");

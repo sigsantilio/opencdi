@@ -408,7 +408,7 @@ pub fn inspect_dvc(data: Vec<u8>) -> BiosImage {
         let msg = format!("size is {} bytes, the VMPEG cartridge ROM is {} bytes", data.len(), DVC_ROM_SIZE);
         return done(data, Status::Error, None, msg);
     }
-    let msg = format!("unknown cartridge image (SHA-1 {} not in the table), not fitted; only the known VMPEG dump is used", sha);
+    let msg = format!("unknown cartridge image (SHA-1 {} not in the table), may not work", sha);
     done(data, Status::Warning, None, msg)
 }
 
@@ -734,7 +734,7 @@ mod tests {
         assert!(sys.report.message.contains("bytes"), "{}", sys.report.message);
         let unknown = inspect_dvc(synthetic()[..DVC_ROM_SIZE].to_vec());
         assert_eq!(unknown.report.status, Status::Warning);
-        assert!(unknown.report.message.contains("not fitted"));
+        assert!(unknown.report.message.contains("unknown cartridge"));
         let z = zip_of(&[("cdi220b.rom", &synthetic(), false), ("vmpega.rom", &synthetic()[..DVC_ROM_SIZE], true)]);
         let (name, img) = best_dvc_in_zip(&z).unwrap();
         assert_eq!((name.as_str(), img.report.status), ("vmpega.rom", Status::Warning));

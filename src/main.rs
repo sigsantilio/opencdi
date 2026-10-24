@@ -172,6 +172,7 @@ fn find_bios_rom() -> Option<PathBuf> {
     None
 }
 
+// First candidate that passes the cartridge check; refused files are logged with the reason.
 fn find_dvc_rom() -> Option<PathBuf> {
     const DVC_CANDIDATES: &[&str] = &[
         "dvc/vmpega.rom",
@@ -182,8 +183,11 @@ fn find_dvc_rom() -> Option<PathBuf> {
         "impega.rom",
     ];
     for &name in DVC_CANDIDATES {
-        if let Some(p) = find_file(name) {
-            return Some(p);
+        let Some(p) = find_file(name) else { continue };
+        match Machine::read_dvc(&p) {
+            Ok((_, img)) if img.report.status != bios::Status::Error => return Some(p),
+            Ok((_, img)) => warn!("DVC ROM {:?} refused: {}", p, img.report.message),
+            Err(e) => warn!("DVC ROM {:?}: {}", p, e),
         }
     }
     None
@@ -373,7 +377,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dvc_arg = flag_value("--dvc").map(PathBuf::from);
     if !dvc_disabled {
         if let Some(dvc_path) = dvc_arg.clone().or_else(find_dvc_rom) {
-            if let Ok(_) = m.load_dvc_rom(&dvc_path) {
+            if let Ok(_) = m.load_dvc(&dvc_path) {
                 info!("Loaded Digital Video Cartridge (DVC) ROM from {:?}", dvc_path);
             }
         } else {
@@ -830,7 +834,7 @@ impl App {
 
                             if !self.dvc_disabled && !self.m.bus.dvc.is_fitted() {
                                 if let Some(dvc_path) = self.dvc_arg.clone().or_else(find_dvc_rom) {
-                                    if let Ok(_) = self.m.load_dvc_rom(&dvc_path) {
+                                    if let Ok(_) = self.m.load_dvc(&dvc_path) {
                                         info!("Loaded Digital Video Cartridge (DVC) extension from {:?}", dvc_path);
                                         #[cfg(target_os = "windows")]
                                         gui::update_dvc_menu(true);
@@ -951,7 +955,7 @@ impl App {
                         gui::update_dvc_menu(false);
                     } else {
                         if let Some(dvc_path) = self.dvc_arg.clone().or_else(find_dvc_rom) {
-                            if let Ok(_) = self.m.load_dvc_rom(&dvc_path) {
+                            if let Ok(_) = self.m.load_dvc(&dvc_path) {
                                 info!("Inserted Digital Video Cartridge (DVC) from {:?}", dvc_path);
                                 #[cfg(target_os = "windows")]
                                 gui::update_dvc_menu(true);

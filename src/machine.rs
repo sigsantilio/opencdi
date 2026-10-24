@@ -69,6 +69,20 @@ impl Machine {
         self.bus.dvc.load_rom_bytes(&img.data);
     }
 
+    /// Checks and fits a cartridge ROM; refuses images whose check failed (an unknown image loads with a warning).
+    pub fn load_dvc<P: AsRef<Path>>(&mut self, path: P) -> std::io::Result<bios::Report> {
+        let (entry, img) = Self::read_dvc(path)?;
+        let mut report = img.report.clone();
+        if let Some(e) = entry {
+            report.message = format!("{}: {}", e, report.message);
+        }
+        if report.status == bios::Status::Error {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, report.message));
+        }
+        self.load_dvc_image(&img);
+        Ok(report)
+    }
+
     pub fn load_disc<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Box<dyn std::error::Error>> {
         self.bus.load_cdrom(path)
     }
