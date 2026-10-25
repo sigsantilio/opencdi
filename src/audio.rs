@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(feature = "host")]
 use log::{info, warn, error};
+#[cfg(feature = "host")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 // CD-i / CD-ROM XA ADPCM Filter Coefficients (K0, K1 scaled by 256)
@@ -274,10 +276,12 @@ impl CdiAudio {
     }
 }
 
+#[cfg(feature = "host")]
 pub struct HostAudioOutput {
     _stream: cpal::Stream,
 }
 
+#[cfg(feature = "host")]
 impl HostAudioOutput {
     pub fn try_start(
         sample_queue: Arc<Mutex<VecDeque<(f32, f32)>>>,

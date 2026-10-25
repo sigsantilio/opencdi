@@ -129,6 +129,39 @@ impl CdiBus {
         w
     }
 
+    /// Side-effect-free read of RAM/ROM (no wait states, no counters); `None` for device windows and unmapped space.
+    pub fn peek_byte(&self, address: u32) -> Option<u8> {
+        if (address & 0xFFFF_0000) == 0x8000_0000 || (address & 0x00FF_0000) == 0x0080_0000 {
+            return None;
+        }
+        let addr = address & 0x00FF_FFFF;
+        match addr {
+            0x000000..=0x07FFFF => Some(self.mcd212.plane_a[addr as usize]),
+            0x200000..=0x27FFFF => Some(self.mcd212.plane_b[(addr - 0x200000) as usize]),
+            0x300000..=0x303BFF => Some(self.cdic.ram[(addr - 0x300000) as usize]),
+            0x400000..=0x47FFFF => Some(self.rom[(addr - 0x400000) as usize]),
+            0x500000..=0x57FFFF => Some(self.sys_ram[(addr - 0x500000) as usize]),
+            0xD00000..=0xDFFFFF if self.dvc.is_fitted() => Some(self.dvc.read_ram1((addr - 0xD00000) as usize)),
+            0xE40000..=0xE7FFFF => self.dvc.rom.as_ref().map(|r| r[(addr - 0xE40000) as usize % r.len()]),
+            0xE80000..=0xEFFFFF if self.dvc.is_fitted() && self.dvc.ram2_enabled => {
+                Some(self.dvc.read_ram2((addr - 0xE80000) as usize))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn peek_word(&self, address: u32) -> Option<u16> {
+        let hi = self.peek_byte(address)? as u16;
+        let lo = self.peek_byte(address.wrapping_add(1))? as u16;
+        Some((hi << 8) | lo)
+    }
+
+    pub fn peek_long(&self, address: u32) -> Option<u32> {
+        let hi = self.peek_word(address)? as u32;
+        let lo = self.peek_word(address.wrapping_add(2))? as u32;
+        Some((hi << 16) | lo)
+    }
+
     pub fn tick_timer(&mut self, cycles: u32) {
         self.scc_timer.tick(cycles);
     }
@@ -915,5 +948,31 @@ impl AddressBus for CdiBus {
             0x18 + level as u32
         })();
         vec
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peek_matches_read_without_side_effects() {
+        let mut bus = CdiBus::new();
+        bus.mcd212.plane_a[0x5172..0x5176].copy_from_slice(&[0x00, 0x00, 0x00, 0x02]);
+        bus.rom[0x5E48..0x5E4C].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        bus.sys_ram[0x10..0x12].copy_from_slice(&[0xAB, 0xCD]);
+        bus.current_line_cycle = 100;
+
+        assert_eq!(bus.peek_long(0x5172), Some(2));
+        assert_eq!(bus.peek_long(0x405E48), Some(0x1234_5678));
+        assert_eq!(bus.peek_word(0x500010), Some(0xABCD));
+        assert_eq!(bus.peek_byte(0x303C00), None);
+        assert_eq!(bus.peek_byte(0xE40000), None);
+        assert_eq!(bus.peek_byte(0x8000_2011), None);
+        assert_eq!((bus.wait_cycles, bus.current_line_cycle, bus.trace_setup), (0, 100, false));
+
+        assert_eq!(bus.read_long(0x5172), 2);
+        assert_eq!(bus.read_byte(0x405E48), 0x12);
+        assert!(bus.wait_cycles > 0 && bus.current_line_cycle > 100 && bus.trace_setup);
     }
 }

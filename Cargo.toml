@@ -3,15 +3,51 @@ name = "opencdi"
 version = "0.1.8"
 edition = "2024"
 
+[features]
+default = ["host"]
+host = ["dep:minifb", "dep:cpal", "dep:gilrs", "dep:env_logger"]
+
+[workspace]
+
+[[bin]]
+name = "opencdi"
+path = "src/main.rs"
+required-features = ["host"]
+
+[[bin]]
+name = "debug_games"
+path = "src/bin/debug_games.rs"
+required-features = ["host"]
+
+[[bin]]
+name = "test_audio_trace"
+path = "src/bin/test_audio_trace.rs"
+required-features = ["host"]
+
+[[bin]]
+name = "test_dvc"
+path = "src/bin/test_dvc.rs"
+required-features = ["host"]
+
+[[bin]]
+name = "test_vcd"
+path = "src/bin/test_vcd.rs"
+required-features = ["host"]
+
+[[bin]]
+name = "test_boot_disc"
+path = "src/bin/test_boot_disc.rs"
+required-features = ["host"]
+
 [dependencies]
 byteorder = "1.5.0"
 chd = "0.3.4"
-cpal = "0.18.2"
-env_logger = "0.11.11"
-gilrs = "0.11.2"
+cpal = { version = "0.18.2", optional = true }
+env_logger = { version = "0.11.11", optional = true }
+gilrs = { version = "0.11.2", optional = true }
 log = "0.4.34"
 m68k = "0.12.1"
-minifb = "0.28.0"
+minifb = { version = "0.28.0", optional = true }
 oxideav-mp2 = "0.0.10"
 
 [patch.crates-io]
