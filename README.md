@@ -65,6 +65,8 @@ cargo build --release
 
 The optimized binary will be built in `target/release/opencdi.exe`.
 
+On Linux the same command builds `target/release/opencdi` (needs the ALSA and udev development packages; the window uses X11 or Wayland).
+
 ## System BIOS & Required Files Setup
 
 OpenCDi is a low-level hardware emulator that executes authentic Philips CD-i firmware to initialize the OS-9 operating system kernel, bus controllers, and system drivers. Due to copyright restrictions, **these proprietary system ROMs are not bundled with the emulator and must be provided by the user.**
@@ -128,6 +130,8 @@ opencdi.exe --bios
 opencdi.exe --no-dvc "path/to/game.chd"
 ```
 Or simply drag and drop any `.chd` CD-i disc image directly onto `opencdi.exe`.
+
+Other options: `--rom <path>` (system BIOS), `--frames <n>` (quit after n frames), `--mouse` (start in mouse mode), `--no-host-input` (ignore keyboard, mouse and gamepads), `--recent [n]` (list the recent disc images or boot number n; on Windows they are also under File, Recent Disc Images), `--help` (all options). Shortcuts: F11 fullscreen, F5 reset, P pause, Space fast-forward, F8 screenshot, Esc quit.
 
 ---
 
