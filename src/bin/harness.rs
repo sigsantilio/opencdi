@@ -41,7 +41,7 @@ fn dump_ppm(fb: &[u32], path: &str) {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: harness <bios.rom> <disc|none> <frames> [--dvc <rom>] [--ppm <out.ppm>] [--ntsc] [--autoplay [--print-autoplay-script]] [--input <script|@file>] [--sample <n> [--sample-audio]] [--dump-every <n> <prefix>]");
+    eprintln!("usage: harness <bios.rom> <disc|none> <frames> [--dvc <rom>] [--ppm <out.ppm>] [--ntsc] [--autoplay [--print-autoplay-script]] [--input <script|@file>] [--sample <n> [--sample-audio]] [--dump-every <n> <prefix>] [--nvram-out <file>]");
     std::process::exit(2);
 }
 
@@ -61,11 +61,13 @@ fn main() {
     let mut sample = 0u64;
     let mut sample_audio = false;
     let mut dump: Option<(u64, String)> = None;
+    let mut nvram_out: Option<&String> = None;
     let mut i = 4;
     while i < a.len() {
         match a[i].as_str() {
             "--dvc" => { i += 1; dvc = a.get(i); }
             "--ppm" => { i += 1; ppm = a.get(i); }
+            "--nvram-out" => { i += 1; nvram_out = a.get(i); }
             "--ntsc" => ntsc = true,
             "--autoplay" => autoplay = true,
             "--print-autoplay-script" => print_script = true,
@@ -179,6 +181,9 @@ fn main() {
     let nonblack = m.framebuffer().iter().filter(|&&p| p & 0x00FF_FFFF != 0).count();
     if let Some(p) = ppm {
         dump_ppm(m.framebuffer(), p);
+    }
+    if let Some(p) = nvram_out {
+        std::fs::write(p, &m.bus.nvram.ram[..]).expect("write nvram");
     }
     println!(
         "\nHARNESS frames={} pc={:08x} nonblack={} video_last={:016x} video_all={:016x} audio={:016x} audio_samples={}",
