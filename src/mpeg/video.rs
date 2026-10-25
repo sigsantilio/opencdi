@@ -17,6 +17,7 @@ const START_SLICE_LAST: i32 = 0xAF;
 const START_PICTURE: i32 = 0x00;
 const START_EXTENSION: i32 = 0xB5;
 const START_USER_DATA: i32 = 0xB2;
+const SEQUENCE_HEADER_MAX_BITS: usize = 64 + 2 * 64 * 8;
 const START_GOP: i32 = 0xB8;
 
 fn is_slice_start_code(c: i32) -> bool {
@@ -897,45 +898,42 @@ impl Video {
             return None;
         }
         loop {
-            if self.start_code != START_PICTURE {
-                while self.start_code != START_PICTURE {
-                    if self.start_code == -1 {
-                        self.start_code = self.buffer.next_start_code();
-                        if self.start_code == -1 {
-                            break;
-                        }
+            while self.start_code != START_PICTURE && self.start_code != -1 {
+                if self.start_code == START_SEQUENCE {
+                    if !self.buffer.has(SEQUENCE_HEADER_MAX_BITS) {
+                        return None;
                     }
-                    if self.start_code == START_PICTURE {
-                        break;
+                    if self.sequence_size_changes() && self.has_reference_frame && !self.assume_no_b_frames {
+                        // Show the held reference picture before the new size drops it.
+                        self.has_reference_frame = false;
+                        return Some(self.emit(self.bwd));
                     }
-                    if self.start_code == START_GOP {
-                        if !self.buffer.has(27) {
-                            return None;
-                        }
-                        self.gop_header_seen = true;
-                        self.decode_gop_header();
-                    } else if self.start_code == START_SEQUENCE {
-                        self.sequence_header_seen = true;
-                        if !self.has_sequence_header {
-                            self.decode_sequence_header();
-                        }
+                    self.decode_sequence_header();
+                } else if self.start_code == START_GOP {
+                    if !self.buffer.has(27) {
+                        return None;
                     }
-                    self.start_code = -1;
+                    self.gop_header_seen = true;
+                    self.decode_gop_header();
                 }
-                if self.start_code == -1 {
-                    // Flush the last reference frame at end of stream.
-                    if self.has_reference_frame
-                        && !self.assume_no_b_frames
-                        && (self.buffer.has_ended() || self.sequence_end_seen)
-                        && (self.picture_type == PICTURE_TYPE_INTRA
-                            || self.picture_type == PICTURE_TYPE_PREDICTIVE)
-                    {
-
-self.has_reference_frame = false;
-                        return Some(self.bwd);
-                    }
-                    return None;
+                self.start_code = self.buffer.next_start_code();
+            }
+            if self.start_code == -1 {
+                self.start_code = self.buffer.next_start_code();
+                if self.start_code != -1 {
+                    continue;
                 }
+                // Flush the last reference frame at end of stream.
+                if self.has_reference_frame
+                    && !self.assume_no_b_frames
+                    && (self.buffer.has_ended() || self.sequence_end_seen)
+                    && (self.picture_type == PICTURE_TYPE_INTRA
+                        || self.picture_type == PICTURE_TYPE_PREDICTIVE)
+                {
+                    self.has_reference_frame = false;
+                    return Some(self.bwd);
+                }
+                return None;
             }
 
             // Need a full picture buffered before decoding it.
@@ -960,13 +958,25 @@ self.has_reference_frame = false;
             };
 
             if let Some(idx) = frame {
-                self.last_frame_time = self.time;
-                self.frames_decoded += 1;
-                self.time = self.frames_decoded as f64 / self.framerate;
-                self.buffer.discard_read_bytes();
-                return Some(idx);
+                return Some(self.emit(idx));
             }
         }
+    }
+
+    fn emit(&mut self, idx: usize) -> usize {
+        self.last_frame_time = self.time;
+        self.frames_decoded += 1;
+        self.time = self.frames_decoded as f64 / self.framerate;
+        self.buffer.discard_read_bytes();
+        idx
+    }
+
+    // Peeks the size fields of a sequence header at the read position.
+    fn sequence_size_changes(&mut self) -> bool {
+        let pos = self.buffer.tell();
+        let (w, h) = (self.buffer.read(12) as usize, self.buffer.read(12) as usize);
+        self.buffer.seek(pos);
+        w != 0 && h != 0 && (w != self.width || h != self.height)
     }
 
     fn decode_gop_header(&mut self) {
@@ -986,16 +996,17 @@ self.has_reference_frame = false;
     }
 
     fn decode_sequence_header(&mut self) -> bool {
-        let max_header_size = 64 + 2 * 64 * 8;
-        if !self.buffer.has(max_header_size) {
+        if !self.buffer.has(SEQUENCE_HEADER_MAX_BITS) {
             return false;
         }
 
-        self.width = self.buffer.read(12) as usize;
-        self.height = self.buffer.read(12) as usize;
-        if self.width == 0 || self.height == 0 {
+        let width = self.buffer.read(12) as usize;
+        let height = self.buffer.read(12) as usize;
+        if width == 0 || height == 0 {
             return false;
         }
+        self.width = width;
+        self.height = height;
 
         let mut par_code = self.buffer.read(4) as i32 - 1;
         if par_code < 0 {
@@ -1032,6 +1043,13 @@ self.has_reference_frame = false;
             self.non_intra_quant_matrix = NON_INTRA_QUANT_MATRIX;
         }
 
+        // Header handled; a repeat of the same size keeps the reference pictures.
+        self.start_code = -1;
+        self.sequence_header_seen = true;
+        if self.has_sequence_header && self.frames.first().map_or(false, |f| f.width == self.width && f.height == self.height) {
+            return true;
+        }
+        self.has_reference_frame = false;
         self.mb_width = (self.width + 15) >> 4;
         self.mb_height = (self.height + 15) >> 4;
         self.mb_size = self.mb_width * self.mb_height;
@@ -1579,7 +1597,8 @@ fn process_macroblock(
         + (mb_col * block_size) as i64
         + hp as i64;
     let di0 = ((mb_row * dw + mb_col) * block_size) as i64;
-    let needed_si_max = si0 + ((block_size - 1 + if odd_v { 1 } else { 0 }) * dw + block_size - 1 + if odd_h { 1 } else { 0 }) as i64;
+    // Half-pel neighbours are clamped below, so only the full-pel block must fit.
+    let needed_si_max = si0 + ((block_size - 1) * dw + block_size - 1) as i64;
     let needed_di_max = di0 + ((block_size - 1) * dw + block_size) as i64;
     if si0 < 0 || needed_si_max >= s.len() as i64 || di0 < 0 || needed_di_max > d.len() as i64 {
         return; // corrupt video
@@ -1588,33 +1607,38 @@ fn process_macroblock(
     let mut si = si0 as usize;
     let mut di = di0 as usize;
     let scan = dw - block_size;
+    let rows = s.len() / dw;
     for _y in 0..block_size {
         for _x in 0..block_size {
+            // Half-pel neighbours past the picture edge repeat the edge sample.
+            let below = if si / dw + 1 < rows { dw } else { 0 };
+            let right = usize::from(si % dw + 1 < dw);
+            let (s01, s10, s11) = (si + right, si + below, si + below + right);
             let val: i32 = match (interpolate, odd_h, odd_v) {
                 (false, false, false) => s[si] as i32,
-                (false, false, true) => (s[si] as i32 + s[si + dw] as i32 + 1) >> 1,
-                (false, true, false) => (s[si] as i32 + s[si + 1] as i32 + 1) >> 1,
+                (false, false, true) => (s[si] as i32 + s[s10] as i32 + 1) >> 1,
+                (false, true, false) => (s[si] as i32 + s[s01] as i32 + 1) >> 1,
                 (false, true, true) => {
                     (s[si] as i32
-                        + s[si + 1] as i32
-                        + s[si + dw] as i32
-                        + s[si + dw + 1] as i32
+                        + s[s01] as i32
+                        + s[s10] as i32
+                        + s[s11] as i32
                         + 2)
                         >> 2
                 }
                 (true, false, false) => (d[di] as i32 + s[si] as i32 + 1) >> 1,
                 (true, false, true) => {
-                    (d[di] as i32 + ((s[si] as i32 + s[si + dw] as i32 + 1) >> 1) + 1) >> 1
+                    (d[di] as i32 + ((s[si] as i32 + s[s10] as i32 + 1) >> 1) + 1) >> 1
                 }
                 (true, true, false) => {
-                    (d[di] as i32 + ((s[si] as i32 + s[si + 1] as i32 + 1) >> 1) + 1) >> 1
+                    (d[di] as i32 + ((s[si] as i32 + s[s01] as i32 + 1) >> 1) + 1) >> 1
                 }
                 (true, true, true) => {
                     (d[di] as i32
                         + ((s[si] as i32
-                            + s[si + 1] as i32
-                            + s[si + dw] as i32
-                            + s[si + dw + 1] as i32
+                            + s[s01] as i32
+                            + s[s10] as i32
+                            + s[s11] as i32
                             + 2)
                             >> 2)
                         + 1)
@@ -1734,3 +1758,41 @@ impl Frame {
     }
 }
 
+
+#[cfg(test)]
+mod edge_mc_tests {
+    use super::{process_macroblock, Video};
+
+    fn sequence_header(w: u32, h: u32) -> Vec<u8> {
+        let mut v = vec![0, 0, 1, 0xB3, (w >> 4) as u8, ((w & 15) << 4 | h >> 8) as u8, h as u8, 0x13];
+        v.extend([0xFF, 0xFF, 0xE0, 0x00]);
+        v.extend(std::iter::repeat(0).take(160));
+        v
+    }
+
+    #[test]
+    fn new_sequence_header_resizes_the_decoder() {
+        let mut es = sequence_header(32, 16);
+        es.extend(sequence_header(48, 16));
+        es.extend([0, 0, 1, 0x00, 0x00, 0x08, 0xFF, 0xF8]);
+        es.extend([0, 0, 1, 0x00, 0x00, 0x48, 0xFF, 0xF8]);
+        es.extend(std::iter::repeat(0).take(16));
+        let mut v = Video::new(es);
+        assert_eq!(v.width(), 32);
+        assert!(v.take_sequence_seen() && !v.take_sequence_seen());
+        v.decode();
+        assert_eq!((v.width(), v.frame(0).y.width), (48, 48));
+        assert!(v.take_sequence_seen());
+    }
+
+    #[test]
+    fn half_pel_at_bottom_right_edge_repeats_edge_sample() {
+        // 2x2 macroblocks of 16x16 luma; vector points to the last block with +1/2 pel both ways.
+        let dw = 32;
+        let s: Vec<u8> = (0..dw * dw).map(|i| (i % 251) as u8).collect();
+        let mut d = vec![0u8; dw * dw];
+        process_macroblock(&s, &mut d, 1, 1, 2, 2, 1, 1, 16, false);
+        let last = dw * dw - 1;
+        assert_eq!(d[last], s[last]);
+    }
+}

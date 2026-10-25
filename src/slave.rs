@@ -60,6 +60,8 @@ pub struct SlaveHle {
     pub video_mode: VideoMode,
     pub debug_log: bool,
     pub stream_counter: u32,
+    // Set by the channel 2 reset command, cleared by the machine when it resets the player
+    pub reset_request: bool,
 }
 
 impl SlaveHle {
@@ -86,6 +88,7 @@ impl SlaveHle {
             video_mode: VideoMode::Pal,
             debug_log: false,
             stream_counter: 0,
+            reset_request: false,
         }
     }
 
@@ -101,6 +104,7 @@ impl SlaveHle {
         self.input_mouse_x = -1;
         self.input_mouse_y = -1;
         self.irq_pending = false;
+        self.reset_request = false;
         self.disc_timer = 0;
         self.disc_state = if self.has_disc { 0x41 } else { 0x00 };
     }
@@ -247,6 +251,12 @@ impl SlaveHle {
                         0x82 | 0x83 => {
                             ch.in_index = 0;
                             ch.in_count = 0;
+                        }
+                        0x8A => {
+                            // Reset player: the slave pulls the system reset line; the machine acts on it after this access
+                            ch.in_index = 0;
+                            ch.in_count = 0;
+                            self.reset_request = true;
                         }
                         0xC0..=0xCF => {
                             ch.in_count = 5;

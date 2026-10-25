@@ -1,9 +1,10 @@
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use log::info;
-use minifb::Key;
+
+use crate::frontend::{push_action, GuiAction, InputDeviceMode, InputProfile};
 
 pub const ID_FILE_INSERT: usize = 1000;
 pub const ID_FILE_OPEN: usize = 1001;
@@ -41,10 +42,7 @@ pub const ID_HELP_ABOUT: usize = 1041;
 
 pub const ID_RECENT_IMAGE_BASE: usize = 1200;
 pub const ID_RECENT_CLEAR: usize = 1210;
-pub const MAX_RECENT_IMAGES: usize = 10;
-const RECENT_FILE: &str = "opencdi_recent.txt";
-
-static RECENT_IMAGES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+pub use crate::frontend::MAX_RECENT_IMAGES;
 
 // Win32 Constants
 const MF_STRING: u32 = 0x0000_0000;
@@ -57,13 +55,20 @@ const MF_UNCHECKED: u32 = 0x0000_0000;
 const MF_GRAYED: u32 = 0x0000_0001;
 
 const WM_COMMAND: u32 = 0x0111;
+const WM_TIMER: u32 = 0x0113;
+const WM_ENTERMENULOOP: u32 = 0x0211;
+const WM_EXITMENULOOP: u32 = 0x0212;
+const WM_ENTERSIZEMOVE: u32 = 0x0231;
+const WM_EXITSIZEMOVE: u32 = 0x0232;
+const RDW_INTERNALPAINT: u32 = 0x0002;
+const MODAL_TIMER_ID: usize = 0x0CD1;
+const MODAL_TIMER_MS: u32 = 10;
 const WM_SETICON: u32 = 0x0080;
 const ICON_SMALL: usize = 0;
 const ICON_BIG: usize = 1;
 const IMAGE_ICON: u32 = 1;
 const LR_LOADFROMFILE: u32 = 0x0000_0010;
 const LR_SHARED: u32 = 0x0000_8000;
-
 const GWLP_WNDPROC: i32 = -4;
 
 const MB_OK: u32 = 0x0000_0000;
@@ -71,6 +76,7 @@ const MB_YESNO: u32 = 0x0000_0004;
 const MB_YESNOCANCEL: u32 = 0x0000_0003;
 const MB_ICONINFORMATION: u32 = 0x0000_0040;
 const MB_ICONQUESTION: u32 = 0x0000_0020;
+const MB_ICONWARNING: u32 = 0x0000_0030;
 const IDYES: i32 = 6;
 const IDNO: i32 = 7;
 
@@ -113,6 +119,11 @@ unsafe extern "system" {
     fn MessageBoxW(hwnd: *mut std::ffi::c_void, lptext: *const u16, lpcaption: *const u16, utype: u32) -> i32;
     fn SetWindowLongPtrW(hwnd: *mut std::ffi::c_void, nindex: i32, dwnewlong: isize) -> isize;
     fn CallWindowProcW(prev: isize, hwnd: *mut std::ffi::c_void, msg: u32, wparam: usize, lparam: isize) -> isize;
+    fn PostMessageW(hwnd: *mut std::ffi::c_void, msg: u32, wparam: usize, lparam: isize) -> i32;
+    fn SetTimer(hwnd: *mut std::ffi::c_void, id: usize, elapse: u32, func: *mut std::ffi::c_void) -> usize;
+    fn KillTimer(hwnd: *mut std::ffi::c_void, id: usize) -> i32;
+    fn RedrawWindow(hwnd: *mut std::ffi::c_void, rect: *const std::ffi::c_void, region: *mut std::ffi::c_void, flags: u32) -> i32;
+    fn EndMenu() -> i32;
     fn SendMessageW(hwnd: *mut std::ffi::c_void, msg: u32, wparam: usize, lparam: isize) -> isize;
     fn LoadImageW(hinst: *mut std::ffi::c_void, name: *const u16, utype: u32, cx: i32, cy: i32, fu_load: u32) -> *mut std::ffi::c_void;
     fn DeleteMenu(hmenu: *mut std::ffi::c_void, uposition: u32, uflags: u32) -> i32;
@@ -154,44 +165,13 @@ pub fn get_optical_drives() -> Vec<char> {
     drives
 }
 
-pub fn load_recent_images() -> Vec<PathBuf> {
-    let mut list = Vec::new();
-    if let Ok(content) = std::fs::read_to_string(RECENT_FILE) {
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                let p = PathBuf::from(trimmed);
-                if p.exists() || crate::cdrom::parse_drive_letter(&p).is_some() {
-                    if !list.contains(&p) && list.len() < MAX_RECENT_IMAGES {
-                        list.push(p);
-                    }
-                }
-            }
-        }
-    }
-    list
-}
-
-pub fn save_recent_images(list: &[PathBuf]) {
-    let mut content = String::new();
-    for p in list.iter().take(MAX_RECENT_IMAGES) {
-        content.push_str(&p.to_string_lossy());
-        content.push('\n');
-    }
-    let _ = std::fs::write(RECENT_FILE, content);
-}
-
+// Records an opened image and refreshes the Recent Disc Images menu
 pub fn add_recent_image(path: &std::path::Path) {
-    {
-        let mut list = RECENT_IMAGES.lock().unwrap();
-        let p = path.to_path_buf();
-        list.retain(|x| x != &p);
-        list.insert(0, p);
-        if list.len() > MAX_RECENT_IMAGES {
-            list.truncate(MAX_RECENT_IMAGES);
-        }
-        save_recent_images(&list);
-    }
+    crate::frontend::add_recent_image(path);
+    refresh_recent_menu();
+}
+
+pub fn refresh_recent_menu() {
     unsafe {
         if !RECENT_MENU_HANDLE.is_null() {
             rebuild_recent_menu_items(RECENT_MENU_HANDLE);
@@ -230,285 +210,6 @@ pub fn set_window_icon(hwnd: *mut std::ffi::c_void) {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InputProfile {
-    Standard, // Frecce + Z / X
-    Wasd,     // W, A, S, D + J / K
-    Numpad,   // Numpad 8, 4, 6, 2 + 1 / 2
-    Custom,   // Personalizzato da opencdi_controls.ini
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InputDeviceMode {
-    Gamepad, // Controller CD-i (Gamepad USB / Joystick / Tastiera centrate)
-    Mouse,   // Mouse Philips CD-i (Cursore Fisico Host)
-}
-
-pub fn key_to_string(key: Key) -> &'static str {
-    match key {
-        Key::Up => "Up",
-        Key::Down => "Down",
-        Key::Left => "Left",
-        Key::Right => "Right",
-        Key::A => "A",
-        Key::B => "B",
-        Key::C => "C",
-        Key::D => "D",
-        Key::E => "E",
-        Key::F => "F",
-        Key::G => "G",
-        Key::H => "H",
-        Key::I => "I",
-        Key::J => "J",
-        Key::K => "K",
-        Key::L => "L",
-        Key::M => "M",
-        Key::N => "N",
-        Key::O => "O",
-        Key::P => "P",
-        Key::Q => "Q",
-        Key::R => "R",
-        Key::S => "S",
-        Key::T => "T",
-        Key::U => "U",
-        Key::V => "V",
-        Key::W => "W",
-        Key::X => "X",
-        Key::Y => "Y",
-        Key::Z => "Z",
-        Key::Space => "Space",
-        Key::Enter => "Enter",
-        Key::LeftShift => "LeftShift",
-        Key::RightShift => "RightShift",
-        Key::LeftCtrl => "LeftCtrl",
-        Key::RightCtrl => "RightCtrl",
-        Key::LeftAlt => "LeftAlt",
-        Key::RightAlt => "RightAlt",
-        Key::Tab => "Tab",
-        Key::Backspace => "Backspace",
-        Key::NumPad0 => "NumPad0",
-        Key::NumPad1 => "NumPad1",
-        Key::NumPad2 => "NumPad2",
-        Key::NumPad3 => "NumPad3",
-        Key::NumPad4 => "NumPad4",
-        Key::NumPad5 => "NumPad5",
-        Key::NumPad6 => "NumPad6",
-        Key::NumPad7 => "NumPad7",
-        Key::NumPad8 => "NumPad8",
-        Key::NumPad9 => "NumPad9",
-        _ => "Z",
-    }
-}
-
-pub fn string_to_key(s: &str) -> Option<Key> {
-    let s_upper = s.trim().to_uppercase();
-    match s_upper.as_str() {
-        "UP" => Some(Key::Up),
-        "DOWN" => Some(Key::Down),
-        "LEFT" => Some(Key::Left),
-        "RIGHT" => Some(Key::Right),
-        "A" => Some(Key::A),
-        "B" => Some(Key::B),
-        "C" => Some(Key::C),
-        "D" => Some(Key::D),
-        "E" => Some(Key::E),
-        "F" => Some(Key::F),
-        "G" => Some(Key::G),
-        "H" => Some(Key::H),
-        "I" => Some(Key::I),
-        "J" => Some(Key::J),
-        "K" => Some(Key::K),
-        "L" => Some(Key::L),
-        "M" => Some(Key::M),
-        "N" => Some(Key::N),
-        "O" => Some(Key::O),
-        "P" => Some(Key::P),
-        "Q" => Some(Key::Q),
-        "R" => Some(Key::R),
-        "S" => Some(Key::S),
-        "T" => Some(Key::T),
-        "U" => Some(Key::U),
-        "V" => Some(Key::V),
-        "W" => Some(Key::W),
-        "X" => Some(Key::X),
-        "Y" => Some(Key::Y),
-        "Z" => Some(Key::Z),
-        "SPACE" => Some(Key::Space),
-        "ENTER" | "RETURN" => Some(Key::Enter),
-        "LEFTSHIFT" | "SHIFT" => Some(Key::LeftShift),
-        "RIGHTSHIFT" => Some(Key::RightShift),
-        "LEFTCTRL" | "CTRL" => Some(Key::LeftCtrl),
-        "RIGHTCTRL" => Some(Key::RightCtrl),
-        "LEFTALT" | "ALT" => Some(Key::LeftAlt),
-        "RIGHTALT" => Some(Key::RightAlt),
-        "TAB" => Some(Key::Tab),
-        "BACKSPACE" => Some(Key::Backspace),
-        "NUMPAD0" | "KP0" | "0" => Some(Key::NumPad0),
-        "NUMPAD1" | "KP1" | "1" => Some(Key::NumPad1),
-        "NUMPAD2" | "KP2" | "2" => Some(Key::NumPad2),
-        "NUMPAD3" | "KP3" | "3" => Some(Key::NumPad3),
-        "NUMPAD4" | "KP4" | "4" => Some(Key::NumPad4),
-        "NUMPAD5" | "KP5" | "5" => Some(Key::NumPad5),
-        "NUMPAD6" | "KP6" | "6" => Some(Key::NumPad6),
-        "NUMPAD7" | "KP7" | "7" => Some(Key::NumPad7),
-        "NUMPAD8" | "KP8" | "8" => Some(Key::NumPad8),
-        "NUMPAD9" | "KP9" | "9" => Some(Key::NumPad9),
-        _ => None,
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct KeyBindings {
-    pub profile: InputProfile,
-    pub up: Key,
-    pub down: Key,
-    pub left: Key,
-    pub right: Key,
-    pub btn1: Key,
-    pub btn2: Key,
-}
-
-impl KeyBindings {
-    pub fn new() -> Self {
-        let mut bindings = Self {
-            profile: InputProfile::Standard,
-            up: Key::Up,
-            down: Key::Down,
-            left: Key::Left,
-            right: Key::Right,
-            btn1: Key::Z,
-            btn2: Key::X,
-        };
-        bindings.load_from_ini();
-        bindings
-    }
-
-    pub fn set_profile(&mut self, profile: InputProfile) {
-        self.profile = profile;
-        match profile {
-            InputProfile::Standard => {
-                self.up = Key::Up;
-                self.down = Key::Down;
-                self.left = Key::Left;
-                self.right = Key::Right;
-                self.btn1 = Key::Z;
-                self.btn2 = Key::X;
-            }
-            InputProfile::Wasd => {
-                self.up = Key::W;
-                self.down = Key::S;
-                self.left = Key::A;
-                self.right = Key::D;
-                self.btn1 = Key::J;
-                self.btn2 = Key::K;
-            }
-            InputProfile::Numpad => {
-                self.up = Key::NumPad8;
-                self.down = Key::NumPad2;
-                self.left = Key::NumPad4;
-                self.right = Key::NumPad6;
-                self.btn1 = Key::NumPad1;
-                self.btn2 = Key::NumPad0;
-            }
-            InputProfile::Custom => {
-                // Keep custom key configuration intact
-            }
-        }
-        self.save_to_ini();
-    }
-
-    pub fn save_to_ini(&self) {
-        let prof_str = match self.profile {
-            InputProfile::Standard => "Standard",
-            InputProfile::Wasd => "WASD",
-            InputProfile::Numpad => "Numpad",
-            InputProfile::Custom => "Custom",
-        };
-        let content = format!(
-            "# OpenCDi Controls Configuration\n\
-             # Profile: Standard | WASD | Numpad | Custom\n\
-             profile={}\n\n\
-             # Custom key bindings (active with profile=Custom or as overrides):\n\
-             up={}\n\
-             down={}\n\
-             left={}\n\
-             right={}\n\
-             btn1={}\n\
-             btn2={}\n",
-            prof_str,
-            key_to_string(self.up),
-            key_to_string(self.down),
-            key_to_string(self.left),
-            key_to_string(self.right),
-            key_to_string(self.btn1),
-            key_to_string(self.btn2),
-        );
-        let _ = std::fs::write("opencdi_controls.ini", content);
-    }
-
-    pub fn load_from_ini(&mut self) {
-        if let Ok(content) = std::fs::read_to_string("opencdi_controls.ini") {
-            let mut detected_custom = false;
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
-                    continue;
-                }
-                let parts: Vec<&str> = trimmed.split('=').map(|s| s.trim()).collect();
-                if parts.len() == 2 {
-                    match parts[0].to_lowercase().as_str() {
-                        "profile" => match parts[1].to_lowercase().as_str() {
-                            "wasd" => self.set_profile(InputProfile::Wasd),
-                            "numpad" => self.set_profile(InputProfile::Numpad),
-                            "custom" => {
-                                self.profile = InputProfile::Custom;
-                                detected_custom = true;
-                            }
-                            _ => self.set_profile(InputProfile::Standard),
-                        },
-                        "up" => if let Some(k) = string_to_key(parts[1]) { self.up = k; detected_custom = true; }
-                        "down" => if let Some(k) = string_to_key(parts[1]) { self.down = k; detected_custom = true; }
-                        "left" => if let Some(k) = string_to_key(parts[1]) { self.left = k; detected_custom = true; }
-                        "right" => if let Some(k) = string_to_key(parts[1]) { self.right = k; detected_custom = true; }
-                        "btn1" => if let Some(k) = string_to_key(parts[1]) { self.btn1 = k; detected_custom = true; }
-                        "btn2" => if let Some(k) = string_to_key(parts[1]) { self.btn2 = k; detected_custom = true; }
-                        _ => {}
-                    }
-                }
-            }
-            if detected_custom && self.profile == InputProfile::Custom {
-                info!("Comandi personalizzati caricati da opencdi_controls.ini: up={:?}, down={:?}, left={:?}, right={:?}, btn1={:?}, btn2={:?}",
-                    self.up, self.down, self.left, self.right, self.btn1, self.btn2);
-            }
-        } else {
-            self.save_to_ini();
-        }
-    }
-}
-
-pub enum GuiAction {
-    InsertDisc(PathBuf),
-    OpenDisc(PathBuf),
-    EjectDisc,
-    Reset,
-    Exit,
-    SetProfile(InputProfile),
-    SetInputDevice(InputDeviceMode),
-    ReloadControls,
-    ToggleReleaseMouse,
-    ToggleMute,
-    VolumeUp,
-    VolumeDown,
-    ToggleFullscreen,
-    TakeScreenshot,
-    SetVideoMode(crate::mcd212::VideoMode),
-    ToggleWaitStates,
-    ToggleDvc,
-    ShowHelp,
-    ShowAbout,
-}
-
-static PENDING_ACTIONS: Mutex<Vec<GuiAction>> = Mutex::new(Vec::new());
 static mut PREV_WNDPROC: isize = 0;
 static mut MENU_HANDLE: *mut std::ffi::c_void = std::ptr::null_mut();
 static mut OWNER_HWND: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -521,7 +222,7 @@ pub fn rebuild_recent_menu_items(menu: *mut std::ffi::c_void) {
         for _ in 0..count {
             DeleteMenu(menu, 0, MF_BYPOSITION);
         }
-        let list = RECENT_IMAGES.lock().unwrap();
+        let list = crate::frontend::recent_images();
         if list.is_empty() {
             AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, to_wide("(No recent disc images)").as_ptr());
         } else {
@@ -536,17 +237,55 @@ pub fn rebuild_recent_menu_items(menu: *mut std::ffi::c_void) {
     }
 }
 
-pub fn pop_action() -> Option<GuiAction> {
-    let mut actions = PENDING_ACTIONS.lock().unwrap();
-    if actions.is_empty() {
-        None
-    } else {
-        Some(actions.remove(0))
+// --run-in-menu: menus, dialogs and move/size loops block winit's loop, so a timer drives emulation through WM_PAINT
+static RUN_IN_MODAL: AtomicBool = AtomicBool::new(false);
+static MODAL_DEPTH: AtomicU32 = AtomicU32::new(0);
+static TIMER_PAINT: AtomicBool = AtomicBool::new(false);
+
+pub fn set_run_in_modal(on: bool) {
+    RUN_IN_MODAL.store(on, Ordering::Relaxed);
+}
+
+// True while a Win32 modal loop (menu, dialog, move/size) is running
+pub fn modal_active() -> bool {
+    MODAL_DEPTH.load(Ordering::Relaxed) > 0
+}
+
+// True once per WM_PAINT that the modal timer asked for
+pub fn take_timer_paint() -> bool {
+    TIMER_PAINT.swap(false, Ordering::Relaxed)
+}
+
+// Closes an open menu so a quit requested during the menu loop takes effect
+pub fn end_menu() {
+    unsafe {
+        EndMenu();
     }
 }
 
-pub fn push_action(action: GuiAction) {
-    PENDING_ACTIONS.lock().unwrap().push(action);
+fn modal_begin(hwnd: *mut std::ffi::c_void) {
+    if MODAL_DEPTH.fetch_add(1, Ordering::Relaxed) == 0 && RUN_IN_MODAL.load(Ordering::Relaxed) {
+        unsafe {
+            SetTimer(hwnd, MODAL_TIMER_ID, MODAL_TIMER_MS, std::ptr::null_mut());
+        }
+    }
+}
+
+fn modal_end(hwnd: *mut std::ffi::c_void) {
+    let prev = MODAL_DEPTH.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |d| Some(d.saturating_sub(1))).unwrap_or(0);
+    if prev == 1 {
+        unsafe {
+            KillTimer(hwnd, MODAL_TIMER_ID);
+        }
+    }
+}
+
+// Runs a modal dialog with the modal timer active
+fn modal<R>(hwnd: *mut std::ffi::c_void, f: impl FnOnce() -> R) -> R {
+    modal_begin(hwnd);
+    let r = f();
+    modal_end(hwnd);
+    r
 }
 
 pub fn update_input_device_menu(mode: InputDeviceMode) {
@@ -655,6 +394,18 @@ unsafe extern "system" fn custom_wndproc(
     wparam: usize,
     lparam: isize,
 ) -> isize {
+    match msg {
+        WM_ENTERMENULOOP | WM_ENTERSIZEMOVE => modal_begin(hwnd),
+        WM_EXITMENULOOP | WM_EXITSIZEMOVE => modal_end(hwnd),
+        WM_TIMER if wparam == MODAL_TIMER_ID => {
+            TIMER_PAINT.store(true, Ordering::Relaxed);
+            unsafe {
+                RedrawWindow(hwnd, std::ptr::null(), std::ptr::null_mut(), RDW_INTERNALPAINT);
+            }
+            return 0;
+        }
+        _ => {}
+    }
     if msg == WM_COMMAND {
         let menu_id = (wparam & 0xFFFF) as usize;
         if menu_id >= ID_PHYSICAL_DRIVE_BOOT_BASE && menu_id < ID_PHYSICAL_DRIVE_BOOT_BASE + 26 {
@@ -669,37 +420,26 @@ unsafe extern "system" fn custom_wndproc(
         }
         if menu_id >= ID_RECENT_IMAGE_BASE && menu_id < ID_RECENT_IMAGE_BASE + MAX_RECENT_IMAGES {
             let idx = menu_id - ID_RECENT_IMAGE_BASE;
-            let list = RECENT_IMAGES.lock().unwrap();
+            let list = crate::frontend::recent_images();
             if let Some(path) = list.get(idx) {
                 push_action(GuiAction::OpenDisc(path.clone()));
             }
             return 0;
         }
         if menu_id == ID_RECENT_CLEAR {
-            {
-                let mut list = RECENT_IMAGES.lock().unwrap();
-                list.clear();
-                save_recent_images(&list);
-            }
-            unsafe {
-                if !RECENT_MENU_HANDLE.is_null() {
-                    rebuild_recent_menu_items(RECENT_MENU_HANDLE);
-                    if !OWNER_HWND.is_null() {
-                        DrawMenuBar(OWNER_HWND);
-                    }
-                }
-            }
+            crate::frontend::clear_recent_images();
+            refresh_recent_menu();
             return 0;
         }
         match menu_id {
             ID_FILE_INSERT => {
-                if let Some(path) = open_file_dialog(hwnd) {
+                if let Some(path) = modal(hwnd, || open_file_dialog(hwnd)) {
                     push_action(GuiAction::InsertDisc(path));
                 }
                 return 0;
             }
             ID_FILE_OPEN => {
-                if let Some(path) = open_file_dialog(hwnd) {
+                if let Some(path) = modal(hwnd, || open_file_dialog(hwnd)) {
                     push_action(GuiAction::OpenDisc(path));
                 }
                 return 0;
@@ -750,7 +490,7 @@ unsafe extern "system" fn custom_wndproc(
                 return 0;
             }
             ID_CONTROLS_INFO => {
-                show_controls_dialog(hwnd);
+                modal(hwnd, || show_controls_dialog(hwnd));
                 return 0;
             }
             ID_CONTROLS_RELEASE_MOUSE => {
@@ -794,11 +534,11 @@ unsafe extern "system" fn custom_wndproc(
                 return 0;
             }
             ID_HELP_CONTROLS => {
-                show_controls_dialog(hwnd);
+                modal(hwnd, || show_controls_dialog(hwnd));
                 return 0;
             }
             ID_HELP_ABOUT => {
-                show_about_dialog(hwnd);
+                modal(hwnd, || show_about_dialog(hwnd));
                 return 0;
             }
             _ => {}
@@ -810,6 +550,15 @@ unsafe extern "system" fn custom_wndproc(
             CallWindowProcW(PREV_WNDPROC, hwnd, msg, wparam, lparam)
         } else {
             0
+        }
+    }
+}
+
+// Queue a menu command so its modal dialog runs from the window procedure, outside winit's event handler
+pub fn post_menu_command(hwnd: *mut std::ffi::c_void, menu_id: usize) {
+    if !hwnd.is_null() {
+        unsafe {
+            PostMessageW(hwnd, WM_COMMAND, menu_id, 0);
         }
     }
 }
@@ -836,13 +585,11 @@ pub fn attach_gui_menu(
         // 1. File Menu
         let file_menu = CreatePopupMenu();
         AppendMenuW(file_menu, MF_STRING, ID_FILE_INSERT, to_wide("Insert Disc Image (Hot-swap)...\tCtrl+I").as_ptr());
-        AppendMenuW(file_menu, MF_STRING, ID_FILE_OPEN, to_wide("Open Disc Image & Restart Console...\tCtrl+O").as_ptr());
+        AppendMenuW(file_menu, MF_STRING, ID_FILE_OPEN, to_wide("Open Disc Image && Restart Console...\tCtrl+O").as_ptr());
 
         // Submenu: Recent Disc Images
         let recent_menu = CreatePopupMenu();
         RECENT_MENU_HANDLE = recent_menu;
-        let recents = load_recent_images();
-        *RECENT_IMAGES.lock().unwrap() = recents;
         rebuild_recent_menu_items(recent_menu);
         AppendMenuW(file_menu, MF_POPUP, recent_menu as usize, to_wide("Recent Disc Images").as_ptr());
 
@@ -881,9 +628,9 @@ pub fn attach_gui_menu(
         }
 
         AppendMenuW(file_menu, MF_SEPARATOR, 0, std::ptr::null());
-        AppendMenuW(file_menu, MF_STRING, ID_FILE_RESET, to_wide("Restart Console (Reset)\tF5").as_ptr());
+        AppendMenuW(file_menu, MF_STRING, ID_FILE_RESET, to_wide("Restart Console (Reset)\tF5 / H").as_ptr());
         AppendMenuW(file_menu, MF_SEPARATOR, 0, std::ptr::null());
-        AppendMenuW(file_menu, MF_STRING, ID_FILE_EXIT, to_wide("Exit\tAlt+F4").as_ptr());
+        AppendMenuW(file_menu, MF_STRING, ID_FILE_EXIT, to_wide("Exit\tEsc").as_ptr());
         AppendMenuW(main_menu, MF_POPUP, file_menu as usize, to_wide("File").as_ptr());
 
         // 2. Controls Menu
@@ -916,7 +663,7 @@ pub fn attach_gui_menu(
 
         // 4. Video Menu
         let video_menu = CreatePopupMenu();
-        AppendMenuW(video_menu, MF_STRING, ID_VIDEO_FULLSCREEN, to_wide("Fullscreen\tF11").as_ptr());
+        AppendMenuW(video_menu, MF_STRING, ID_VIDEO_FULLSCREEN, to_wide("Fullscreen\tF11 / Alt+Enter").as_ptr());
         AppendMenuW(video_menu, MF_STRING, ID_VIDEO_SCREENSHOT, to_wide("Save Screenshot\tF12").as_ptr());
         AppendMenuW(video_menu, MF_SEPARATOR, 0, std::ptr::null());
         AppendMenuW(video_menu, MF_STRING, ID_VIDEO_PAL, to_wide("PAL (50 Hz) [CD-i 220 Standard]").as_ptr());
@@ -1012,12 +759,13 @@ pub fn show_controls_dialog(owner: *mut std::ffi::c_void) {
            • Button B / Circle / X = Button 2\n\
            • Start Button = Action / Pause\n\n\
         KEYBOARD SHORTCUTS:\n\
-           • F12: Save Screenshot\n\
-           • Ctrl+O: Open disc image (CHD / ISO / BIN)\n\
-           • F5: Restart console (Reset)\n\
-           • F11: Fullscreen\n\
-           • M: Mute / Unmute audio\n\
-           • + / - : Adjust volume"
+           • F11 or Alt+Enter: Fullscreen\n\
+           • F5 or H: Restart console (Reset)\n\
+           • P: Pause  |  Space (hold): Fast-forward\n\
+           • F8: Screenshot (PPM)  |  F12: Screenshot (BMP)\n\
+           • Ctrl+I: Insert disc  |  Ctrl+O: Open disc image and restart\n\
+           • M: Mute / Unmute audio  |  + / - : Adjust volume\n\
+           • Esc: Quit"
     );
     let title = to_wide("OpenCDi - Controls & Key Mapping Guide");
     unsafe {
@@ -1025,11 +773,20 @@ pub fn show_controls_dialog(owner: *mut std::ffi::c_void) {
     }
 }
 
+// Warning box for a disc image or drive that failed to load
+pub fn show_disc_error(owner: *mut std::ffi::c_void, text: &str) {
+    let text = to_wide(text);
+    let title = to_wide("OpenCDi - Errore Lettura Disco");
+    modal(owner, || unsafe {
+        MessageBoxW(owner, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
+    });
+}
+
 pub fn show_about_dialog(owner: *mut std::ffi::c_void) {
     let text = to_wide(
         "OpenCDi - Philips CD-i Emulator\n\
         Version: 0.1.8 (High Performance Edition)\n\
-        Built with Rust & MiniFB\n\n\
+        Built with Rust, winit & softbuffer\n\n\
         Key Emulation Features:\n\
         • Philips SCC68070 Microprocessor & OS-9 CD-RTOS kernel\n\
         • Philips MCD-212 Video Display Controller (Planes A & B, ICA/DCA display lists)\n\

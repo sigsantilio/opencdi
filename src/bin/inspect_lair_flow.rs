@@ -34,16 +34,14 @@ fn save_bmp(path: &str, buffer: &[u32; 768 * 560]) {
     data.extend_from_slice(&0u32.to_le_bytes());
     data.extend_from_slice(&0u32.to_le_bytes());
 
-    for &pix in buffer.iter() {
+    for &pix in buffer[..(width * height) as usize].iter() {
         data.extend_from_slice(&pix.to_le_bytes());
     }
     fs::write(path, data).unwrap();
 }
 
-fn save_bmp_dvc(path: &str, buffer: &[u32; 352 * 288]) {
-    let mut data = Vec::with_capacity(352 * 288 * 4 + 54);
-    let width = 352u32;
-    let height = 288u32;
+fn save_bmp_dvc(path: &str, buffer: &[u32], width: u32, height: u32) {
+    let mut data = Vec::with_capacity((width * height * 4 + 54) as usize);
     let file_size = 54 + width * height * 4;
     data.extend_from_slice(b"BM");
     data.extend_from_slice(&file_size.to_le_bytes());
@@ -61,7 +59,7 @@ fn save_bmp_dvc(path: &str, buffer: &[u32; 352 * 288]) {
     data.extend_from_slice(&0u32.to_le_bytes());
     data.extend_from_slice(&0u32.to_le_bytes());
 
-    for &pix in buffer.iter() {
+    for &pix in buffer[..(width * height) as usize].iter() {
         data.extend_from_slice(&pix.to_le_bytes());
     }
     fs::write(path, data).unwrap();
@@ -562,7 +560,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if frame == 2170 || frame == 2175 || frame == 2200 || frame == 2300 || frame == 2400 || frame == 2500 || frame == 2600 || frame == 2730 || frame == 2740 || frame == 2750 || frame == 2900 || frame == 2940 || frame == 3000 || frame == 3100 || frame == 3200 || frame == 3300 || frame == 3400 || frame == 3500 {
-            save_bmp_dvc(&format!("dvc_fb_{:04}.bmp", frame), &bus.dvc.framebuffer);
+            save_bmp_dvc(&format!("dvc_fb_{:04}.bmp", frame), &bus.dvc.framebuffer[..], bus.dvc.video_width as u32, bus.dvc.video_height as u32);
             save_bmp(&format!("frame_{:04}.bmp", frame), &bus.mcd212.framebuffer);
             let icm = bus.mcd212.image_coding_method;
             let tcr = bus.mcd212.transparency_control;
@@ -572,7 +570,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(">>> [Frame {} DIAGNOSTIC] ICM=0x{:08X}, TCR=0x{:08X}, PO=0x{:04X}, DCR=[0x{:04X}, 0x{:04X}], DDR=[0x{:04X}, 0x{:04X}]",
                 frame, icm, tcr, po, dcr[0], dcr[1], ddr[0], ddr[1]);
             println!("    External video line[384] = 0x{:08X}, DVC FB center = 0x{:08X}",
-                bus.mcd212.external_video_line[384], bus.dvc.framebuffer[144 * 352 + 176]);
+                bus.mcd212.external_video_line[384], bus.dvc.framebuffer[(bus.dvc.video_height / 2) * bus.dvc.video_width + bus.dvc.video_width / 2]);
         }
 
         if frame % 500 == 0 {

@@ -22,9 +22,16 @@ pub const FMV_VIDCMD: usize = 0xC2;
 pub const FMV_STREAM: usize = 0xC4;
 pub const FMV_IVEC: usize = 0xDC;
 pub const FMV_XFER: usize = 0xDE;
+pub const FMV_BORDER_R: usize = 0x66;
+pub const FMV_SCRPOS_Y: usize = 0x74;
+
+// Largest MPEG-1 picture the DVC framebuffer holds (constrained parameters).
+pub const FB_MAX_W: usize = 768;
+pub const FB_MAX_H: usize = 576;
 
 // FMA Register Byte Offsets (within 0xE03000..0xE030FF)
 pub const FMA_CMD: usize = 0x00;
+pub const FMA_MODE: usize = 0x04;
 pub const FMA_STREAM: usize = 0x08;
 pub const FMA_IVEC: usize = 0x0C;
 pub const FMA_ISR: usize = 0x1A;
@@ -54,6 +61,7 @@ pub const FMA_IRQ_UNF: u16   = 1 << 3;  // 0x0008: Underflow
 pub const FMA_IRQ_DEC: u16   = 1 << 2;  // 0x0004: Decoded data ready
 pub const FMA_IRQ_PLAY: u16  = 1 << 4;  // 0x0010: Playback active
 pub const FMA_IRQ_POLL: u16  = 1 << 8;  // 0x0100: Timer tick
+pub const FMA_MODE_DRAIN: u16 = 0x1F;  // madriv mode: 7 = play, 0x1F = drain at end of data or before a loop restart
 
 // =========================================================================
 // MPEG Audio Layer-II Decoder (oxideav-mp2)
@@ -151,6 +159,15 @@ impl Mp2Decoder {
             }
         }
         decoded
+    }
+
+    // A trailing partial frame cannot be decoded, so it does not keep the decoder fed.
+    pub fn has_frame(input: &VecDeque<u8>) -> bool {
+        if input.len() < 4 {
+            return false;
+        }
+        let head = [input[0], input[1], input[2], input[3]];
+        oxideav_mp2::header::FrameHeader::parse(&head).map_or(false, |h| input.len() >= h.frame_size_bytes())
     }
 
     fn append_native(output: &mut VecDeque<(f32, f32)>, channels: &[Vec<f64>]) {
@@ -421,7 +438,10 @@ pub struct Dvc {
     pub transfer_for_fma: bool,
     pub fma_dma_seen: bool,
     pub dma_requested: bool,
-    pub framebuffer: Box<[u32; 352 * 288]>,
+    pub framebuffer: Box<[u32; FB_MAX_W * FB_MAX_H]>,
+    /// Display window latched by VIDCMD WIN: screen y, screen x, height, width, picture y, picture x (pixels, x in normal resolution).
+    pub window: [u16; 6],
+    pub border_color: u32,
 
     pub demux: MpegSystemDemux,
     pub fma_demux: MpegSystemDemux,
@@ -437,6 +457,10 @@ pub struct Dvc {
     pub vsync_counter: usize,
     pub underflow_count: u32,
     pub fma_underflow_count: u32,
+    /// Audio samples decoded since the last FMA play or stop.
+    pub fma_decoded_since_play: u64,
+    // Cycle (total_cycles) at which the decoded MPEG audio would have finished playing; 0 when none is pending.
+    pub fma_playout_end: u64,
     pub has_valid_frame: bool,
 }
 
@@ -490,7 +514,9 @@ impl Dvc {
             transfer_for_fma: false,
             fma_dma_seen: false,
             dma_requested: false,
-            framebuffer: vec![0xFF00_0000; 352 * 288].into_boxed_slice().try_into().unwrap(),
+            framebuffer: vec![0xFF00_0000; FB_MAX_W * FB_MAX_H].into_boxed_slice().try_into().unwrap(),
+            window: [0; 6],
+            border_color: 0xFF00_0000,
 
             demux: MpegSystemDemux::default(),
             fma_demux: MpegSystemDemux::default(),
@@ -506,6 +532,8 @@ impl Dvc {
             vsync_counter: 0,
             underflow_count: 0,
             fma_underflow_count: 0,
+            fma_decoded_since_play: 0,
+            fma_playout_end: 0,
             has_valid_frame: false,
         };
         d.reset_regs();
@@ -516,6 +544,8 @@ impl Dvc {
         self.ram1.fill(0);
         self.ram2.fill(0);
         self.framebuffer.fill(0xFF00_0000);
+        self.window = [0; 6];
+        self.border_color = 0xFF00_0000;
         self.has_valid_frame = false;
         self.ram2_enabled = false;
         self.reg_write_count = 0;
@@ -537,6 +567,7 @@ impl Dvc {
         self.fmv_decoder_active = false;
         self.dma_requested = false;
         self.total_cycles = 0;
+        self.fma_playout_end = 0;
         self.dclk = 0;
         self.dclk_accum = 0;
         self.timer_accum = 0;
@@ -555,6 +586,7 @@ impl Dvc {
         self.vsync_counter = 0;
         self.underflow_count = 0;
         self.fma_underflow_count = 0;
+        self.fma_decoded_since_play = 0;
         self.frame_accum = 0.0;
         self.display_timecode = 0;
         self.decoder_timecode = 0;
@@ -692,6 +724,16 @@ impl Dvc {
 
     pub fn tick(&mut self, cycles: u32) {
         self.total_cycles += cycles as u64;
+
+        // In drain mode (0x1F, end of data or loop) the driver waits for underflow, which comes when the decoded audio has been played.
+        if self.fma_playout_end != 0 && self.total_cycles >= self.fma_playout_end {
+            self.fma_playout_end = 0;
+            let draining = self.get_fma_word(FMA_MODE) == FMA_MODE_DRAIN;
+            if draining && (self.audio_enabled || self.audio_armed) && self.fma_underflow_count == 0 && self.fma_drained() {
+                self.raise_fma_underflow();
+                self.fma_underflow_count = 10;
+            }
+        }
 
         // DCLK runs at 45 kHz
         self.dclk_accum += (cycles as u64) * DCLK_FREQ;
@@ -876,10 +918,15 @@ impl Dvc {
                     self.fma_stream_fifo.clear();
                     self.fma_demux.clear();
                     self.mp2.reset();
+                    self.fma_decoded_since_play = 0;
+                    self.fma_playout_end = 0;
                     self.set_fma_word(0x02, 0x0200);
                     self.set_fma_word(FMA_ISR, 0);
                 }
                 if value & 0x0002 != 0 { // PLAY ARM
+                    if !self.audio_enabled {
+                        self.fma_decoded_since_play = 0;
+                    }
                     self.audio_armed = true;
                     self.audio_enabled = true;
                     self.or_fma_word(0x02, 0x0010);
@@ -981,6 +1028,9 @@ impl Dvc {
                 }
             }
             FMV_VIDCMD => {
+                if value & 0x0008 != 0 { // WIN: apply position, window, offset and border
+                    self.latch_window();
+                }
                 if value & 0x0004 != 0 || value & 0x0008 != 0 {
                     self.or_fmv_word(FMV_ISR, FMV_IRQ_VCUP | FMV_IRQ_DCL);
                 }
@@ -1033,6 +1083,8 @@ impl Dvc {
                 self.audio_sample_rate = self.mp2.last_sample_rate;
                 self.or_fma_word(0x02, 0x0004);
                 self.or_fma_word(FMA_ISR, 0x0004);
+                self.fma_decoded_since_play += self.mp2.pcm.len() as u64;
+                self.extend_playout(self.mp2.pcm.len());
                 while let Some(sample) = self.mp2.pcm.pop_front() {
                     if self.audio_out.len() < 32 * 1024 {
                         self.audio_out.push_back(sample);
@@ -1049,6 +1101,8 @@ impl Dvc {
                 self.audio_sample_rate = self.mp2.last_sample_rate;
                 self.or_fma_word(0x02, 0x0004);
                 self.or_fma_word(FMA_ISR, 0x0004);
+                self.fma_decoded_since_play += self.mp2.pcm.len() as u64;
+                self.extend_playout(self.mp2.pcm.len());
                 while let Some(sample) = self.mp2.pcm.pop_front() {
                     if self.audio_out.len() < 32 * 1024 {
                         self.audio_out.push_back(sample);
@@ -1149,20 +1203,38 @@ impl Dvc {
         self.set_fmv_word(0x0A, hr_min);  // word 0x05
     }
 
+    // Input holds no whole MP2 frame and all decoded audio has been played.
+    fn fma_drained(&self) -> bool {
+        // Concealment: report underflow only once playback has run (half a second decoded), not during pre-roll.
+        let fma_started = self.fma_decoded_since_play >= u64::from(self.audio_sample_rate / 2);
+        fma_started
+            && self.fma_playout_end == 0
+            && self.fma_stream_fifo.is_empty()
+            && !Mp2Decoder::has_frame(&self.fma_demux.audio)
+            && !Mp2Decoder::has_frame(&self.demux.audio)
+    }
+
+    fn raise_fma_underflow(&mut self) {
+        trace!(">>> [DVC FMA] AUDIO BUFFER UNDERFLOW (raising FMA_IRQ_UNF)");
+        self.or_fma_word(FMA_ISR, FMA_IRQ_UNF);
+        self.or_fma_word(0x02, 0x0008);
+    }
+
+    // Decoded samples are queued for output at once, but play for their length at the stream's rate.
+    fn extend_playout(&mut self, samples: usize) {
+        let rate = u64::from(self.audio_sample_rate.max(1));
+        self.fma_playout_end = self.fma_playout_end.max(self.total_cycles) + samples as u64 * MASTER_CLOCK / rate;
+    }
+
     pub fn on_vsync(&mut self) {
         self.process_stream();
 
         // Check for FMA audio buffer drain / underflow when audio is active
         if self.audio_enabled || self.audio_armed {
-            let fma_drained = self.fma_stream_fifo.is_empty()
-                && self.fma_demux.audio.is_empty()
-                && self.demux.audio.is_empty();
-            if fma_drained {
+            if self.fma_drained() {
                 self.fma_underflow_count = self.fma_underflow_count.saturating_add(1);
                 if self.fma_underflow_count == 10 {
-                    trace!(">>> [DVC FMA] AUDIO BUFFER UNDERFLOW (raising FMA_IRQ_UNF)");
-                    self.or_fma_word(FMA_ISR, FMA_IRQ_UNF);
-                    self.or_fma_word(0x02, 0x0008);
+                    self.raise_fma_underflow();
                 } else if self.fma_underflow_count > 10 && self.fma_underflow_count % 15 == 0 {
                     self.or_fma_word(FMA_ISR, FMA_IRQ_UNF);
                 }
@@ -1215,9 +1287,8 @@ impl Dvc {
                     }
                     decoded_w = decoder.width();
                     decoded_h = decoder.height();
-                    let target_w = (decoded_w as usize).min(352).max(1);
-                    let target_h = (decoded_h as usize).min(288).max(1);
-
+                    let target_w = (decoded_w as usize).min(FB_MAX_W).max(1);
+                    let target_h = (decoded_h as usize).min(FB_MAX_H).max(1);
                     decoder.frame(frame_idx).write_rgb_scaled(&mut *self.framebuffer, target_w, target_h);
                     self.video_width = target_w;
                     self.video_height = target_h;
@@ -1233,7 +1304,6 @@ impl Dvc {
                 self.set_fmv_word(0x54, decoded_h as u16);
                 self.set_fmv_word(0x06, 0x23);  // PRPA
                 self.set_fmv_word(0x56, 1800);  // Frame rate ratio
-                self.set_fmv_word(0x55, 1800);  // Display period
 
                 // Synchronize with embedded MPEG-1 GOP timecode if present, otherwise advance by 1 frame
                 if let Some(tc) = gop_tc {
@@ -1338,48 +1408,78 @@ impl Dvc {
         }
     }
 
-    pub fn get_scanline(&self, active_line: usize, out: &mut [u32; 768]) {
-        out.fill(0xFF00_0000);
+    fn latch_window(&mut self) {
+        for i in 0..6 {
+            self.window[i] = self.get_fmv_word(FMV_SCRPOS_Y + i * 2);
+        }
+        // Border components are studio-range levels (16 = black); expand like the MCD212 output does.
+        let level = |off: usize| ((((self.get_fmv_word(off) & 0xFF) as i32 - 16) * 298 + 128) >> 8).clamp(0, 255) as u32;
+        self.border_color = 0xFF00_0000 | (level(FMV_BORDER_R) << 16) | (level(FMV_BORDER_R + 2) << 8) | level(FMV_BORDER_R + 4);
+    }
+
+    /// One field line of DVC output at 768 high-resolution pixels; `present` marks pixels inside the display window.
+    pub fn get_scanline(&self, active_line: usize, out: &mut [u32; 768], present: &mut [bool; 768]) {
+        present.fill(false);
         if !self.has_valid_frame {
+            out.fill(0xFF00_0000);
             return;
         }
-
-        let disp_h = (self.get_fmv_word(0x04) as usize).min(288);
-        let disp_h = if disp_h == 0 {
-            if self.video_height > 0 { self.video_height } else { 240 }
-        } else {
-            disp_h
-        };
-        let reg_y = self.get_fmv_word(0x6C) as usize;
-        let y_start = if reg_y > 0 && reg_y != 26 && reg_y <= 240 {
-            reg_y
-        } else {
-            (240usize.saturating_sub(disp_h)) / 2
-        };
-        let y_end = y_start + disp_h;
-        if active_line >= y_start && active_line < y_end {
-            let dy = active_line - y_start;
-            let disp_w = (self.get_fmv_word(0x02) as usize).min(352);
-            let disp_w = if disp_w == 0 {
-                if self.video_width > 0 { self.video_width } else { 352 }
-            } else {
-                disp_w
-            };
-            let pitch = if self.video_width > 0 { self.video_width } else { disp_w };
-            let x_start = (768usize.saturating_sub(disp_w * 2)) / 2;
-            for dx in 0..disp_w {
-                let px_idx = dy * pitch + dx;
-                let pixel = if px_idx < self.framebuffer.len() {
-                    self.framebuffer[px_idx]
-                } else {
-                    0xFF00_0000
-                };
-                let target_x = x_start + dx * 2;
-                if target_x + 1 < 768 {
-                    out[target_x] = pixel;
-                    out[target_x + 1] = pixel;
-                }
-            }
+        out.fill(self.border_color);
+        let [pos_y, pos_x, win_h, win_w, off_y, off_x] = self.window.map(usize::from);
+        let (pic_w, pic_h) = (self.video_width, self.video_height);
+        // The window is clipped to the decoded picture (mv_window adapts its size the same way).
+        let off_x = off_x.min(pic_w);
+        let off_y = off_y.min(pic_h);
+        let win_w = win_w.min(pic_w - off_x);
+        let win_h = win_h.min(pic_h - off_y);
+        if active_line < pos_y || active_line >= pos_y + win_h {
+            return;
         }
+        let row = (off_y + active_line - pos_y) * pic_w + off_x;
+        // One picture pixel per normal-resolution pixel, so two high-resolution pixels each; no scaling.
+        for col in 0..win_w {
+            let x = (pos_x + col) * 2;
+            if x + 1 >= 768 {
+                break;
+            }
+            let pixel = self.framebuffer[row + col];
+            out[x] = pixel;
+            out[x + 1] = pixel;
+            present[x] = true;
+            present[x + 1] = true;
+        }
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    #[test]
+    fn window_places_and_clips_the_picture() {
+        let mut d = Dvc::new();
+        d.video_width = 8;
+        d.video_height = 4;
+        for (i, px) in d.framebuffer[..32].iter_mut().enumerate() {
+            *px = 0xFF00_0000 | i as u32;
+        }
+        d.has_valid_frame = true;
+        // Screen y 10, x 5; window 3 lines by 6 pixels; picture offset y 1, x 4 (width clips to 4).
+        for (i, v) in [10u16, 5, 3, 6, 1, 4].iter().enumerate() {
+            d.set_fmv_word(FMV_SCRPOS_Y + i * 2, *v);
+        }
+        d.set_fmv_word(FMV_VIDCMD, 0x0008);
+        d.handle_fmv_write(FMV_VIDCMD);
+        let mut out = [0u32; 768];
+        let mut present = [false; 768];
+        d.get_scanline(9, &mut out, &mut present);
+        assert!(!present.iter().any(|&p| p));
+        d.get_scanline(10, &mut out, &mut present);
+        assert_eq!(&out[10..18], &[0xFF00_000C, 0xFF00_000C, 0xFF00_000D, 0xFF00_000D, 0xFF00_000E, 0xFF00_000E, 0xFF00_000F, 0xFF00_000F]);
+        assert!(present[10..18].iter().all(|&p| p) && !present[9] && !present[18]);
+        d.get_scanline(12, &mut out, &mut present);
+        assert_eq!(out[10], 0xFF00_001C);
+        d.get_scanline(13, &mut out, &mut present);
+        assert!(!present.iter().any(|&p| p));
     }
 }
