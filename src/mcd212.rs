@@ -83,6 +83,7 @@ pub const CSR1W_DD2_SHIFT: u32 = 8;
 pub const CSR2R_IT1: u8 = 0x04; // Interrupt 1
 pub const CSR2R_IT2: u8 = 0x02; // Interrupt 2
 pub const CSR2R_BE: u8 = 0x01;  // Bus Error
+pub const CSRW_DI: u16 = 0x8000; // CSR1W/CSR2W: disable the channel's interrupt request (IT1/IT2 status still set)
 
 pub const DCR_DCA_BIT: u16 = 1 << 8;
 pub const DCR_ICA_BIT: u16 = 1 << 9;
@@ -332,6 +333,13 @@ impl Mcd212 {
         self.external_video_line.fill(0xFF00_0000);
         self.external_video_present.fill(false);
         self.init_default_palette();
+    }
+
+    /// Interrupt output: IT1 or IT2 set while its channel's disable bit is clear.
+    pub fn int_line(&self) -> bool {
+        let it1 = (self.csrr[1] & CSR2R_IT1) != 0 && (self.csrw[0] & CSRW_DI) == 0;
+        let it2 = (self.csrr[1] & CSR2R_IT2) != 0 && (self.csrw[1] & CSRW_DI) == 0;
+        it1 || it2
     }
 
     pub fn read_reg(&mut self, offset: u32) -> u16 {
@@ -801,7 +809,7 @@ impl Mcd212 {
                 0x60..=0x6F => {
                     // INTERRUPT
                     self.csrr[1] |= 1 << (2 - PATH);
-                    self.vblank_irq = true;
+                    self.vblank_irq |= (self.csrw[PATH] & CSRW_DI) == 0;
                 }
                 0x78..=0x7F => {
                     // RELOAD DISPLAY PARAMETERS
@@ -873,7 +881,7 @@ impl Mcd212 {
                 0x60..=0x6F => {
                     // INTERRUPT
                     self.csrr[1] |= 1 << (2 - PATH);
-                    self.vblank_irq = true;
+                    self.vblank_irq |= (self.csrw[PATH] & CSRW_DI) == 0;
                 }
                 0x78..=0x7F => {
                     // RELOAD DISPLAY PARAMETERS
@@ -1271,5 +1279,37 @@ impl Mcd212 {
             let start = (y_offset + active_lines * 2) * SCREEN_WIDTH;
             self.framebuffer[start..].fill(0xFF00_0000);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Channel 1 ICA at 0x400: INTERRUPT, then reload DCP and stop.
+    fn mcd_with_int() -> Mcd212 {
+        let mut m = Mcd212::new();
+        m.dcr[0] = DCR_ICA_BIT;
+        m.plane_a[0x400..0x408].copy_from_slice(&[0x60, 0, 0, 0, 0x30, 0, 0, 0]);
+        m
+    }
+
+    #[test]
+    fn interrupt_disable_bit_gates_request_not_status() {
+        let mut m = mcd_with_int();
+        m.write_reg(0x10, CSRW_DI | 0x0003);
+        m.tick_scanline(0);
+        assert_eq!(m.csrr[1] & CSR2R_IT1, CSR2R_IT1);
+        assert!(!m.vblank_irq && !m.int_line());
+        assert_eq!(m.read_reg(0x00) & 0x07, CSR2R_IT1 as u16);
+        assert_eq!(m.csrr[1] & CSR2R_IT1, 0);
+
+        let mut m = mcd_with_int();
+        m.write_reg(0x10, 0x0003);
+        m.write_reg(0x00, CSRW_DI);
+        m.tick_scanline(0);
+        assert!(m.vblank_irq && m.int_line());
+        m.read_reg(0x00);
+        assert!(!m.int_line());
     }
 }

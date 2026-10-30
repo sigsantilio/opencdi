@@ -289,7 +289,7 @@ impl CdiBus {
             }
         }
         let frame_done = self.mcd212.tick_scanline(line);
-        let mcd_int = (self.mcd212.csrr[1] & (crate::mcd212::CSR2R_IT1 | crate::mcd212::CSR2R_IT2)) != 0;
+        let mcd_int = self.mcd212.int_line();
         self.scc_timer.int1_w(mcd_int);
         if line == 0 && self.dvc.is_fitted() {
             self.dvc.vsync_hz = if self.mcd212.video_mode == crate::mcd212::VideoMode::Pal { 50.0 } else { 60.0 };
@@ -496,7 +496,7 @@ impl AddressBus for CdiBus {
                 let offset = addr - 0x4FFFE0;
                 let reg_base = offset & !1;
                 let word = self.mcd212.read_reg(reg_base);
-                let mcd_int = (self.mcd212.csrr[1] & (crate::mcd212::CSR2R_IT1 | crate::mcd212::CSR2R_IT2)) != 0;
+                let mcd_int = self.mcd212.int_line();
                 self.scc_timer.int1_w(mcd_int);
                 if (addr & 1) == 0 { (word >> 8) as u8 } else { word as u8 }
             }
@@ -603,7 +603,7 @@ impl AddressBus for CdiBus {
             0x4FFFE0..=0x4FFFFF => {
                 let offset = (addr - 0x4FFFE0) & !1;
                 let word = self.mcd212.read_reg(offset);
-                let mcd_int = (self.mcd212.csrr[1] & (crate::mcd212::CSR2R_IT1 | crate::mcd212::CSR2R_IT2)) != 0;
+                let mcd_int = self.mcd212.int_line();
                 self.scc_timer.int1_w(mcd_int);
                 word
             }
@@ -925,9 +925,8 @@ impl AddressBus for CdiBus {
 
     fn interrupt_acknowledge(&mut self, level: u8) -> u32 {
         let vec = (|| {
-            let int1_lvl = (self.scc_timer.lir >> 4) & 7;
-            let int1_priority = if int1_lvl != 0 { int1_lvl } else { 5 };
-            if (self.scc_timer.lir & 0x80) != 0 && level == int1_priority {
+            let int1_lvl = self.scc_timer.int1_level();
+            if int1_lvl != 0 && level == int1_lvl {
                 self.scc_timer.lir &= 0x7F;
                 self.mcd212.vblank_irq = false;
                 return 0x38 + level as u32; // SCC68070 Vector 0x3D (Vector 61)
