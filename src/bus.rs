@@ -688,6 +688,13 @@ impl AddressBus for CdiBus {
                 0x2020..=0x2029 | 0x2045 | 0x2047 => self.scc_timer.write_byte(reg, value),
                 0x4000..=0x406F => {
                     let offset = (reg - 0x4000) & !1;
+                    // The error register is read-only, and a status byte write clears only its own bits.
+                    if offset % 0x40 == 0 {
+                        if (reg & 1) == 0 {
+                            self.dma.write_reg(offset, (value as u16) << 8);
+                        }
+                        return;
+                    }
                     let cur = self.dma.read_reg(offset);
                     let new_val = if (reg & 1) == 0 {
                         (cur & 0x00FF) | ((value as u16) << 8)
@@ -1001,5 +1008,16 @@ mod tests {
         assert_eq!(bus.read_long(0x5172), 2);
         assert_eq!(bus.read_byte(0x405E48), 0x12);
         assert!(bus.wait_cycles > 0 && bus.current_line_cycle > 100 && bus.trace_setup);
+    }
+
+    #[test]
+    fn dma_error_byte_is_read_only_and_status_byte_clears_only_its_bits() {
+        let mut bus = CdiBus::new();
+        bus.dma.channels[0].channel_status = 0x90;
+        bus.dma.channels[0].channel_error = 0x02;
+        bus.write_byte(0x8000_4001, 0xFF);
+        assert_eq!((bus.dma.channels[0].channel_status, bus.dma.channels[0].channel_error), (0x90, 0x02));
+        bus.write_byte(0x8000_4000, 0x10);
+        assert_eq!(bus.dma.channels[0].channel_status, 0x80);
     }
 }
