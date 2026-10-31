@@ -17,7 +17,8 @@ const XA_FILTER_COEF: [[i32; 2]; 4] = [
 const HEADER_OFFSET_4BIT: [usize; 8] = [4, 5, 6, 7, 12, 13, 14, 15];
 const DATA_OFFSET_4BIT: [usize; 8]   = [16, 16, 17, 17, 18, 18, 19, 19];
 
-const HEADER_OFFSET_8BIT: [usize; 4] = [4, 5, 6, 7];
+// 8-bit groups repeat the four sound parameters four times; the decoder uses the last copy (bytes 12-15).
+const HEADER_OFFSET_8BIT: [usize; 4] = [12, 13, 14, 15];
 const DATA_OFFSET_8BIT: [usize; 4]   = [16, 17, 18, 19];
 
 #[derive(Default, Clone, Copy)]
@@ -578,5 +579,24 @@ impl HostAudioOutput {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eight_bit_groups_use_the_last_parameter_copy() {
+        let mut payload = vec![0u8; 18 * 128];
+        for g in payload.chunks_exact_mut(128) {
+            g[0..12].fill(0x08); // range 8 in the first three copies
+            g[12..16].fill(0x00); // range 0 in the last copy
+            g[16..].fill(0x01);
+        }
+        let mut a = CdiAudio::new();
+        a.decode_sector(&payload, false, true, 37800);
+        let first = a.sample_queue.lock().unwrap()[0].0;
+        assert_eq!(first, 256.0 / 32768.0);
     }
 }
