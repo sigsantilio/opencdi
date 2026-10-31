@@ -118,7 +118,7 @@ impl Ikat {
             if dx.abs() <= 127 && dy.abs() <= 127 {
                 self.reported = Some((x, y));
                 let (dx, dy) = ((dx as i8) as u8, (dy as i8) as u8);
-                let r = [0x40 | btn | ((dy >> 6) & 3) << 2 | (dx >> 6) & 3, 0x10 | (dx & 0x3F), dy & 0x3F, 0];
+                let r = [0x40 | btn | ((dy >> 6) & 3) << 2 | (dx >> 6) & 3, dx & 0x3F, dy & 0x3F, 0];
                 self.respond(1, &r);
                 return;
             }
@@ -441,6 +441,9 @@ mod tests {
         k.update_pointer(381, 283, 0);
         let r: Vec<u8> = (0..4).map(|_| k.read(0x0B, 0)).collect();
         assert_eq!(r, [0x43, 0x3D, 0x03, 0x00]);
+        k.update_pointer(382, 284, 0);
+        let r: Vec<u8> = (0..4).map(|_| k.read(0x0B, 0)).collect();
+        assert_eq!(r, [0x40, 0x01, 0x01, 0x00]);
     }
 
     #[test]
