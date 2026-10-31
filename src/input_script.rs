@@ -70,11 +70,17 @@ impl Pad {
         m
     }
 
-    // Moves (x, y) by PAD_SPEED per held direction, clamped to the slave's range.
-    pub fn step(self, x: i32, y: i32) -> (i32, i32) {
+    // Unclamped move of the held directions, PAD_SPEED per axis.
+    pub fn delta(self) -> (i32, i32) {
         let dx = self.held(PadButton::Right) as i32 - self.held(PadButton::Left) as i32;
         let dy = self.held(PadButton::Down) as i32 - self.held(PadButton::Up) as i32;
-        ((x + dx * PAD_SPEED).clamp(0, MAX_X), (y + dy * PAD_SPEED).clamp(0, MAX_Y))
+        (dx * PAD_SPEED, dy * PAD_SPEED)
+    }
+
+    // Moves (x, y) by PAD_SPEED per held direction, clamped to the slave's range.
+    pub fn step(self, x: i32, y: i32) -> (i32, i32) {
+        let (dx, dy) = self.delta();
+        ((x + dx).clamp(0, MAX_X), (y + dy).clamp(0, MAX_Y))
     }
 }
 

@@ -117,9 +117,7 @@ impl Ikat {
             let (dx, dy) = (x - rx, y - ry);
             if dx.abs() <= 127 && dy.abs() <= 127 {
                 self.reported = Some((x, y));
-                let (dx, dy) = ((dx as i8) as u8, (dy as i8) as u8);
-                let r = [0x40 | btn | ((dy >> 6) & 3) << 2 | (dx >> 6) & 3, dx & 0x3F, dy & 0x3F, 0];
-                self.respond(1, &r);
+                self.send_relative(btn, dx, dy);
                 return;
             }
         }
@@ -132,6 +130,23 @@ impl Ikat {
             (y & 0x3F) as u8 | 0x80,
         ];
         self.respond(1, &r);
+    }
+
+    fn send_relative(&mut self, btn: u8, dx: i32, dy: i32) {
+        let (dx, dy) = ((dx as i8) as u8, (dy as i8) as u8);
+        let r = [0x40 | btn | ((dy >> 6) & 3) << 2 | (dx >> 6) & 3, dx & 0x3F, dy & 0x3F, 0];
+        self.respond(1, &r);
+    }
+
+    /// A move the host position could not follow (held against its edge); the title's own position may be elsewhere, so it still goes out as a relative report.
+    pub fn push_pointer(&mut self, dx: i32, dy: i32) {
+        if (dx, dy) == (0, 0) || self.imr & pending_bit(1) == 0 || self.reported.is_none() {
+            return;
+        }
+        let b = self.pointer.2;
+        let third = b & 4 != 0;
+        let btn = if b & 1 != 0 || third { 0x20 } else { 0 } | if b & 2 != 0 || third { 0x10 } else { 0 };
+        self.send_relative(btn, dx.clamp(-127, 127), dy.clamp(-127, 127));
     }
 
     /// Ports holding an unread reply, as pending bits.
@@ -444,6 +459,9 @@ mod tests {
         k.update_pointer(382, 284, 0);
         let r: Vec<u8> = (0..4).map(|_| k.read(0x0B, 0)).collect();
         assert_eq!(r, [0x40, 0x01, 0x01, 0x00]);
+        k.push_pointer(0, -3);
+        let r: Vec<u8> = (0..4).map(|_| k.read(0x0B, 0)).collect();
+        assert_eq!(r, [0x4C, 0x00, 0x3D, 0x00]);
     }
 
     #[test]
