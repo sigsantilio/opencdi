@@ -560,8 +560,8 @@ impl Dvc {
         self.decoder_timecode = 0;
         self.display_frame_counter = 0;
         self.decoder_frame_counter = 0;
-        self.has_valid_frame = false;
-        self.framebuffer.fill(0xFF00_0000);
+        // NOTE: Real DVC hardware keeps the last decoded picture in DRAM.
+        // Screen blanking and plane transitions are managed by MCD-212.
     }
 
     pub fn reset_regs(&mut self) {
@@ -1308,7 +1308,8 @@ impl Dvc {
                     self.set_fmv_word(0x5C, 0x0000); // Return display status to idle
                     self.video_playing = false;
                     self.video_armed = false;
-                    self.has_valid_frame = false;
+                    // NOTE: Real DVC hardware keeps the last decoded picture in DRAM.
+                    // Retaining has_valid_frame prevents black flash during scene transitions.
                 } else if buffer_drained {
                     // Real CL450 MPEG-1 decoder asserts FMV_IRQ_NDAT (Need Data) on underflow during active play,
                     // repeating the last frame in DRAM without stopping or destroying the decoder.

@@ -103,10 +103,10 @@ Legenda: `[ ]` aperto · `[~]` fix applicata nel codice, **da confermare giocand
   - **Causa Tecnica:** La presentazione dei frame era vincolata al modulo fisso `vsync_counter % 2 == 0` (assunzione rigida di 25 fps esatti su 50 Hz PAL), generando sfasamenti in caso di rate frazionari o frame drop. Inoltre, le collisioni di DMA tra video e audio corrompevano i macroblocchi MPEG.
   - **Risoluzione / Stato:** Introduzione di un accumulatore frazionario di frame (`frame_accum += fps / vsync_hz`) in `on_vsync` e separazione indipendente dei canali DMA/FIFO per video e audio. L'utente riscontra ancora un leggero stuttering residuo; da rifinire PTS/SCR clock sync.
 
-- [ ] **Problema 3: Transizione post-filmato (Frattura 10px / Schermata nera transitoria)**
-  - **Sintomo:** La frattura superiore di 10px è stata eliminata con successo, ma al termine delle sequenze filmate si nota ora una schermata completamente nera transitoria (di durata variabile da un flash a qualche istante) prima che ricompaia l'immagine della stanza.
-  - **Causa Tecnica:** `get_scanline` azzera l'output e il framebuffer viene pulito non appena la sequenza termina o riceve STOP/DEC_OFF, mentre il gioco impiega qualche campo per ricaricare la VRAM e riattivare i piani A/B.
-  - **Stato:** Da perfezionare la persistenza dell'ultimo fotogramma fino alla prima riga valida disegnata da Plane A/B.
+- [x] **Problema 3: Transizione post-filmato (Frattura 10px / Schermata nera transitoria)**
+  - **Sintomo:** Al termine delle sequenze filmate si notava una schermata completamente nera transitoria prima che ricomparisse l'immagine della stanza interattiva.
+  - **Causa Tecnica:** In `src/dvc.rs`, al verificarsi di `sequence_ended` e nel metodo `reset_stream()`, veniva forzato `self.has_valid_frame = false` e azzerato il framebuffer. Sull'hardware autentico DVC con decoder CL450, la memoria DRAM conserva l'ultimo fotogramma decodificato ed emette continuamente i pixel sul bus video fino a sovrascrittura o commutazione dei piani/ICM da parte dell'MCD-212.
+  - **Risoluzione:** Rimossa la disattivazione prematura di `has_valid_frame` e la cancellazione a nero da `sequence_ended` e `reset_stream()`. La persistenza dell'ultimo fotogramma decodificato assicura una transizione visiva continua e priva di blackout tra filmati e stanze 3D interattive.
 
 - [x] **Problema 4: Blocco totale (Freeze) dopo la cutscene del fantasma nel corridoio al piano superiore**
   - **Sintomo:** Salendo la scalinata e voltandosi a sinistra parte il video con il fantasma; al termine del filmato, cliccando per avanzare nel corridoio, il gioco si bloccava permanentemente con errore OS-9 *"avm_play: Still busy from last play $8000"*.
