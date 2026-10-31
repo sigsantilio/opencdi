@@ -53,6 +53,14 @@ impl Timekeeper {
         }
     }
 
+    pub fn clear(&mut self) -> std::io::Result<()> {
+        self.ram.fill(0);
+        self.init_default();
+        self.dirty = true;
+        self.save_to_file()?;
+        Ok(())
+    }
+
     fn init_default(&mut self) {
         // MK48T08 timekeeper registers are at the top (8184..8191)
         // Set standard flags: Calibration = 0, Seconds = 0 (oscillator running, bit 7 = 0)

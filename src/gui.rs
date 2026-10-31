@@ -38,6 +38,8 @@ pub const ID_EMU_DVC: usize = 1051;
 
 pub const ID_HELP_CONTROLS: usize = 1040;
 pub const ID_HELP_ABOUT: usize = 1041;
+pub const ID_HELP_FEEDBACK: usize = 1042;
+pub const ID_FILE_CLEAR_NVRAM: usize = 1005;
 
 pub const ID_STATE_QUICK_SAVE: usize = 1070;
 pub const ID_STATE_QUICK_LOAD: usize = 1071;
@@ -134,6 +136,18 @@ unsafe extern "system" {
     fn GetLogicalDrives() -> u32;
     fn GetDriveTypeW(lpRootPathName: *const u16) -> u32;
     fn GetModuleHandleW(lpmodulename: *const u16) -> *mut std::ffi::c_void;
+}
+
+#[link(name = "shell32")]
+unsafe extern "system" {
+    fn ShellExecuteW(
+        hwnd: *mut std::ffi::c_void,
+        lpoperation: *const u16,
+        lpfile: *const u16,
+        lpparameters: *const u16,
+        lpdirectory: *const u16,
+        nshowcmd: i32,
+    ) -> *mut std::ffi::c_void;
 }
 
 pub fn to_wide(s: &str) -> Vec<u16> {
@@ -531,6 +545,7 @@ pub enum GuiAction {
     ToggleDvc,
     ShowHelp,
     ShowAbout,
+    ClearNvram,
 }
 
 static PENDING_ACTIONS: Mutex<Vec<GuiAction>> = Mutex::new(Vec::new());
@@ -840,6 +855,24 @@ unsafe extern "system" fn custom_wndproc(
                 show_controls_dialog(hwnd);
                 return 0;
             }
+            ID_FILE_CLEAR_NVRAM => {
+                let confirm = unsafe {
+                    MessageBoxW(
+                        hwnd,
+                        to_wide("Are you sure you want to clear console memory (NVRAM)?\n\nAll saved games in NVRAM will be erased and the console will be reset to factory defaults.").as_ptr(),
+                        to_wide("OpenCDi - Clear Console Memory").as_ptr(),
+                        MB_YESNO | MB_ICONQUESTION,
+                    )
+                };
+                if confirm == IDYES {
+                    push_action(GuiAction::ClearNvram);
+                }
+                return 0;
+            }
+            ID_HELP_FEEDBACK => {
+                open_feedback_url();
+                return 0;
+            }
             ID_HELP_ABOUT => {
                 show_about_dialog(hwnd);
                 return 0;
@@ -947,6 +980,7 @@ pub fn attach_gui_menu(
         AppendMenuW(file_menu, MF_POPUP, load_state_menu as usize, to_wide("Load State from Slot").as_ptr());
 
         AppendMenuW(file_menu, MF_SEPARATOR, 0, std::ptr::null());
+        AppendMenuW(file_menu, MF_STRING, ID_FILE_CLEAR_NVRAM, to_wide("Clear Console Memory (Reset NVRAM)...").as_ptr());
         AppendMenuW(file_menu, MF_STRING, ID_FILE_RESET, to_wide("Restart Console (Reset)\tF5").as_ptr());
         AppendMenuW(file_menu, MF_SEPARATOR, 0, std::ptr::null());
         AppendMenuW(file_menu, MF_STRING, ID_FILE_EXIT, to_wide("Exit\tAlt+F4").as_ptr());
@@ -994,6 +1028,8 @@ pub fn attach_gui_menu(
 
         // 5. Help Menu
         let help_menu = CreatePopupMenu();
+        AppendMenuW(help_menu, MF_STRING, ID_HELP_FEEDBACK, to_wide("Send Feedback...\tF1").as_ptr());
+        AppendMenuW(help_menu, MF_SEPARATOR, 0, std::ptr::null());
         AppendMenuW(help_menu, MF_STRING, ID_HELP_CONTROLS, to_wide("Controls Guide...").as_ptr());
         AppendMenuW(help_menu, MF_STRING, ID_HELP_ABOUT, to_wide("About OpenCDi...").as_ptr());
         AppendMenuW(main_menu, MF_POPUP, help_menu as usize, to_wide("Help").as_ptr());
@@ -1113,6 +1149,31 @@ pub fn show_about_dialog(owner: *mut std::ffi::c_void) {
         • The CD-i preservation community"
     );
     let title = to_wide("About OpenCDi");
+    unsafe {
+        MessageBoxW(owner, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
+    }
+}
+
+pub fn open_feedback_url() {
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            to_wide("open").as_ptr(),
+            to_wide("https://cdi-tester-feedback.pages.dev/").as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        );
+    }
+}
+
+pub fn show_nvram_cleared_dialog(owner: *mut std::ffi::c_void) {
+    let text = to_wide(
+        "Console memory (NVRAM) has been cleared successfully.\n\n\
+        All saved games and preferences have been reset to factory defaults.\n\
+        The console has been restarted."
+    );
+    let title = to_wide("OpenCDi - Memory Cleared");
     unsafe {
         MessageBoxW(owner, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
     }

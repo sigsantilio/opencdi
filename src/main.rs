@@ -477,6 +477,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut prev_m = false;
     let mut prev_ctrl_o = false;
     let mut prev_ctrl_i = false;
+    let mut prev_f1 = false;
     let mut prev_f5 = false;
     let mut prev_f6 = false;
     let mut prev_f7 = false;
@@ -759,6 +760,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     #[cfg(target_os = "windows")]
                     crate::gui::show_about_dialog(window.get_window_handle());
                 }
+                GuiAction::ClearNvram => {
+                    info!("Clearing console NVRAM memory upon user request...");
+                    if let Err(e) = bus.nvram.clear() {
+                        error!("Error clearing NVRAM: {}", e);
+                    } else {
+                        info!("Console NVRAM memory successfully cleared and reset to factory defaults.");
+                    }
+                    bus.reset_system();
+                    cpu.reset(&mut bus);
+                    frame_count = 0;
+                    disc_launched = false;
+                    shell_ready_count = 0;
+                    pad_x = if bus.cdrom.is_some() { 575 } else { 384 };
+                    pad_y = if bus.cdrom.is_some() { 335 } else { 280 };
+                    pad_x_f = pad_x as f32;
+                    pad_y_f = pad_y as f32;
+                    pad_active = false;
+                    mouse_captured = true;
+                    bus.emulate_wait_states = true;
+                    next_frame_time = std::time::Instant::now();
+                    fps_timer = std::time::Instant::now();
+                    #[cfg(target_os = "windows")]
+                    crate::gui::show_nvram_cleared_dialog(window.get_window_handle());
+                }
             }
         }
 
@@ -943,6 +968,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         prev_ctrl_o = ctrl_down && o_down;
+
+        // Keyboard Shortcut: F1 (Send Feedback)
+        let f1_down = window.is_key_down(Key::F1);
+        if is_active && f1_down && !prev_f1 {
+            #[cfg(target_os = "windows")]
+            crate::gui::open_feedback_url();
+        }
+        prev_f1 = f1_down;
 
         // Keyboard Shortcut: F5 (Reset)
         let f5_down = window.is_key_down(Key::F5);

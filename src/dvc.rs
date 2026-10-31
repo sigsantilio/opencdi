@@ -948,7 +948,8 @@ impl Dvc {
                 }
                 self.or_fmv_word(FMV_ISR, FMV_IRQ_DCL);
                 if value & 0x0080 != 0 { // STOP
-                    // NOTE: Real DVC hardware keeps the last decoded picture in DRAM.
+                    self.has_valid_frame = false;
+                    self.framebuffer.fill(0xFF00_0000);
                     self.video_armed = false;
                     self.video_playing = false;
                     self.decoder_enabled = false;
@@ -970,6 +971,8 @@ impl Dvc {
                     self.set_fmv_word(0x5C, 0x0000);
                 }
                 if value & 0x0100 != 0 { // RESET
+                    self.has_valid_frame = false;
+                    self.framebuffer.fill(0xFF00_0000);
                     self.video_playing = false;
                     self.video_armed = false;
                     self.reset_stream();
@@ -979,7 +982,8 @@ impl Dvc {
                     self.decoder_enabled = true;
                 }
                 if value & 0x2000 != 0 { // DEC_OFF
-                    // NOTE: Real DVC hardware keeps the last decoded picture in DRAM.
+                    self.has_valid_frame = false;
+                    self.framebuffer.fill(0xFF00_0000);
                     self.decoder_enabled = false;
                     self.video_playing = false;
                     self.underflow_count = 0;
