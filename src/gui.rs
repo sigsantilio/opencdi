@@ -1028,11 +1028,12 @@ pub fn attach_gui_menu(
 
         // 5. Help Menu
         let help_menu = CreatePopupMenu();
-        AppendMenuW(help_menu, MF_STRING, ID_HELP_FEEDBACK, to_wide("Send Feedback...\tF1").as_ptr());
-        AppendMenuW(help_menu, MF_SEPARATOR, 0, std::ptr::null());
         AppendMenuW(help_menu, MF_STRING, ID_HELP_CONTROLS, to_wide("Controls Guide...").as_ptr());
         AppendMenuW(help_menu, MF_STRING, ID_HELP_ABOUT, to_wide("About OpenCDi...").as_ptr());
         AppendMenuW(main_menu, MF_POPUP, help_menu as usize, to_wide("Help").as_ptr());
+
+        // 6. Prominent Top-Level Send Feedback Button
+        AppendMenuW(main_menu, MF_STRING, ID_HELP_FEEDBACK, to_wide("Send Feedback (F1)").as_ptr());
 
         SetMenu(hwnd, main_menu);
         DrawMenuBar(hwnd);
