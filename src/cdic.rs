@@ -450,15 +450,12 @@ impl Cdic {
         }
     }
 
-    pub fn step_cycles(&mut self, cycles: u32, cdrom: &mut Option<CdRom>) {
-        // CD-i 1x Red/Green Book read speed = 75 sectors/sec
-        // At 15,500,000 cycles/sec (SCC68070 master clock): 15,500,000 / 75 = 206,667 cycles/sector
-        const CYCLES_PER_SECTOR: u32 = 206_700;
-
+    // `sector_cycles` is one sector at 1x speed (75 per second) in CPU cycles of the current video standard.
+    pub fn step_cycles(&mut self, cycles: u32, sector_cycles: u32, cdrom: &mut Option<CdRom>) {
         // 1. Audio tick (75 Hz) for audio maps
         self.audio_cycle_accumulator += cycles;
-        while self.audio_cycle_accumulator >= CYCLES_PER_SECTOR {
-            self.audio_cycle_accumulator -= CYCLES_PER_SECTOR;
+        while self.audio_cycle_accumulator >= sector_cycles {
+            self.audio_cycle_accumulator -= sector_cycles;
 
             if self.audio_map_counter > 0 {
                 self.audio_map_counter -= 1;
@@ -475,8 +472,8 @@ impl Cdic {
         }
 
         self.cycle_accumulator += cycles;
-        while self.cycle_accumulator >= CYCLES_PER_SECTOR {
-            self.cycle_accumulator -= CYCLES_PER_SECTOR;
+        while self.cycle_accumulator >= sector_cycles {
+            self.cycle_accumulator -= sector_cycles;
 
             if self.disc_spinup_counter > 0 {
                 self.disc_spinup_counter -= 1;

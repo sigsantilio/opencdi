@@ -1,7 +1,7 @@
 pub const SCREEN_WIDTH: usize = 768;
 pub const SCREEN_HEIGHT: usize = 560;
 pub const TOTAL_SCANLINES: usize = 312;
-pub const CYCLES_PER_SCANLINE: u32 = 993; // 15.5 MHz / 15,625 Hz (PAL default)
+pub const CYCLES_PER_SCANLINE: u32 = 960; // 15 MHz CPU / 15,625 Hz (PAL default)
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoMode {
@@ -18,15 +18,25 @@ impl VideoMode {
         }
     }
 
+    // CPU clock is half the video crystal: 30 MHz (PAL) or 30.2098 MHz (NTSC).
+    #[inline]
+    pub fn cpu_clock_hz(self) -> u32 {
+        match self {
+            VideoMode::Pal => 15_000_000,
+            VideoMode::Ntsc => 15_104_900,
+        }
+    }
+
+    // 960 CPU cycles per line on both standards (15,625 Hz PAL, 15,734 Hz NTSC lines).
     #[inline]
     pub fn cycles_per_scanline(self) -> u32 {
-        // SCC68070 Master clock: ~15.5 MHz
-        // PAL line frequency: 15,625 Hz -> 15,500,000 / 15,625 = 992 cycles (use 993)
-        // NTSC line frequency: 15,734 Hz -> 15,500,000 / 15,734 = 985 cycles
-        match self {
-            VideoMode::Pal => 993,
-            VideoMode::Ntsc => 985,
-        }
+        960
+    }
+
+    // One CD sector at 75 sectors per second: 200,000 cycles (PAL) or 201,398 (NTSC).
+    #[inline]
+    pub fn cycles_per_sector(self) -> u32 {
+        self.cpu_clock_hz() / 75
     }
 
     #[inline]
@@ -429,7 +439,7 @@ impl Mcd212 {
             return 2;
         }
 
-        // Stalled waiting for the system slot (1 to 5 clocks at 15.5 MHz)
+        // Stalled waiting for the system slot (1 to 5 CPU clocks)
         2 + (((11 - slot_cycle) + 1) >> 1)
     }
 

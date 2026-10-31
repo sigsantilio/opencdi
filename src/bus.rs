@@ -210,7 +210,7 @@ impl CdiBus {
     }
 
     pub fn tick_cdic(&mut self, cycles: u32) {
-        self.cdic.step_cycles(cycles, &mut self.cdrom);
+        self.cdic.step_cycles(cycles, self.mcd212.video_mode.cycles_per_sector(), &mut self.cdrom);
     }
 
     #[inline]
@@ -252,6 +252,7 @@ impl CdiBus {
 
     pub fn tick_dvc(&mut self, cycles: u32) {
         if self.dvc.is_fitted() {
+            self.dvc.cpu_hz = u64::from(self.mcd212.video_mode.cpu_clock_hz());
             self.dvc.tick(cycles);
             if self.dvc_dma_requested() {
                 self.perform_dvc_dma();

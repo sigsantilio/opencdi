@@ -456,7 +456,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("USB Gamepad subsystem active (Xbox / PlayStation / Generic USB)");
     }
 
-    m.bus.emulate_wait_states = true; // Authentic hardware wait-states (15.5 MHz)
+    m.bus.emulate_wait_states = true; // Authentic hardware wait-states
     let (pad_x, pad_y) = if m.bus.cdrom.is_some() { (575, 335) } else { (384, 280) };
     let prev_vsr = (m.bus.mcd212.get_vsr::<0>(), m.bus.mcd212.get_vsr::<1>());
     let now = Instant::now();
@@ -1300,7 +1300,7 @@ impl App {
         }
         if self.measured_mips > 4.5 && m.bus.emulate_wait_states {
             log::warn!(
-                "[TELEMETRY CPU ANOMALY] Unexpected CPU throughput: {:.2} MIPS (expected ~3.2-3.5 MIPS for SCC68070 at 15.5MHz)",
+                "[TELEMETRY CPU ANOMALY] Unexpected CPU throughput: {:.2} MIPS (expected ~3.1-3.4 MIPS for SCC68070 at 15 MHz)",
                 self.measured_mips
             );
         }
