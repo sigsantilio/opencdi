@@ -27,9 +27,15 @@ L'obiettivo del progetto è preservare e rendere fruibile la libreria software e
   - Emulazione della cartuccia DVC per la riproduzione FMV (Full Motion Video).
   - Demuxer hardware integrato (video pack MPEG-1 e audio layer 2).
   - Decoder video MPEG e pipeline di compositing YUV -> RGB su MCD-212.
-- **Frontend GUI:**
+- **Salvataggi di Stato & Persistenza NVRAM:**
+  - Sistema Save State a 5 slot con salvataggio atomico dell'hardware (`F6` Quick Save, `F7` Quick Load).
+  - Persistenza reale della memoria console (NVRAM MK48T08) conservata fedelmente su disco.
+- **Sistema di Controllo & Input:**
+  - Modalità esclusiva di input (`F9` toggle): CD-i Gamepad vs CD-i Mouse senza sovrapposizione di comandi.
+  - Supporto nativo controller USB (Xbox, PlayStation, generici) e profili tastiera personalizzabili.
+- **Frontend GUI & Feedback:**
   - Finestra interattiva a 50/60 Hz basata su `minifb`.
-  - Controlli tastiera, mouse e gamepad.
+  - Barra dei menu Win32 con pulsante in primo piano `Send Feedback (F1)` collegato alla piattaforma tester.
 
 ---
 

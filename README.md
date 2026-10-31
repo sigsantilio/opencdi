@@ -31,9 +31,15 @@ The goal of the project is to accurately preserve and run the software and multi
   - Integrated MPEG-1 system stream demuxer (video and audio packets).
   - Video decoder with YUV-to-RGB planar compositing onto the MCD-212 external video plane.
   - Accurate presentation pacing and end-of-sequence stream drain detection.
-- **Frontend GUI:**
+- **Save States & NVRAM Persistence:**
+  - 5-slot save state engine with atomic hardware snapshot serialization (`F6` Quick Save, `F7` Quick Load).
+  - Authentic MK48T08 battery-backed NVRAM persistence preserved across sessions.
+- **Input System & Controls:**
+  - Exclusive input device mode (`F9` toggle): physical Gamepad vs host Mouse without input bleed.
+  - Native USB controller support (Xbox, PlayStation, standard gamepads) and configurable keyboard profiles.
+- **Frontend GUI & Feedback:**
   - Interactive 50/60 Hz display window powered by `minifb`.
-  - Configurable keyboard, mouse, and gamepad controls.
+  - Win32 native menu bar with direct `Send Feedback (F1)` integration pointing to the tester feedback portal.
 
 ---
 

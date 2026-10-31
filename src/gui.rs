@@ -1134,7 +1134,7 @@ pub fn show_controls_dialog(owner: *mut std::ffi::c_void) {
 pub fn show_about_dialog(owner: *mut std::ffi::c_void) {
     let text = to_wide(
         "OpenCDi - Philips CD-i Emulator\n\
-        Version: 0.1.8 (High Performance Edition)\n\
+        Version: 0.1.9 (High Performance Edition)\n\
         Built with Rust & MiniFB\n\n\
         Key Emulation Features:\n\
         • Philips SCC68070 Microprocessor & OS-9 CD-RTOS kernel\n\
