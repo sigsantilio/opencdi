@@ -39,6 +39,11 @@ pub const ID_EMU_DVC: usize = 1051;
 pub const ID_HELP_CONTROLS: usize = 1040;
 pub const ID_HELP_ABOUT: usize = 1041;
 
+pub const ID_STATE_QUICK_SAVE: usize = 1070;
+pub const ID_STATE_QUICK_LOAD: usize = 1071;
+pub const ID_STATE_SAVE_BASE: usize = 1072; // 1072..1076 (Slots 1..5)
+pub const ID_STATE_LOAD_BASE: usize = 1080; // 1080..1084 (Slots 1..5)
+
 pub const ID_RECENT_IMAGE_BASE: usize = 1200;
 pub const ID_RECENT_CLEAR: usize = 1210;
 pub const MAX_RECENT_IMAGES: usize = 10;
@@ -360,6 +365,7 @@ pub fn string_to_key(s: &str) -> Option<Key> {
 #[derive(Debug, Clone)]
 pub struct KeyBindings {
     pub profile: InputProfile,
+    pub input_device: InputDeviceMode,
     pub up: Key,
     pub down: Key,
     pub left: Key,
@@ -372,6 +378,7 @@ impl KeyBindings {
     pub fn new() -> Self {
         let mut bindings = Self {
             profile: InputProfile::Standard,
+            input_device: InputDeviceMode::Gamepad,
             up: Key::Up,
             down: Key::Down,
             left: Key::Left,
@@ -381,6 +388,11 @@ impl KeyBindings {
         };
         bindings.load_from_ini();
         bindings
+    }
+
+    pub fn set_input_device(&mut self, mode: InputDeviceMode) {
+        self.input_device = mode;
+        self.save_to_ini();
     }
 
     pub fn set_profile(&mut self, profile: InputProfile) {
@@ -424,8 +436,14 @@ impl KeyBindings {
             InputProfile::Numpad => "Numpad",
             InputProfile::Custom => "Custom",
         };
+        let dev_str = match self.input_device {
+            InputDeviceMode::Gamepad => "Gamepad",
+            InputDeviceMode::Mouse => "Mouse",
+        };
         let content = format!(
             "# OpenCDi Controls Configuration\n\
+             # Input Device: Gamepad | Mouse (Exclusive active input device)\n\
+             input_device={}\n\
              # Profile: Standard | WASD | Numpad | Custom\n\
              profile={}\n\n\
              # Custom key bindings (active with profile=Custom or as overrides):\n\
@@ -435,6 +453,7 @@ impl KeyBindings {
              right={}\n\
              btn1={}\n\
              btn2={}\n",
+            dev_str,
             prof_str,
             key_to_string(self.up),
             key_to_string(self.down),
@@ -457,6 +476,10 @@ impl KeyBindings {
                 let parts: Vec<&str> = trimmed.split('=').map(|s| s.trim()).collect();
                 if parts.len() == 2 {
                     match parts[0].to_lowercase().as_str() {
+                        "input_device" => match parts[1].to_lowercase().as_str() {
+                            "mouse" => self.input_device = InputDeviceMode::Mouse,
+                            _ => self.input_device = InputDeviceMode::Gamepad,
+                        },
                         "profile" => match parts[1].to_lowercase().as_str() {
                             "wasd" => self.set_profile(InputProfile::Wasd),
                             "numpad" => self.set_profile(InputProfile::Numpad),
@@ -492,6 +515,8 @@ pub enum GuiAction {
     EjectDisc,
     Reset,
     Exit,
+    SaveState(usize),
+    LoadState(usize),
     SetProfile(InputProfile),
     SetInputDevice(InputDeviceMode),
     ReloadControls,
@@ -691,7 +716,25 @@ unsafe extern "system" fn custom_wndproc(
             }
             return 0;
         }
+        if menu_id >= ID_STATE_SAVE_BASE && menu_id < ID_STATE_SAVE_BASE + 5 {
+            let slot = (menu_id - ID_STATE_SAVE_BASE) + 1;
+            push_action(GuiAction::SaveState(slot));
+            return 0;
+        }
+        if menu_id >= ID_STATE_LOAD_BASE && menu_id < ID_STATE_LOAD_BASE + 5 {
+            let slot = (menu_id - ID_STATE_LOAD_BASE) + 1;
+            push_action(GuiAction::LoadState(slot));
+            return 0;
+        }
         match menu_id {
+            ID_STATE_QUICK_SAVE => {
+                push_action(GuiAction::SaveState(1));
+                return 0;
+            }
+            ID_STATE_QUICK_LOAD => {
+                push_action(GuiAction::LoadState(1));
+                return 0;
+            }
             ID_FILE_INSERT => {
                 if let Some(path) = open_file_dialog(hwnd) {
                     push_action(GuiAction::InsertDisc(path));
@@ -881,6 +924,29 @@ pub fn attach_gui_menu(
         }
 
         AppendMenuW(file_menu, MF_SEPARATOR, 0, std::ptr::null());
+        AppendMenuW(file_menu, MF_STRING, ID_STATE_QUICK_SAVE, to_wide("Quick Save State (Slot 1)\tF6").as_ptr());
+        AppendMenuW(file_menu, MF_STRING, ID_STATE_QUICK_LOAD, to_wide("Quick Load State (Slot 1)\tF7").as_ptr());
+
+        let save_state_menu = CreatePopupMenu();
+        let load_state_menu = CreatePopupMenu();
+        for slot in 1..=5 {
+            let save_label = if slot == 1 {
+                format!("Slot &{} (Quick Save)\tF6", slot)
+            } else {
+                format!("Slot &{}", slot)
+            };
+            let load_label = if slot == 1 {
+                format!("Slot &{} (Quick Load)\tF7", slot)
+            } else {
+                format!("Slot &{}", slot)
+            };
+            AppendMenuW(save_state_menu, MF_STRING, ID_STATE_SAVE_BASE + (slot - 1), to_wide(&save_label).as_ptr());
+            AppendMenuW(load_state_menu, MF_STRING, ID_STATE_LOAD_BASE + (slot - 1), to_wide(&load_label).as_ptr());
+        }
+        AppendMenuW(file_menu, MF_POPUP, save_state_menu as usize, to_wide("Save State to Slot").as_ptr());
+        AppendMenuW(file_menu, MF_POPUP, load_state_menu as usize, to_wide("Load State from Slot").as_ptr());
+
+        AppendMenuW(file_menu, MF_SEPARATOR, 0, std::ptr::null());
         AppendMenuW(file_menu, MF_STRING, ID_FILE_RESET, to_wide("Restart Console (Reset)\tF5").as_ptr());
         AppendMenuW(file_menu, MF_SEPARATOR, 0, std::ptr::null());
         AppendMenuW(file_menu, MF_STRING, ID_FILE_EXIT, to_wide("Exit\tAlt+F4").as_ptr());
@@ -890,9 +956,9 @@ pub fn attach_gui_menu(
         let controls_menu = CreatePopupMenu();
 
         let device_menu = CreatePopupMenu();
-        AppendMenuW(device_menu, MF_STRING, ID_INPUT_DEVICE_GAMEPAD, to_wide("CD-i Gamepad (USB Controller / Keyboard)").as_ptr());
-        AppendMenuW(device_menu, MF_STRING, ID_INPUT_DEVICE_MOUSE, to_wide("Philips CD-i Mouse (Host Cursor)").as_ptr());
-        AppendMenuW(controls_menu, MF_POPUP, device_menu as usize, to_wide("Input Device").as_ptr());
+        AppendMenuW(device_menu, MF_STRING, ID_INPUT_DEVICE_GAMEPAD, to_wide("CD-i Gamepad (USB Controller / Keyboard)\tF9").as_ptr());
+        AppendMenuW(device_menu, MF_STRING, ID_INPUT_DEVICE_MOUSE, to_wide("Philips CD-i Mouse (Host Cursor)\tF9").as_ptr());
+        AppendMenuW(controls_menu, MF_POPUP, device_menu as usize, to_wide("Input Device (Exclusive)").as_ptr());
         AppendMenuW(controls_menu, MF_SEPARATOR, 0, std::ptr::null());
 
         AppendMenuW(controls_menu, MF_STRING, ID_PROFILE_STANDARD, to_wide("Key Profile: Standard (Arrow Keys + Z / X)").as_ptr());
@@ -1012,6 +1078,9 @@ pub fn show_controls_dialog(owner: *mut std::ffi::c_void) {
            • Button B / Circle / X = Button 2\n\
            • Start Button = Action / Pause\n\n\
         KEYBOARD SHORTCUTS:\n\
+           • F6: Quick Save State (Slot 1)\n\
+           • F7: Quick Load State (Slot 1)\n\
+           • F9: Switch Active Input Device (Gamepad <-> Mouse)\n\
            • F12: Save Screenshot\n\
            • Ctrl+O: Open disc image (CHD / ISO / BIN)\n\
            • F5: Restart console (Reset)\n\

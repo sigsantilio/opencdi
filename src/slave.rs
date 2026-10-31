@@ -48,9 +48,9 @@ pub struct SlaveHle {
     pub center_y: i32,
 
     // Previous input values to detect changes
-    input_mouse_x: i32,
-    input_mouse_y: i32,
-    input_mouse_btn: u8,
+    pub input_mouse_x: i32,
+    pub input_mouse_y: i32,
+    pub input_mouse_btn: u8,
 
     pub irq_pending: bool,
     pub has_disc: bool,

@@ -7,6 +7,7 @@ pub mod dvc;
 pub mod gui;
 pub mod mcd212;
 pub mod nvram;
+pub mod savestate;
 pub mod scc_timer;
 pub mod slave;
 

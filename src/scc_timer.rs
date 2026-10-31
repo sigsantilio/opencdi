@@ -28,7 +28,7 @@ pub struct SccTimer {
     pub lir: u8,       // 0x80001001: Line Interrupt Register (INT1 / INT2 control & status)
     pub int1_line: bool, // Physical INT1 line level from MCD212
     pub timer_irq: bool,
-    cycle_accum: u32,
+    pub cycle_accum: u32,
 }
 
 impl SccTimer {

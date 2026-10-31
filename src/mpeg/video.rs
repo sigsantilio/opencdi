@@ -694,12 +694,12 @@ pub struct Frame {
 }
 
 #[derive(Default, Clone, Copy)]
-struct Motion {
-    full_px: bool,
-    is_set: bool,
-    r_size: i32,
-    h: i32,
-    v: i32,
+pub struct Motion {
+    pub full_px: bool,
+    pub is_set: bool,
+    pub r_size: i32,
+    pub h: i32,
+    pub v: i32,
 }
 
 fn clamp_u8(n: i32) -> u8 {
@@ -707,60 +707,62 @@ fn clamp_u8(n: i32) -> u8 {
 }
 
 /// MPEG-1 video decoder over an in-memory elementary stream.
+#[derive(Clone)]
 pub struct Video {
-    buffer: Buffer,
-    framerate: f64,
-    pixel_aspect_ratio: f64,
-    time: f64,
-    last_frame_time: f64,
-    frames_decoded: i64,
+    pub buffer: Buffer,
+    pub framerate: f64,
+    pub pixel_aspect_ratio: f64,
+    pub time: f64,
+    pub last_frame_time: f64,
+    pub frames_decoded: i64,
 
-    width: usize,
-    height: usize,
-    mb_width: usize,
-    mb_height: usize,
-    mb_size: usize,
-    luma_width: usize,
-    luma_height: usize,
-    chroma_width: usize,
-    chroma_height: usize,
+    pub width: usize,
+    pub height: usize,
+    pub mb_width: usize,
+    pub mb_height: usize,
+    pub mb_size: usize,
+    pub luma_width: usize,
+    pub luma_height: usize,
+    pub chroma_width: usize,
+    pub chroma_height: usize,
 
-    start_code: i32,
-    picture_type: i32,
+    pub start_code: i32,
+    pub picture_type: i32,
 
-    motion_forward: Motion,
-    motion_backward: Motion,
+    pub motion_forward: Motion,
+    pub motion_backward: Motion,
 
-    has_sequence_header: bool,
+    pub has_sequence_header: bool,
 
-    quantizer_scale: i32,
-    slice_begin: bool,
-    macroblock_address: i32,
-    mb_row: usize,
-    mb_col: usize,
+    pub quantizer_scale: i32,
+    pub slice_begin: bool,
+    pub macroblock_address: i32,
+    pub mb_row: usize,
+    pub mb_col: usize,
 
-    macroblock_type: i32,
-    macroblock_intra: bool,
+    pub macroblock_type: i32,
+    pub macroblock_intra: bool,
 
-    dc_predictor: [i32; 3],
+    pub dc_predictor: [i32; 3],
 
-    frames: Vec<Frame>,
-    cur: usize,
-    fwd: usize,
-    bwd: usize,
+    pub frames: Vec<Frame>,
+    pub cur: usize,
+    pub fwd: usize,
+    pub bwd: usize,
 
-    block_data: [i32; 64],
-    intra_quant_matrix: [u8; 64],
-    non_intra_quant_matrix: [u8; 64],
+    pub block_data: [i32; 64],
+    pub intra_quant_matrix: [u8; 64],
+    pub non_intra_quant_matrix: [u8; 64],
 
-    has_reference_frame: bool,
-    assume_no_b_frames: bool,
+    pub has_reference_frame: bool,
+    pub assume_no_b_frames: bool,
     /// Set when an MPEG-1 sequence_end_code (00 00 01 B7) has been received
     /// and not yet reported to the host.
-    sequence_end_seen: bool,
+    pub sequence_end_seen: bool,
     pub sequence_header_seen: bool,
     pub gop_header_seen: bool,
     pub last_gop_timecode: Option<u32>,
+    pub prpa: u16,
 }
 
 impl Video {
@@ -809,6 +811,7 @@ impl Video {
             sequence_header_seen: false,
             gop_header_seen: false,
             last_gop_timecode: None,
+            prpa: 0x0023,
         };
         s.sequence_end_seen = s.buffer.contains_start_code_from(0, 0xB7);
         s.start_code = s.buffer.find_start_code(START_SEQUENCE);
@@ -880,6 +883,9 @@ impl Video {
     }
     pub fn pixel_aspect_ratio(&self) -> f64 {
         self.pixel_aspect_ratio
+    }
+    pub fn prpa(&self) -> u16 {
+        if self.prpa != 0 { self.prpa } else { 0x0023 }
     }
     /// Display time (seconds) of the most recently returned frame.
     pub fn last_frame_time(&self) -> f64 {
@@ -997,7 +1003,8 @@ self.has_reference_frame = false;
             return false;
         }
 
-        let mut par_code = self.buffer.read(4) as i32 - 1;
+        let raw_par = self.buffer.read(4);
+        let mut par_code = raw_par as i32 - 1;
         if par_code < 0 {
             par_code = 0;
         }
@@ -1007,7 +1014,10 @@ self.has_reference_frame = false;
         }
         self.pixel_aspect_ratio = PIXEL_ASPECT_RATIO[par_code as usize];
 
-        self.framerate = PICTURE_RATE[self.buffer.read(4) as usize];
+        let raw_rate = self.buffer.read(4);
+        self.framerate = PICTURE_RATE[raw_rate as usize];
+        let prpa_val = ((raw_par as u16) << 4) | (raw_rate as u16);
+        self.prpa = if prpa_val != 0 { prpa_val } else { 0x0023 };
 
         // Skip bit_rate, marker, buffer_size and constrained bit.
         self.buffer.skip(18 + 1 + 10 + 1);

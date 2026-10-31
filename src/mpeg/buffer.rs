@@ -2,10 +2,11 @@
 // Ported to Rust from PL_MPEG by Dominic Szablewski (MIT licensed).
 
 /// A bit reader over an owned byte buffer.
+#[derive(Clone, Default)]
 pub struct Buffer {
-    bytes: Vec<u8>,
+    pub bytes: Vec<u8>,
     /// Current read position, in bits.
-    bit_index: usize,
+    pub bit_index: usize,
 }
 
 impl Buffer {
