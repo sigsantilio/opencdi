@@ -87,6 +87,7 @@ Usage: opencdi [options] [disc image (cue, chd, iso, bin)]
   --dvc <path>        Digital Video Cartridge ROM (default: search dvc/, bios/, the current and the program directory)
   --no-dvc, --nodvc   Boot without the Digital Video Cartridge
   --slave-debug       Log slave (mouse channel) bytes
+  --nvram <path>      Console NVRAM save file (default: bios/nvram_mk48t08.bin or nvram_mk48t08.bin)
   --run-in-menu       Windows: keep emulating while a menu or dialog is open, or the window is moved (default: paused)
   --console           Windows: show the log in the parent console or a new console window
   --help, -h          Show this text
@@ -355,9 +356,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 2. Load NVRAM if present
-    if let Some(nvram_path) = find_nvram_file() {
-        let _ = m.bus.nvram.load_from_file(&nvram_path);
-        info!("Loaded NVRAM from {:?}", nvram_path);
+    let nvram_arg = args.iter().position(|a| a == "--nvram").and_then(|i| args.get(i + 1)).map(PathBuf::from);
+    let resolved_nvram_path = nvram_arg.unwrap_or_else(default_nvram_save_path);
+    if resolved_nvram_path.is_file() {
+        if let Err(e) = m.bus.nvram.load_from_file(&resolved_nvram_path) {
+            log::warn!("Impossibile caricare NVRAM da {:?}: {:?}", resolved_nvram_path, e);
+        } else {
+            info!("NVRAM caricata da {:?}", resolved_nvram_path);
+        }
     }
 
     // 2b. Load DVC ROM (Digital Video Cartridge) by default if present
@@ -462,7 +468,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dvc_arg,
         max_frames,
         current_game_name,
-        nvram_path: Some(default_nvram_save_path()),
+        nvram_path: Some(resolved_nvram_path),
         window: None,
         surface: None,
         image_rect: (0, 0, SCREEN_WIDTH, SCREEN_HEIGHT),
