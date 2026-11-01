@@ -305,14 +305,26 @@ impl Cdic {
     }
 
     fn init_disc_read(&mut self, mode: u8) {
+        let new_lba = if mode == 4 { 0 } else { self.lba_from_time() };
+        let is_seek = (new_lba as i64 - self.curr_lba as i64).abs() > 4;
+
         self.disc_command = self.command as u8;
         self.disc_mode = mode;
-        self.curr_lba = if mode == 4 { 0 } else { self.lba_from_time() };
+        self.curr_lba = new_lba;
         self.disc_spinup_counter = 0;
         self.cycle_accumulator = 170_000;
+
+        if is_seek {
+            self.audio.left_state.reset();
+            self.audio.right_state.reset();
+            if let Ok(mut q) = self.audio.sample_queue.lock() {
+                q.clear();
+            }
+        }
+
         info!(
-            "CDIC init disc read: cmd=0x{:02X}, mode={}, LBA={}",
-            self.disc_command, self.disc_mode, self.curr_lba
+            "CDIC init disc read: cmd=0x{:02X}, mode={}, LBA={}, is_seek={}",
+            self.disc_command, self.disc_mode, self.curr_lba, is_seek
         );
     }
 
@@ -627,14 +639,17 @@ impl Cdic {
 
             // Mode 2 sector filtering
             if sector_buf[15] == 2 && self.disc_mode == 2 {
-                if !self.is_mode2_sector_selected(&sector_buf) {
+                let is_audio_sel = self.is_mode2_audio_selected(&sector_buf);
+                let is_sector_sel = self.is_mode2_sector_selected(&sector_buf);
+
+                if !is_sector_sel && !is_audio_sel {
                     if self.disc_command == 0 {
                         self.cancel_disc_read();
                     }
                     return;
                 }
 
-                if self.is_mode2_audio_selected(&sector_buf) {
+                if is_audio_sel {
                     let coding = sector_buf[23];
                     let is_stereo = (coding & 0x03) == 0x01;
                     let is_8bit = (coding & 0x30) == 0x10;
@@ -643,6 +658,13 @@ impl Cdic {
                     self.audio_sector_counter = get_sector_count_for_coding(coding);
 
                     self.audio.decode_sector(&sector_buf[24..24 + 2304], is_stereo, is_8bit, sample_rate);
+                }
+
+                if !is_sector_sel && !(self.command == 0x2A && is_audio_sel) {
+                    if self.disc_command == 0 {
+                        self.cancel_disc_read();
+                    }
+                    return;
                 }
             }
         } else {

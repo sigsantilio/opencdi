@@ -365,12 +365,24 @@ impl SlaveHle {
 
     pub fn prepare_readback(&mut self, ch_idx: usize, data: &[u8], cmd: u8, assert_irq: bool) {
         let ch = &mut self.channels[ch_idx];
-        // CH0: pacchetto arrivato mentre il precedente è in lettura -> stage (last-wins), nessuna promozione ora
-        if ch_idx == 0 && ch.out_count > 0 && ch.out_index > 0 {
-            ch.pending_count = data.len().min(ch.pending_buf.len());
-            ch.pending_cmd = cmd;
-            for (i, &b) in data.iter().take(ch.pending_count).enumerate() {
-                ch.pending_buf[i] = b;
+        // CH0 (Pointing Device): se c'è già un pacchetto attivo in out_buf (anche se out_index == 0),
+        // non sovrascrivere out_buf per evitare la perdita di click/spari o la corruzione di letture in corso.
+        if ch_idx == 0 && ch.out_count > 0 {
+            let new_has_btn = (data[0] & 0x38) != 0x08;
+            let pending_has_btn = ch.pending_count > 0 && (ch.pending_buf[0] & 0x38) != 0x08;
+
+            if !pending_has_btn || new_has_btn {
+                ch.pending_count = data.len().min(ch.pending_buf.len());
+                ch.pending_cmd = cmd;
+                for (i, &b) in data.iter().take(ch.pending_count).enumerate() {
+                    ch.pending_buf[i] = b;
+                }
+            } else {
+                // Preserva il bottone già in attesa in pending_buf, aggiornando solo le coordinate di puntamento
+                ch.pending_buf[0] = (ch.pending_buf[0] & 0x38) | (data[0] & !0x38);
+                ch.pending_buf[1] = data[1];
+                ch.pending_buf[2] = data[2];
+                ch.pending_buf[3] = data[3];
             }
             return;
         }

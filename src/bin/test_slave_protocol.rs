@@ -170,5 +170,28 @@ fn main() {
         }
     }
 
+    // ---- Gruppo 6: salvaguardia click rapido (down poi up prima della lettura del byte 0)
+    {
+        let mut bus = CdiBus::new();
+        // Click DOWN
+        bus.slave.update_mouse(400, 250, 1);
+        // Subito dopo Click UP (rilascio) prima che la CPU abbia letto il byte 0!
+        bus.slave.update_mouse(400, 250, 0);
+
+        // Il primo pacchetto letto DEVE contenere il click DOWN (btn = 1)
+        let p_down = expected_mouse_packet(400, 250, 1);
+        for (i, &want) in p_down.iter().enumerate() {
+            let got = read_ch0_byte(&mut bus);
+            expect(got == want, format!("click rapido preservato: byte {} del click == 0x{:02X}", i, want), format!("got=0x{:02X} want=0x{:02X}", want, got));
+        }
+
+        // Il secondo pacchetto promosso DEVE contenere il rilascio UP (btn = 0)
+        let p_up = expected_mouse_packet(400, 250, 0);
+        for (i, &want) in p_up.iter().enumerate() {
+            let got = read_ch0_byte(&mut bus);
+            expect(got == want, format!("rilascio successivo preservato: byte {} del rilascio == 0x{:02X}", i, want), format!("got=0x{:02X} want=0x{:02X}", want, got));
+        }
+    }
+
     println!("=== Test protocollo slave completato senza errori ===");
 }

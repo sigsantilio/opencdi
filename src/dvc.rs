@@ -1210,11 +1210,6 @@ impl Dvc {
         }
 
         if self.frame_accum >= 1.0 {
-            self.frame_accum -= 1.0;
-            if self.frame_accum >= 1.0 {
-                self.frame_accum = self.frame_accum.min(1.0);
-            }
-
             let mut decoded_w = 0;
             let mut decoded_h = 0;
             let mut decoded_prpa = 0x0023;
@@ -1224,6 +1219,7 @@ impl Dvc {
             let mut gop_tc = None;
             if let Some(ref mut decoder) = self.video_decoder {
                 if let Some(frame_idx) = decoder.decode() {
+                    self.frame_accum = (self.frame_accum - 1.0).max(0.0).min(1.0);
                     self.frames_decoded_count += 1;
                     self.frames_presented_count += 1;
                     gop_seen = decoder.take_gop_seen();
@@ -1243,6 +1239,8 @@ impl Dvc {
                     self.video_height = target_h;
                     self.has_valid_frame = true;
                     got_frame = true;
+                } else {
+                    self.frame_accum = self.frame_accum.min(1.5);
                 }
             }
 

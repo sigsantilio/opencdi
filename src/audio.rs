@@ -382,7 +382,7 @@ impl HostAudioOutput {
 
                 // Prebuffering management for CDIC XA stream (~4096 samples / ~108 ms at 37.8 kHz)
                 // Ensures at least 1-2 sectors of Level B/C Mono are queued before playback starts
-                const PREBUFFER_SAMPLES: usize = 4096;
+                const PREBUFFER_SAMPLES: usize = 1536;
                 if prebuffering && q_len >= PREBUFFER_SAMPLES {
                     prebuffering = false;
                     curr_sample = q_guard.pop_front().unwrap_or((0.0, 0.0));
