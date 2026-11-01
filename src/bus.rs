@@ -699,6 +699,7 @@ impl AddressBus for CdiBus {
             // Slave MCU (HLE)
             0x310000..=0x317FFF => {
                 self.slave.write(addr - 0x310000, value as u16);
+                self.cdic.audio.set_attenuation(self.slave.attenuation);
             }
 
             // Timekeeper NVRAM (MK48T08, 8-bit chip on upper data bus D15..D8 / even addresses)
@@ -826,6 +827,7 @@ impl AddressBus for CdiBus {
             }
             0x310000..=0x317FFF => {
                 self.slave.write(addr - 0x310000, value);
+                self.cdic.audio.set_attenuation(self.slave.attenuation);
                 return;
             }
             0x4FFFE0..=0x4FFFFF => {

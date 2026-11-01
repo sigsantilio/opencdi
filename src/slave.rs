@@ -35,8 +35,18 @@ impl Default for SlaveChannel {
     }
 }
 
+const ATTENUATION_TABLE: [u8; 46] = [
+    0xff, 0xe4, 0xcb, 0xb5, 0xa2, 0x90, 0x80, 0x72,
+    0x66, 0x5b, 0x51, 0x48, 0x40, 0x39, 0x33, 0x2e,
+    0x29, 0x24, 0x20, 0x1d, 0x1a, 0x17, 0x14, 0x12,
+    0x10, 0x0e, 0x0d, 0x0b, 0x0a, 0x09, 0x08, 0x07,
+    0x06, 0x06, 0x05, 0x05, 0x04, 0x04, 0x03, 0x03,
+    0x03, 0x02, 0x02, 0x02, 0x02, 0x01,
+];
+
 pub struct SlaveHle {
     pub channels: [SlaveChannel; 4],
+    pub attenuation: [u8; 4],
 
     // Mouse coordinates (0..767, 0..559)
     pub device_mouse_x: i32,
@@ -66,6 +76,7 @@ impl SlaveHle {
     pub fn new() -> Self {
         Self {
             channels: [SlaveChannel::default(); 4],
+            attenuation: [0xFF, 0, 0xFF, 0],
 
             device_mouse_x: 384,
             device_mouse_y: 280,
@@ -260,6 +271,16 @@ impl SlaveHle {
                         }
                     }
                 } else if ch.in_index == ch.in_count {
+                    if (ch.in_buf[0] & 0xF0) == 0xC0 {
+                        for i in 0..4 {
+                            let idx = ch.in_buf[i + 1] as usize;
+                            self.attenuation[i] = if idx < ATTENUATION_TABLE.len() {
+                                ATTENUATION_TABLE[idx]
+                            } else {
+                                0
+                            };
+                        }
+                    }
                     ch.in_index = 0;
                     ch.in_count = 0;
                 }

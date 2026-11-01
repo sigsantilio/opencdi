@@ -57,6 +57,7 @@ pub struct CdiAudio {
     pub dvc_queue: Arc<Mutex<VecDeque<(f32, f32)>>>,
     pub source_rate: Arc<AtomicU32>,
     pub dvc_rate: Arc<AtomicU32>,
+    pub attenuation: [u8; 4],
     pub volume: f32,
     pub muted: bool,
     pub total_sectors_decoded: u64,
@@ -69,11 +70,12 @@ impl CdiAudio {
             right_state: ChannelState::default(),
             map_left_state: ChannelState::default(),
             map_right_state: ChannelState::default(),
-            sample_queue: Arc::new(Mutex::new(VecDeque::with_capacity(32768))),
-            sfx_queue: Arc::new(Mutex::new(VecDeque::with_capacity(16384))),
-            dvc_queue: Arc::new(Mutex::new(VecDeque::with_capacity(32768))),
+            sample_queue: Arc::new(Mutex::new(VecDeque::with_capacity(65536))),
+            sfx_queue: Arc::new(Mutex::new(VecDeque::with_capacity(65536))),
+            dvc_queue: Arc::new(Mutex::new(VecDeque::with_capacity(65536))),
             source_rate: Arc::new(AtomicU32::new(37800)),
             dvc_rate: Arc::new(AtomicU32::new(44100)),
+            attenuation: [0xFF, 0, 0xFF, 0],
             volume: 1.0,
             muted: false,
             total_sectors_decoded: 0,
@@ -85,6 +87,7 @@ impl CdiAudio {
         self.right_state.reset();
         self.map_left_state.reset();
         self.map_right_state.reset();
+        self.attenuation = [0xFF, 0, 0xFF, 0];
         if let Ok(mut q) = self.sample_queue.lock() {
             q.clear();
         }
@@ -96,15 +99,24 @@ impl CdiAudio {
         }
     }
 
+    pub fn set_attenuation(&mut self, atten: [u8; 4]) {
+        self.attenuation = atten;
+    }
+
     fn decode_xa_payload(
         payload: &[u8],
         is_stereo: bool,
         is_8bit: bool,
         vol: f32,
+        attenuation: [u8; 4],
         left_state: &mut ChannelState,
         right_state: &mut ChannelState,
     ) -> Vec<(f32, f32)> {
         let mut samples = Vec::with_capacity(18 * 224);
+        let scale_ll = (attenuation[0] as f32 / 255.0) * vol;
+        let scale_lr = (attenuation[1] as f32 / 255.0) * vol;
+        let scale_rr = (attenuation[2] as f32 / 255.0) * vol;
+        let scale_rl = (attenuation[3] as f32 / 255.0) * vol;
 
         for g in 0..18 {
             let group = &payload[g * 128..(g + 1) * 128];
@@ -129,10 +141,11 @@ impl CdiAudio {
                         }
                     }
                     for s in 0..56 {
-                        samples.push((
-                            (group_samples[0][s] as f32 / 32768.0) * vol,
-                            (group_samples[1][s] as f32 / 32768.0) * vol,
-                        ));
+                        let sl = group_samples[0][s] as f32 / 32768.0;
+                        let sr = group_samples[1][s] as f32 / 32768.0;
+                        let out_l = sl * scale_ll + sr * scale_rl;
+                        let out_r = sl * scale_lr + sr * scale_rr;
+                        samples.push((out_l, out_r));
                     }
                 } else {
                     let mut mono_samples = [0i16; 112];
@@ -147,8 +160,10 @@ impl CdiAudio {
                         }
                     }
                     for s in 0..112 {
-                        let f = (mono_samples[s] as f32 / 32768.0) * vol;
-                        samples.push((f, f));
+                        let sm = mono_samples[s] as f32 / 32768.0;
+                        let out_l = sm * (scale_ll + scale_rl);
+                        let out_r = sm * (scale_rr + scale_lr);
+                        samples.push((out_l, out_r));
                     }
                 }
             } else {
@@ -174,10 +189,11 @@ impl CdiAudio {
                         }
                     }
                     for s in 0..112 {
-                        samples.push((
-                            (group_samples[0][s] as f32 / 32768.0) * vol,
-                            (group_samples[1][s] as f32 / 32768.0) * vol,
-                        ));
+                        let sl = group_samples[0][s] as f32 / 32768.0;
+                        let sr = group_samples[1][s] as f32 / 32768.0;
+                        let out_l = sl * scale_ll + sr * scale_rl;
+                        let out_r = sl * scale_lr + sr * scale_rr;
+                        samples.push((out_l, out_r));
                     }
                 } else {
                     let mut mono_samples = [0i16; 224];
@@ -194,8 +210,10 @@ impl CdiAudio {
                         }
                     }
                     for s in 0..224 {
-                        let f = (mono_samples[s] as f32 / 32768.0) * vol;
-                        samples.push((f, f));
+                        let sm = mono_samples[s] as f32 / 32768.0;
+                        let out_l = sm * (scale_ll + scale_rl);
+                        let out_r = sm * (scale_rr + scale_lr);
+                        samples.push((out_l, out_r));
                     }
                 }
             }
@@ -232,14 +250,15 @@ impl CdiAudio {
             is_stereo,
             is_8bit,
             vol,
+            self.attenuation,
             &mut self.left_state,
             &mut self.right_state,
         );
         let final_samples = Self::upsample_if_needed(samples, sample_rate);
 
         if let Ok(mut q) = self.sample_queue.lock() {
-            // Cap queue at ~1.0s of audio to prevent latency while avoiding clicks
-            const MAX_QUEUE_SAMPLES: usize = 37800;
+            // Cap queue at ~1.7s of audio (65536 samples) to prevent runaway latency while avoiding clicks
+            const MAX_QUEUE_SAMPLES: usize = 65536;
             let current_len = q.len();
             if current_len + final_samples.len() > MAX_QUEUE_SAMPLES {
                 let overflow = (current_len + final_samples.len()) - MAX_QUEUE_SAMPLES;
@@ -263,13 +282,14 @@ impl CdiAudio {
             is_stereo,
             is_8bit,
             vol,
+            self.attenuation,
             &mut self.map_left_state,
             &mut self.map_right_state,
         );
         let final_samples = Self::upsample_if_needed(samples, sample_rate);
 
         if let Ok(mut sq) = self.sfx_queue.lock() {
-            const MAX_SFX_SAMPLES: usize = 37800;
+            const MAX_SFX_SAMPLES: usize = 65536;
             let current_len = sq.len();
             if current_len + final_samples.len() > MAX_SFX_SAMPLES {
                 let overflow = (current_len + final_samples.len()) - MAX_SFX_SAMPLES;
@@ -326,11 +346,13 @@ impl HostAudioOutput {
         let mut curr_sample = (0.0f32, 0.0f32);
         let mut next_sample = (0.0f32, 0.0f32);
         let mut prebuffering = true;
+        let mut starved_count: usize = 0;
 
         let mut dvc_phase: f64 = 0.0;
         let mut dvc_curr = (0.0f32, 0.0f32);
         let mut dvc_next = (0.0f32, 0.0f32);
         let mut dvc_prebuffering = true;
+        let mut dvc_starved: usize = 0;
 
         let mut sfx_phase: f64 = 0.0;
         let mut sfx_curr = (0.0f32, 0.0f32);
@@ -358,13 +380,15 @@ impl HostAudioOutput {
                 let q_len = q_guard.len();
                 let dvc_len = dvc_guard.as_ref().map_or(0, |dq| dq.len());
 
-                // Prebuffering management for CDIC XA stream (~2048 samples / ~54 ms at 37.8 kHz)
-                const PREBUFFER_SAMPLES: usize = 2048;
+                // Prebuffering management for CDIC XA stream (~4096 samples / ~108 ms at 37.8 kHz)
+                // Ensures at least 1-2 sectors of Level B/C Mono are queued before playback starts
+                const PREBUFFER_SAMPLES: usize = 4096;
                 if prebuffering && q_len >= PREBUFFER_SAMPLES {
                     prebuffering = false;
                     curr_sample = q_guard.pop_front().unwrap_or((0.0, 0.0));
                     next_sample = q_guard.pop_front().unwrap_or(curr_sample);
                     resample_phase = 0.0;
+                    starved_count = 0;
                 }
 
                 // Prebuffering management for DVC MP2 stream (~2304 samples = 2 MP2 frames / ~52 ms at 44.1 kHz)
@@ -375,6 +399,7 @@ impl HostAudioOutput {
                         dvc_curr = dq.pop_front().unwrap_or((0.0, 0.0));
                         dvc_next = dq.pop_front().unwrap_or(dvc_curr);
                         dvc_phase = 0.0;
+                        dvc_starved = 0;
                     }
                 }
 
@@ -395,9 +420,11 @@ impl HostAudioOutput {
                 }
 
                 // Smooth Proportional Dynamic Rate Control (DRC) for CDIC stream:
-                const TARGET_QUEUE: f64 = 3500.0;
+                // Target ~8192 samples (~216ms at 37.8kHz) gives ample room for 4032-sample
+                // Level B Mono sector bursts without queue underruns or stuttering.
+                const TARGET_QUEUE: f64 = 8192.0;
                 let diff = (q_len as f64 - TARGET_QUEUE) / TARGET_QUEUE;
-                let drc = (1.0 + diff * 0.004).clamp(0.996, 1.004);
+                let drc = (1.0 + diff * 0.008).clamp(0.990, 1.010);
                 let step = (src_rate / host_sample_rate) * drc;
 
                 // Smooth Proportional DRC for DVC MP2 stream:
@@ -418,9 +445,11 @@ impl HostAudioOutput {
                             curr_sample = next_sample;
                             if let Some(s) = q_guard.pop_front() {
                                 next_sample = s;
+                                starved_count = 0;
                             } else {
-                                next_sample = (curr_sample.0 * 0.85, curr_sample.1 * 0.85);
-                                if curr_sample.0.abs() < 0.0005 && curr_sample.1.abs() < 0.0005 {
+                                starved_count += 1;
+                                next_sample = (curr_sample.0 * 0.95, curr_sample.1 * 0.95);
+                                if starved_count >= 512 {
                                     prebuffering = true;
                                     break;
                                 }
@@ -441,9 +470,11 @@ impl HostAudioOutput {
                             let popped = dvc_guard.as_mut().and_then(|dq| dq.pop_front());
                             if let Some(s) = popped {
                                 dvc_next = s;
+                                dvc_starved = 0;
                             } else {
-                                dvc_next = (dvc_curr.0 * 0.85, dvc_curr.1 * 0.85);
-                                if dvc_curr.0.abs() < 0.0005 && dvc_curr.1.abs() < 0.0005 {
+                                dvc_starved += 1;
+                                dvc_next = (dvc_curr.0 * 0.95, dvc_curr.1 * 0.95);
+                                if dvc_starved >= 512 {
                                     dvc_prebuffering = true;
                                     break;
                                 }
@@ -465,10 +496,13 @@ impl HostAudioOutput {
                             if let Some(s) = popped {
                                 sfx_next = s;
                             } else {
-                                sfx_curr = (0.0, 0.0);
-                                sfx_next = (0.0, 0.0);
-                                sfx_active = false;
-                                break;
+                                sfx_next = (sfx_curr.0 * 0.85, sfx_curr.1 * 0.85);
+                                if sfx_curr.0.abs() < 0.001 && sfx_curr.1.abs() < 0.001 {
+                                    sfx_curr = (0.0, 0.0);
+                                    sfx_next = (0.0, 0.0);
+                                    sfx_active = false;
+                                    break;
+                                }
                             }
                         }
                         if sfx_active {
@@ -481,8 +515,21 @@ impl HostAudioOutput {
                         }
                     }
 
-                    l = l.clamp(-1.0, 1.0);
-                    r = r.clamp(-1.0, 1.0);
+                    // Smooth soft-saturation: prevents harsh clipping distortion when mixing
+                    // disc audio stream and audio map sound effects
+                    #[inline]
+                    fn soft_saturate(x: f32) -> f32 {
+                        if x > 1.25 {
+                            1.0
+                        } else if x < -1.25 {
+                            -1.0
+                        } else {
+                            x - 0.16 * x * x * x
+                        }
+                    }
+
+                    l = soft_saturate(l);
+                    r = soft_saturate(r);
 
                     if channels == 1 {
                         output[out_idx] = (l + r) * 0.5;
