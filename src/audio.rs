@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, Ordering};
 use log::{info, warn, error};
+#[cfg(feature = "host")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 // CD-i / CD-ROM XA ADPCM Filter Coefficients (K0, K1 scaled by 256)
@@ -301,10 +302,12 @@ impl CdiAudio {
     }
 }
 
+#[cfg(feature = "host")]
 pub struct HostAudioOutput {
     _stream: cpal::Stream,
 }
 
+#[cfg(feature = "host")]
 impl HostAudioOutput {
     pub fn try_start(
         sample_queue: Arc<Mutex<VecDeque<(f32, f32)>>>,
@@ -436,10 +439,14 @@ impl HostAudioOutput {
                 let dvc_drc = (1.0 + dvc_diff * 0.004).clamp(0.996, 1.004);
                 let dvc_step = (mpeg_rate / host_sample_rate) * dvc_drc;
 
-                // Smooth Proportional DRC for SFX / Audio Map stream:
-                const TARGET_SFX_QUEUE: f64 = 4096.0;
-                let sfx_diff = (sq_len as f64 - TARGET_SFX_QUEUE) / TARGET_SFX_QUEUE;
-                let sfx_drc = (1.0 + sfx_diff * 0.008).clamp(0.990, 1.010);
+                // Smooth Proportional DRC for SFX / Audio Map stream:
+
+                const TARGET_SFX_QUEUE: f64 = 4096.0;
+
+                let sfx_diff = (sq_len as f64 - TARGET_SFX_QUEUE) / TARGET_SFX_QUEUE;
+
+                let sfx_drc = (1.0 + sfx_diff * 0.008).clamp(0.990, 1.010);
+
                 let sfx_step = (37800.0 / host_sample_rate) * sfx_drc;
 
                 let mut out_idx = 0;
