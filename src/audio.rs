@@ -357,7 +357,8 @@ impl HostAudioOutput {
         let mut sfx_phase: f64 = 0.0;
         let mut sfx_curr = (0.0f32, 0.0f32);
         let mut sfx_next = (0.0f32, 0.0f32);
-        let mut sfx_active = false;
+        let mut sfx_prebuffering = true;
+        let mut sfx_starved: usize = 0;
 
         let err_fn = |err| error!("Audio output stream error: {:?}", err);
 
@@ -378,6 +379,7 @@ impl HostAudioOutput {
                 let mut dvc_guard = dvc_queue.lock().ok();
 
                 let q_len = q_guard.len();
+                let sq_len = sfx_guard.as_ref().map_or(0, |sq| sq.len());
                 let dvc_len = dvc_guard.as_ref().map_or(0, |dq| dq.len());
 
                 // Prebuffering management for CDIC XA stream (~4096 samples / ~108 ms at 37.8 kHz)
@@ -403,18 +405,19 @@ impl HostAudioOutput {
                     }
                 }
 
-                if !sfx_active {
+                // Prebuffering management for SFX / Audio Map stream (~1536 samples / ~40 ms at 37.8 kHz)
+                const SFX_PREBUFFER_SAMPLES: usize = 1536;
+                if sfx_prebuffering && sq_len >= SFX_PREBUFFER_SAMPLES {
                     if let Some(ref mut sq) = sfx_guard {
-                        if !sq.is_empty() {
-                            sfx_active = true;
-                            sfx_curr = sq.pop_front().unwrap_or((0.0, 0.0));
-                            sfx_next = sq.pop_front().unwrap_or(sfx_curr);
-                            sfx_phase = 0.0;
-                        }
+                        sfx_prebuffering = false;
+                        sfx_curr = sq.pop_front().unwrap_or((0.0, 0.0));
+                        sfx_next = sq.pop_front().unwrap_or(sfx_curr);
+                        sfx_phase = 0.0;
+                        sfx_starved = 0;
                     }
                 }
 
-                if prebuffering && dvc_prebuffering && !sfx_active {
+                if prebuffering && dvc_prebuffering && sfx_prebuffering {
                     output.fill(0.0);
                     return;
                 }
@@ -433,7 +436,11 @@ impl HostAudioOutput {
                 let dvc_drc = (1.0 + dvc_diff * 0.004).clamp(0.996, 1.004);
                 let dvc_step = (mpeg_rate / host_sample_rate) * dvc_drc;
 
-                let sfx_step = 37800.0 / host_sample_rate;
+                // Smooth Proportional DRC for SFX / Audio Map stream:
+                const TARGET_SFX_QUEUE: f64 = 4096.0;
+                let sfx_diff = (sq_len as f64 - TARGET_SFX_QUEUE) / TARGET_SFX_QUEUE;
+                let sfx_drc = (1.0 + sfx_diff * 0.008).clamp(0.990, 1.010);
+                let sfx_step = (37800.0 / host_sample_rate) * sfx_drc;
 
                 let mut out_idx = 0;
                 while out_idx < output.len() {
@@ -488,24 +495,24 @@ impl HostAudioOutput {
                         }
                     }
 
-                    if sfx_active {
+                    if !sfx_prebuffering {
                         while sfx_phase >= 1.0 {
                             sfx_phase -= 1.0;
                             sfx_curr = sfx_next;
                             let popped = sfx_guard.as_mut().and_then(|sq| sq.pop_front());
                             if let Some(s) = popped {
                                 sfx_next = s;
+                                sfx_starved = 0;
                             } else {
-                                sfx_next = (sfx_curr.0 * 0.85, sfx_curr.1 * 0.85);
-                                if sfx_curr.0.abs() < 0.001 && sfx_curr.1.abs() < 0.001 {
-                                    sfx_curr = (0.0, 0.0);
-                                    sfx_next = (0.0, 0.0);
-                                    sfx_active = false;
+                                sfx_starved += 1;
+                                sfx_next = (sfx_curr.0 * 0.95, sfx_curr.1 * 0.95);
+                                if sfx_starved >= 512 {
+                                    sfx_prebuffering = true;
                                     break;
                                 }
                             }
                         }
-                        if sfx_active {
+                        if !sfx_prebuffering {
                             let st = sfx_phase as f32;
                             let sl = sfx_curr.0 * (1.0 - st) + sfx_next.0 * st;
                             let sr = sfx_curr.1 * (1.0 - st) + sfx_next.1 * st;

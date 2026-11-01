@@ -250,15 +250,17 @@ impl Cdic {
                 );
                 if (val & 0x2000) == 0 {
                     self.decode_addr = 0xFFFF;
-                    self.audio_map_counter = 0;
                     self.decoding_audio_map = false;
-                } else if !self.decoding_audio_map || self.decode_addr == 0xFFFF {
-                    self.decode_addr = val & 0x3A00;
-                    self.audio_format_sectors = 0;
-                    self.audio_map_counter = 1;
-                    self.decoding_audio_map = true;
-                    self.audio.map_left_state.reset();
-                    self.audio.map_right_state.reset();
+                } else {
+                    let req_addr = val & 0x3A00;
+                    if !self.decoding_audio_map || self.decode_addr == 0xFFFF || self.decode_addr != req_addr {
+                        self.decode_addr = req_addr;
+                        self.audio_format_sectors = 0;
+                        if self.audio_map_counter == 0 {
+                            self.audio_map_counter = 1;
+                        }
+                        self.decoding_audio_map = true;
+                    }
                 }
             }
             0x3FC => {
@@ -438,11 +440,9 @@ impl Cdic {
         } else {
             // Buffer has finished (coding == 0xFF)
             let was_decoding = self.decoding_audio_map;
-            info!("CDIC AUDIO MAP END: addr=0x{:04X}, coding=0xFF, was_decoding={}", addr, was_decoding);
+            trace!("CDIC AUDIO MAP END: addr=0x{:04X}, coding=0xFF, was_decoding={}", addr, was_decoding);
             self.decode_addr = 0xFFFF;
-            self.audio_map_counter = 0;
             self.audio_format_sectors = 0;
-            self.decoding_audio_map = false;
             if was_decoding {
                 self.audio_buffer |= 0x8000;
                 self.update_interrupt();
