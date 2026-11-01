@@ -115,11 +115,16 @@ impl Machine {
         &self.bus.mcd212.framebuffer[..]
     }
 
-    /// Appends the main then sfx queue to `out`; returns the source rate.
+    /// Appends the main, sfx and DVC queues to `out`; returns the DVC rate when it held samples, else the source rate.
     pub fn drain_audio(&mut self, out: &mut Vec<(f32, f32)>) -> u32 {
         let audio = &self.bus.cdic.audio;
         for q in [&audio.sample_queue, &audio.sfx_queue] {
             out.extend(q.lock().unwrap().drain(..));
+        }
+        let before = out.len();
+        out.extend(audio.dvc_queue.lock().unwrap().drain(..));
+        if out.len() > before {
+            return audio.dvc_rate.load(Ordering::Relaxed);
         }
         audio.source_rate.load(Ordering::Relaxed)
     }

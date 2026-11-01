@@ -1462,7 +1462,7 @@ impl App {
         if self.fast_forward {
             // Drop fast-forward audio so the queues never hold sped-up backlog
             let audio = &self.m.bus.cdic.audio;
-            for q in [&audio.sample_queue, &audio.sfx_queue] {
+            for q in [&audio.sample_queue, &audio.sfx_queue, &audio.dvc_queue] {
                 if let Ok(mut q) = q.lock() {
                     q.clear();
                 }
