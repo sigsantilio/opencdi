@@ -99,10 +99,10 @@ Legend: `[ ]` open · `[~]` fix applied in code, **pending in-game confirmation*
   - **Technical Cause:** Frame presentation was locked to `vsync_counter % 2 == 0`, causing cadence judder with fractional frame rates, and DMA collision between audio and video sectors caused occasional MPEG slice drops.
   - **Resolution / Status:** Fractional frame accumulator (`frame_accum += fps / vsync_hz`) in `on_vsync` and dedicated FIFO channels for video and audio. User notes slight residual stuttering; PTS/SCR clock synchronization to be refined.
 
-- [ ] **Issue 3: Post-FMV Transition (10px fracture / Transitory black screen)**
-  - **Symptom:** The 10px upper screen fracture is eliminated, but at the conclusion of an FMV sequence a brief transitory black screen (varying from a quick flash to a few moments) occurs before the room background returns.
-  - **Technical Cause:** `get_scanline` outputs black and clears the framebuffer upon sequence end or STOP/DEC_OFF, whereas the game software takes several video fields to reload VRAM and restore Plane A/B rendering.
-  - **Status:** To be refined: maintaining display of the final frame until the first valid MCD212 Plane A/B display scanline.
+- [x] **Issue 3: Post-FMV Transition (10px fracture / Transitory black screen)**
+  - **Symptom:** At the conclusion of FMV sequences, a brief black screen occurred before the interactive room backdrop appeared.
+  - **Technical Cause:** In `src/dvc.rs`, `self.has_valid_frame = false` and premature framebuffer clearing were executed on `sequence_ended` and in `reset_stream()`. Authentic DVC CL450 hardware retains the last decoded MPEG picture in DRAM, outputting it continuously to the pixel bus until overwritten by a new stream or obscured by MCD-212 planes/ICM.
+  - **Resolution:** Removed premature clearing of `has_valid_frame` and framebuffer from `sequence_ended` and `reset_stream()`. Persistent frame scanout guarantees seamless visual continuity during disc seeks into interactive rooms.
 
 - [x] **Issue 4: Hard freeze / crash after upstairs ghost cutscene**
   - **Symptom:** Turning left upstairs plays the ghost cutscene; clicking forward down the corridor afterward caused a hard freeze with OS-9 error *"avm_play: Still busy from last play $8000"*.

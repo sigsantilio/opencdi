@@ -297,6 +297,12 @@ pub enum GuiAction {
     ToggleDvc,
     ShowHelp,
     ShowAbout,
+    QuickSaveState,
+    QuickLoadState,
+    SaveState(usize),
+    LoadState(usize),
+    ClearNvram,
+    OpenFeedback,
 }
 
 static PENDING_ACTIONS: Mutex<Vec<GuiAction>> = Mutex::new(Vec::new());

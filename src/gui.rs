@@ -39,6 +39,13 @@ pub const ID_EMU_DVC: usize = 1051;
 
 pub const ID_HELP_CONTROLS: usize = 1040;
 pub const ID_HELP_ABOUT: usize = 1041;
+pub const ID_HELP_FEEDBACK: usize = 1042;
+pub const ID_FILE_CLEAR_NVRAM: usize = 1005;
+
+pub const ID_STATE_QUICK_SAVE: usize = 1070;
+pub const ID_STATE_QUICK_LOAD: usize = 1071;
+pub const ID_STATE_SAVE_BASE: usize = 1072; // 1072..1076 (Slots 1..5)
+pub const ID_STATE_LOAD_BASE: usize = 1080; // 1080..1084 (Slots 1..5)
 
 pub const ID_RECENT_IMAGE_BASE: usize = 1200;
 pub const ID_RECENT_CLEAR: usize = 1210;
@@ -140,6 +147,18 @@ unsafe extern "system" {
     fn GetLogicalDrives() -> u32;
     fn GetDriveTypeW(lpRootPathName: *const u16) -> u32;
     fn GetModuleHandleW(lpmodulename: *const u16) -> *mut std::ffi::c_void;
+}
+
+#[link(name = "shell32")]
+unsafe extern "system" {
+    fn ShellExecuteW(
+        hwnd: *mut std::ffi::c_void,
+        lpoperation: *const u16,
+        lpfile: *const u16,
+        lpparameters: *const u16,
+        lpdirectory: *const u16,
+        nshowcmd: i32,
+    ) -> *mut std::ffi::c_void;
 }
 
 pub fn to_wide(s: &str) -> Vec<u16> {
@@ -431,7 +450,25 @@ unsafe extern "system" fn custom_wndproc(
             refresh_recent_menu();
             return 0;
         }
+        if menu_id >= ID_STATE_SAVE_BASE && menu_id < ID_STATE_SAVE_BASE + 5 {
+            let slot = (menu_id - ID_STATE_SAVE_BASE) + 1;
+            push_action(GuiAction::SaveState(slot));
+            return 0;
+        }
+        if menu_id >= ID_STATE_LOAD_BASE && menu_id < ID_STATE_LOAD_BASE + 5 {
+            let slot = (menu_id - ID_STATE_LOAD_BASE) + 1;
+            push_action(GuiAction::LoadState(slot));
+            return 0;
+        }
         match menu_id {
+            ID_STATE_QUICK_SAVE => {
+                push_action(GuiAction::SaveState(1));
+                return 0;
+            }
+            ID_STATE_QUICK_LOAD => {
+                push_action(GuiAction::LoadState(1));
+                return 0;
+            }
             ID_FILE_INSERT => {
                 if let Some(path) = modal(hwnd, || open_file_dialog(hwnd)) {
                     push_action(GuiAction::InsertDisc(path));
@@ -537,6 +574,24 @@ unsafe extern "system" fn custom_wndproc(
                 modal(hwnd, || show_controls_dialog(hwnd));
                 return 0;
             }
+            ID_FILE_CLEAR_NVRAM => {
+                let confirm = unsafe {
+                    MessageBoxW(
+                        hwnd,
+                        to_wide("Are you sure you want to clear console memory (NVRAM)?\n\nAll saved games in NVRAM will be erased and the console will be reset to factory defaults.").as_ptr(),
+                        to_wide("OpenCDi - Clear Console Memory").as_ptr(),
+                        MB_YESNO | MB_ICONQUESTION,
+                    )
+                };
+                if confirm == IDYES {
+                    push_action(GuiAction::ClearNvram);
+                }
+                return 0;
+            }
+            ID_HELP_FEEDBACK => {
+                open_feedback_url();
+                return 0;
+            }
             ID_HELP_ABOUT => {
                 modal(hwnd, || show_about_dialog(hwnd));
                 return 0;
@@ -628,6 +683,30 @@ pub fn attach_gui_menu(
         }
 
         AppendMenuW(file_menu, MF_SEPARATOR, 0, std::ptr::null());
+        AppendMenuW(file_menu, MF_STRING, ID_STATE_QUICK_SAVE, to_wide("Quick Save State (Slot 1)\tF6").as_ptr());
+        AppendMenuW(file_menu, MF_STRING, ID_STATE_QUICK_LOAD, to_wide("Quick Load State (Slot 1)\tF7").as_ptr());
+
+        let save_state_menu = CreatePopupMenu();
+        let load_state_menu = CreatePopupMenu();
+        for slot in 1..=5 {
+            let save_label = if slot == 1 {
+                format!("Slot &{} (Quick Save)\tF6", slot)
+            } else {
+                format!("Slot &{}", slot)
+            };
+            let load_label = if slot == 1 {
+                format!("Slot &{} (Quick Load)\tF7", slot)
+            } else {
+                format!("Slot &{}", slot)
+            };
+            AppendMenuW(save_state_menu, MF_STRING, ID_STATE_SAVE_BASE + (slot - 1), to_wide(&save_label).as_ptr());
+            AppendMenuW(load_state_menu, MF_STRING, ID_STATE_LOAD_BASE + (slot - 1), to_wide(&load_label).as_ptr());
+        }
+        AppendMenuW(file_menu, MF_POPUP, save_state_menu as usize, to_wide("Save State to Slot").as_ptr());
+        AppendMenuW(file_menu, MF_POPUP, load_state_menu as usize, to_wide("Load State from Slot").as_ptr());
+
+        AppendMenuW(file_menu, MF_SEPARATOR, 0, std::ptr::null());
+        AppendMenuW(file_menu, MF_STRING, ID_FILE_CLEAR_NVRAM, to_wide("Clear Console Memory (Reset NVRAM)...").as_ptr());
         AppendMenuW(file_menu, MF_STRING, ID_FILE_RESET, to_wide("Restart Console (Reset)\tF5 / H").as_ptr());
         AppendMenuW(file_menu, MF_SEPARATOR, 0, std::ptr::null());
         AppendMenuW(file_menu, MF_STRING, ID_FILE_EXIT, to_wide("Exit\tEsc").as_ptr());
@@ -637,9 +716,9 @@ pub fn attach_gui_menu(
         let controls_menu = CreatePopupMenu();
 
         let device_menu = CreatePopupMenu();
-        AppendMenuW(device_menu, MF_STRING, ID_INPUT_DEVICE_GAMEPAD, to_wide("CD-i Gamepad (USB Controller / Keyboard)").as_ptr());
-        AppendMenuW(device_menu, MF_STRING, ID_INPUT_DEVICE_MOUSE, to_wide("Philips CD-i Mouse (Host Cursor)").as_ptr());
-        AppendMenuW(controls_menu, MF_POPUP, device_menu as usize, to_wide("Input Device").as_ptr());
+        AppendMenuW(device_menu, MF_STRING, ID_INPUT_DEVICE_GAMEPAD, to_wide("CD-i Gamepad (USB Controller / Keyboard)\tF9").as_ptr());
+        AppendMenuW(device_menu, MF_STRING, ID_INPUT_DEVICE_MOUSE, to_wide("Philips CD-i Mouse (Host Cursor)\tF9").as_ptr());
+        AppendMenuW(controls_menu, MF_POPUP, device_menu as usize, to_wide("Input Device (Exclusive)").as_ptr());
         AppendMenuW(controls_menu, MF_SEPARATOR, 0, std::ptr::null());
 
         AppendMenuW(controls_menu, MF_STRING, ID_PROFILE_STANDARD, to_wide("Key Profile: Standard (Arrow Keys + Z / X)").as_ptr());
@@ -678,6 +757,9 @@ pub fn attach_gui_menu(
         AppendMenuW(help_menu, MF_STRING, ID_HELP_CONTROLS, to_wide("Controls Guide...").as_ptr());
         AppendMenuW(help_menu, MF_STRING, ID_HELP_ABOUT, to_wide("About OpenCDi...").as_ptr());
         AppendMenuW(main_menu, MF_POPUP, help_menu as usize, to_wide("Help").as_ptr());
+
+        // 6. Prominent Top-Level Send Feedback Button
+        AppendMenuW(main_menu, MF_STRING, ID_HELP_FEEDBACK, to_wide("Send Feedback (F1)").as_ptr());
 
         SetMenu(hwnd, main_menu);
         DrawMenuBar(hwnd);
@@ -761,6 +843,8 @@ pub fn show_controls_dialog(owner: *mut std::ffi::c_void) {
         KEYBOARD SHORTCUTS:\n\
            • F11 or Alt+Enter: Fullscreen\n\
            • F5 or H: Restart console (Reset)\n\
+           • F6: Quick Save State (Slot 1)  |  F7: Quick Load State (Slot 1)\n\
+           • F9: Switch Active Input Device (Gamepad <-> Mouse)\n\
            • P: Pause  |  Space (hold): Fast-forward\n\
            • F8: Screenshot (PPM)  |  F12: Screenshot (BMP)\n\
            • F2 / F4: Save / Load state  |  F6 / F7: State slot\n\
@@ -786,7 +870,7 @@ pub fn show_disc_error(owner: *mut std::ffi::c_void, text: &str) {
 pub fn show_about_dialog(owner: *mut std::ffi::c_void) {
     let text = to_wide(
         "OpenCDi - Philips CD-i Emulator\n\
-        Version: 0.1.8 (High Performance Edition)\n\
+        Version: 0.2.0 (High Performance Edition)\n\
         Built with Rust, winit & softbuffer\n\n\
         Key Emulation Features:\n\
         • Philips SCC68070 Microprocessor & OS-9 CD-RTOS kernel\n\
@@ -802,6 +886,31 @@ pub fn show_about_dialog(owner: *mut std::ffi::c_void) {
         • The CD-i preservation community"
     );
     let title = to_wide("About OpenCDi");
+    unsafe {
+        MessageBoxW(owner, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
+    }
+}
+
+pub fn open_feedback_url() {
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            to_wide("open").as_ptr(),
+            to_wide("https://cdi-tester-feedback.pages.dev/").as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        );
+    }
+}
+
+pub fn show_nvram_cleared_dialog(owner: *mut std::ffi::c_void) {
+    let text = to_wide(
+        "Console memory (NVRAM) has been cleared successfully.\n\n\
+        All saved games and preferences have been reset to factory defaults.\n\
+        The console has been restarted."
+    );
+    let title = to_wide("OpenCDi - Memory Cleared");
     unsafe {
         MessageBoxW(owner, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
     }

@@ -396,6 +396,12 @@ impl CdiBus {
         }
         if line == 0 {
             self.current_frame += 1;
+            if self.nvram.dirty {
+                self.nvram.dirty_frames += 1;
+                if self.nvram.dirty_frames >= 25 {
+                    self.nvram.flush_if_dirty();
+                }
+            }
         }
         let frame_done = self.mcd212.tick_scanline(line);
         let mcd_int = self.mcd212.int_line();
@@ -406,18 +412,19 @@ impl CdiBus {
         }
         if let Some(cap) = self.dvc_audio_capture.as_mut() {
             cap.extend(self.dvc.audio_out.drain(..));
-        } else if self.dvc.is_fitted() && !self.dvc.audio_out.is_empty() {
-            if let Ok(mut q) = self.cdic.audio.sample_queue.lock() {
-                self.cdic.audio.source_rate.store(self.dvc.audio_sample_rate, std::sync::atomic::Ordering::Relaxed);
-                let max_samples = self.dvc.audio_sample_rate as usize / 4;
+        } else if line == 0 && self.dvc.is_fitted() && !self.dvc.audio_out.is_empty() {
+            if let Ok(mut dq) = self.cdic.audio.dvc_queue.lock() {
+                self.cdic.audio.dvc_rate.store(self.dvc.audio_sample_rate, std::sync::atomic::Ordering::Relaxed);
+                let max_samples = self.dvc.audio_sample_rate as usize;
                 let add_len = self.dvc.audio_out.len();
-                let current_len = q.len();
+                let current_len = dq.len();
                 if current_len + add_len > max_samples {
                     let overflow = (current_len + add_len) - max_samples;
                     let to_drain = overflow.min(current_len);
-                    q.drain(0..to_drain);
+                    dq.drain(0..to_drain);
                 }
-                q.extend(self.dvc.audio_out.drain(..));
+                let vol = if self.cdic.audio.muted { 0.0 } else { self.cdic.audio.volume };
+                dq.extend(self.dvc.audio_out.drain(..).map(|(l, r)| (l * vol, r * vol)));
             }
         }
         frame_done
@@ -674,10 +681,14 @@ impl CdiBus {
                 if (addr & 1) == 0 { (word >> 8) as u8 } else { word as u8 }
             }
 
-            // Timekeeper NVRAM (MK48T08)
+            // Timekeeper NVRAM (MK48T08, 8-bit chip on upper data bus D15..D8 / even addresses)
             0x320000..=0x323FFF => {
-                let offset = (addr - 0x320000) / 2;
-                self.nvram.read(offset)
+                if (addr & 1) == 0 {
+                    let offset = (addr - 0x320000) >> 1;
+                    self.nvram.read(offset)
+                } else {
+                    0xFF
+                }
             }
 
             // System RAM (512 KB)
@@ -968,12 +979,15 @@ impl CdiBus {
             // Slave MCU (HLE)
             0x310000..=0x317FFF => {
                 self.slave.write(addr - 0x310000, value as u16);
+                self.cdic.audio.set_attenuation(self.slave.attenuation);
             }
 
-            // Timekeeper NVRAM
+            // Timekeeper NVRAM (MK48T08, 8-bit chip on upper data bus D15..D8 / even addresses)
             0x320000..=0x323FFF => {
-                let offset = (addr - 0x320000) / 2;
-                self.nvram.write(offset, value);
+                if (addr & 1) == 0 {
+                    let offset = (addr - 0x320000) >> 1;
+                    self.nvram.write(offset, value);
+                }
             }
 
             // System RAM (512 KB)
@@ -1093,6 +1107,7 @@ impl CdiBus {
             }
             0x310000..=0x317FFF => {
                 self.slave.write(addr - 0x310000, value);
+                self.cdic.audio.set_attenuation(self.slave.attenuation);
                 return;
             }
             0xD00000..=0xDFFFFE => {

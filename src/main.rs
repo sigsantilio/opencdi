@@ -89,10 +89,22 @@ Usage: opencdi [options] [disc image (cue, chd, iso, bin)]
   --dvc <path>        Digital Video Cartridge ROM (default: search dvc/, bios/, the current and the program directory)
   --no-dvc, --nodvc   Boot without the Digital Video Cartridge
   --slave-debug       Log slave (mouse channel) bytes
+  --nvram <path>      Console NVRAM save file (default: bios/nvram_mk48t08.bin or nvram_mk48t08.bin)
   --run-in-menu       Windows: keep emulating while a menu or dialog is open, or the window is moved (default: paused)
   --console           Windows: show the log in the parent console or a new console window
   --help, -h          Show this text
 ";
+
+
+fn default_nvram_save_path() -> PathBuf {
+    if let Some(p) = find_nvram_file() {
+        return p;
+    }
+    if Path::new("bios").is_dir() {
+        return PathBuf::from("bios/nvram_mk48t08.bin");
+    }
+    PathBuf::from("nvram_mk48t08.bin")
+}
 
 fn find_file(relative_subpath: &str) -> Option<PathBuf> {
     let sub = Path::new(relative_subpath);
@@ -398,9 +410,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 2. Load NVRAM if present
-    if let Some(nvram_path) = find_nvram_file() {
-        let _ = m.bus.nvram.load_from_file(&nvram_path);
-        info!("Loaded NVRAM from {:?}", nvram_path);
+    let nvram_arg = args.iter().position(|a| a == "--nvram").and_then(|i| args.get(i + 1)).map(PathBuf::from);
+    let resolved_nvram_path = nvram_arg.unwrap_or_else(default_nvram_save_path);
+    m.bus.nvram.save_path = resolved_nvram_path.clone();
+    if resolved_nvram_path.is_file() {
+        if let Err(e) = m.bus.nvram.load_from_file(&resolved_nvram_path) {
+            log::warn!("Impossibile caricare NVRAM da {:?}: {:?}", resolved_nvram_path, e);
+        } else {
+            info!("NVRAM caricata da {:?}", resolved_nvram_path);
+        }
     }
 
     // 2b. Load DVC ROM (Digital Video Cartridge) by default if present
@@ -479,10 +497,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input_device_mode = if has_flag("--mouse") { InputDeviceMode::Mouse } else { InputDeviceMode::Gamepad };
 
     // 6. Initialize Host Audio Playback
+    m.bus.cdic.audio.max_queue = 65536;
     let host_audio = HostAudioOutput::try_start(
         m.bus.cdic.audio.sample_queue.clone(),
         m.bus.cdic.audio.sfx_queue.clone(),
+        m.bus.cdic.audio.dvc_queue.clone(),
         m.bus.cdic.audio.source_rate.clone(),
+        m.bus.cdic.audio.dvc_rate.clone(),
     );
 
     // 7. Initialize USB Gamepad subsystem (Gilrs / XInput / DirectInput)
@@ -503,6 +524,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dvc_arg,
         max_frames,
         current_game_name,
+        nvram_path: Some(resolved_nvram_path),
         window: None,
         surface: None,
         image_rect: (0, 0, SCREEN_WIDTH, SCREEN_HEIGHT),
@@ -563,6 +585,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         timeEndPeriod(1);
     }
 
+    app.m.bus.nvram.flush_if_dirty();
     info!("Emulation stopped. Final PC: 0x{:08X}", app.m.cpu.pc);
     Ok(())
 }
@@ -642,6 +665,7 @@ struct App {
     dvc_arg: Option<PathBuf>,
     max_frames: Option<u64>,
     current_game_name: String,
+    nvram_path: Option<PathBuf>,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     image_rect: (usize, usize, usize, usize),
@@ -850,6 +874,14 @@ impl App {
         let alt = self.mods.alt_key();
         match code {
             Key::Escape => el.exit(),
+            Key::F1 => push_action(GuiAction::OpenFeedback),
+            Key::F9 => {
+                let next_mode = match self.input_device_mode {
+                    InputDeviceMode::Gamepad => InputDeviceMode::Mouse,
+                    InputDeviceMode::Mouse => InputDeviceMode::Gamepad,
+                };
+                push_action(GuiAction::SetInputDevice(next_mode));
+            }
             Key::KeyI if ctrl => self.open_dialog_action(false),
             Key::KeyO if ctrl => self.open_dialog_action(true),
             Key::F5 => push_action(GuiAction::Reset),
@@ -1049,6 +1081,34 @@ impl App {
                 GuiAction::ShowAbout => {
                     #[cfg(target_os = "windows")]
                     gui::post_menu_command(self.hwnd(), gui::ID_HELP_ABOUT);
+                }
+                GuiAction::QuickSaveState | GuiAction::SaveState(_) | GuiAction::QuickLoadState | GuiAction::LoadState(_) => {
+                    self.state_slot = match action {
+                        GuiAction::SaveState(slot) | GuiAction::LoadState(slot) => slot as u32,
+                        _ => 1,
+                    };
+                    if matches!(action, GuiAction::QuickSaveState | GuiAction::SaveState(_)) {
+                        self.save_state();
+                    } else {
+                        self.load_state();
+                    }
+                    self.refresh_title();
+                }
+                GuiAction::ClearNvram => {
+                    let _ = self.m.bus.nvram.clear();
+                    if let Some(ref path) = self.nvram_path {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    self.m.bus.reset_system();
+                    self.m.cpu.reset(&mut self.m.bus);
+                    self.reset_state();
+                    info!("Console memory (NVRAM) cancellata e console riavviata.");
+                }
+                GuiAction::OpenFeedback => {
+                    #[cfg(target_os = "windows")]
+                    gui::open_feedback_url();
+                    #[cfg(not(target_os = "windows"))]
+                    let _ = std::process::Command::new("xdg-open").arg("https://github.com/sigsantilio/opencdi/issues").spawn();
                 }
             }
         }
@@ -1387,6 +1447,9 @@ impl App {
         }
         self.autoplay();
         self.m.run_frame();
+        if self.frame_count % 300 == 0 {
+            self.m.bus.nvram.flush_if_dirty();
+        }
 
         let curr_vsr = (self.m.bus.mcd212.get_vsr::<0>(), self.m.bus.mcd212.get_vsr::<1>());
         if curr_vsr != self.prev_vsr {

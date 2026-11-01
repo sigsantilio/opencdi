@@ -616,8 +616,8 @@ impl Dvc {
         self.decoder_timecode = 0;
         self.display_frame_counter = 0;
         self.decoder_frame_counter = 0;
-        self.has_valid_frame = false;
-        self.framebuffer.fill(0xFF00_0000);
+        // NOTE: Real DVC hardware keeps the last decoded picture in DRAM.
+        // Screen blanking and plane transitions are managed by MCD-212.
     }
 
     pub fn reset_regs(&mut self) {
@@ -635,7 +635,7 @@ impl Dvc {
         self.set_fmv_word(FMV_TIMER, 55);
         self.set_fmv_word(0x5E, 0x2000); // FIFO Ready
         self.set_fmv_word(0x9E, 0xFE96); // Dec delay
-        self.set_fmv_word(FMV_PICTURE_PERIOD, 1800); // 25 fps PAL
+        self.set_fmv_word(FMV_PICTURE_PERIOD, 3600); // 25 fps PAL in 90 kHz units (3600 >> 2 = 900 ticks at 22.5 kHz)
         self.set_fmv_word(FMV_DISPLAY_PERIOD, 1800); // 25 fps PAL (0x0708)
         self.set_fmv_word(0xAC, 1800);               // Frame rate ratio (word 0x56)
 
@@ -800,9 +800,21 @@ impl Dvc {
     pub fn refresh_fmv_dynamic(&mut self) {
         let fifo_ready = self.dvc_stream_fifo.len() < 512 * 1024;
         self.set_fmv_word(0x5E, if fifo_ready { 0x2000 } else { 0 }); // SYS_STS bit 13
-        self.set_fmv_word(0x98, ((self.dclk >> 6) & 0xFFFF) as u16);  // GEN_SYSCR DCLK/64
-        let queue_len = if self.video_decoder.is_some() { 1 } else { 0 };
-        self.set_fmv_word(0xA4, queue_len as u16);                     // Pictures in queue
+        self.set_fmv_word(0x98, ((self.dclk >> 6) & 0x7FFF) as u16);  // GEN_SYSCR (22.5kHz >> 5 = 45kHz >> 6)
+        let queue_len: u16 = if self.video_decoder.is_some() {
+            if self.video_playing { 1 } else { 3 }
+        } else {
+            0
+        };
+        self.set_fmv_word(0xA4, queue_len);                            // Pictures in queue
+        if self.video_decoder.is_some() {
+            let pic_period_22k5 = ((self.get_fmv_word(FMV_PICTURE_PERIOD) >> 2) as u64).max(750);
+            let base_22k5 = self.demux.first_video_pts.or(self.demux.last_video_dts).unwrap_or(0) >> 2;
+            let cur_pic_22k5 = base_22k5.wrapping_add((self.frames_presented_count as u64) * pic_period_22k5);
+            let head_22k5 = cur_pic_22k5.wrapping_add((queue_len as u64) * pic_period_22k5);
+            self.set_fmv_word(0xA0, ((head_22k5 >> 5) & 0x7FFF) as u16);
+            self.or_fmv_word(0x8C, 0x4000);
+        }
         let stream = self.get_fmv_word(FMV_STREAM) & 0xF;
         self.set_fmv_word(FMV_STREAM, stream);
     }
@@ -1110,7 +1122,7 @@ impl Dvc {
                         self.video_decoder = None;
                     }
                 }
-                if value & 0x0020 != 0 { // CONTINUE
+                if value & 0x0020 != 0 || value & 0x0040 != 0 { // CONTINUE / STEP
                     self.video_armed = false;
                     self.video_playing = true;
                 }
@@ -1118,8 +1130,10 @@ impl Dvc {
                     self.video_playing = false;
                     self.or_fmv_word(FMV_ISR, FMV_IRQ_PAI);
                 }
+                self.or_fmv_word(FMV_ISR, FMV_IRQ_DCL);
                 if value & 0x0080 != 0 { // STOP
-                    // NOTE: Real DVC hardware keeps the last decoded picture in DRAM.
+                    self.has_valid_frame = false;
+                    self.framebuffer.fill(0xFF00_0000);
                     self.video_armed = false;
                     self.video_playing = false;
                     self.decoder_enabled = false;
@@ -1141,6 +1155,8 @@ impl Dvc {
                     self.set_fmv_word(0x5C, 0x0000);
                 }
                 if value & 0x0100 != 0 { // RESET
+                    self.has_valid_frame = false;
+                    self.framebuffer.fill(0xFF00_0000);
                     self.video_playing = false;
                     self.video_armed = false;
                     self.reset_stream();
@@ -1150,7 +1166,8 @@ impl Dvc {
                     self.decoder_enabled = true;
                 }
                 if value & 0x2000 != 0 { // DEC_OFF
-                    // NOTE: Real DVC hardware keeps the last decoded picture in DRAM.
+                    self.has_valid_frame = false;
+                    self.framebuffer.fill(0xFF00_0000);
                     self.decoder_enabled = false;
                     self.video_playing = false;
                     self.underflow_count = 0;
@@ -1268,9 +1285,11 @@ impl Dvc {
                 if dec.has_header() {
                     let w = dec.width() as u16;
                     let h = dec.height() as u16;
+                    let prpa = dec.prpa();
                     if w > 0 && h > 0 {
-                        self.set_fmv_word(0x52, w);
-                        self.set_fmv_word(0x54, h);
+                        self.set_fmv_word(0x02, w);
+                        self.set_fmv_word(0x04, h);
+                        self.set_fmv_word(0x06, prpa);
                     }
                 }
             }
@@ -1293,9 +1312,8 @@ impl Dvc {
             self.fma_demux.program_ends = 0;
         }
 
-        // Update DTS if newly available
-        if let Some(dts) = self.demux.last_video_dts {
-            self.set_fmv_word(0xA0, ((dts >> 7) & 0x7FFF) as u16); // word 0x50
+        // Ensure DTS valid flag is set once video DTS/PTS is available (0xA0 is computed dynamically in refresh_fmv_dynamic)
+        if self.demux.first_video_pts.is_some() || self.demux.last_video_dts.is_some() {
             self.or_fmv_word(0x8C, 0x4000);                         // word 0x46 bit 14
         }
     }
@@ -1394,26 +1412,23 @@ impl Dvc {
         // Fractional frame presentation
         let fps = if self.fps > 0.0 { self.fps } else { 25.0 };
         let vsync_hz = if self.vsync_hz > 0.0 { self.vsync_hz } else { 50.0 };
-        if self.video_playing || self.decoder_enabled || self.video_decoder.is_some() {
+        if self.video_playing {
             self.frame_accum += fps / vsync_hz;
         } else {
             self.frame_accum = 0.0;
         }
 
         if self.frame_accum >= 1.0 {
-            self.frame_accum -= 1.0;
-            if self.frame_accum >= 1.0 {
-                self.frame_accum = self.frame_accum.min(1.0);
-            }
-
             let mut decoded_w = 0;
             let mut decoded_h = 0;
+            let mut decoded_prpa = 0x0023;
             let mut got_frame = false;
             let mut gop_seen = false;
             let mut seq_seen = false;
             let mut gop_tc = None;
             if let Some(ref mut decoder) = self.video_decoder {
                 if let Some(frame_idx) = decoder.decode() {
+                    self.frame_accum = (self.frame_accum - 1.0).max(0.0).min(1.0);
                     self.frames_decoded_count += 1;
                     self.frames_presented_count += 1;
                     gop_seen = decoder.take_gop_seen();
@@ -1424,6 +1439,7 @@ impl Dvc {
                     }
                     decoded_w = decoder.width();
                     decoded_h = decoder.height();
+                    decoded_prpa = decoder.prpa();
                     let target_w = (decoded_w as usize).min(FB_MAX_W).max(1);
                     let target_h = (decoded_h as usize).min(FB_MAX_H).max(1);
                     decoder.frame(frame_idx).write_rgb_scaled(&mut *self.framebuffer, target_w, target_h);
@@ -1431,15 +1447,19 @@ impl Dvc {
                     self.video_height = target_h;
                     self.has_valid_frame = true;
                     got_frame = true;
+                } else {
+                    self.frame_accum = self.frame_accum.min(1.5);
                 }
             }
 
             if got_frame {
                 self.underflow_count = 0;
                 // Update frame geometry & timing registers
+                self.set_fmv_word(0x02, decoded_w as u16);
+                self.set_fmv_word(0x04, decoded_h as u16);
                 self.set_fmv_word(0x52, decoded_w as u16);
                 self.set_fmv_word(0x54, decoded_h as u16);
-                self.set_fmv_word(0x06, 0x23);  // PRPA
+                self.set_fmv_word(0x06, decoded_prpa);  // PRPA (Decoder)
                 self.set_fmv_word(0x56, 1800);  // Frame rate ratio
 
                 // Synchronize with embedded MPEG-1 GOP timecode if present, otherwise advance by 1 frame
@@ -1498,18 +1518,13 @@ impl Dvc {
                     self.set_fmv_word(0x5C, 0x0000); // Return display status to idle
                     self.video_playing = false;
                     self.video_armed = false;
+                    // NOTE: Real DVC hardware keeps the last decoded picture in DRAM.
+                    // Retaining has_valid_frame prevents black flash during scene transitions.
                 } else if buffer_drained {
-                    // Real CL450 MPEG-1 decoder asserts FMV_IRQ_NDAT (Need Data) on underflow,
+                    // Real CL450 MPEG-1 decoder asserts FMV_IRQ_NDAT (Need Data) on underflow during active play,
                     // repeating the last frame in DRAM without stopping or destroying the decoder.
                     self.or_fmv_word(FMV_ISR, FMV_IRQ_NDAT);
                 }
-            } else if (self.get_fmv_word(FMV_IER) & FMV_IRQ_NDAT) != 0
-                && self.dvc_stream_fifo.is_empty()
-                && self.demux.video.is_empty()
-                && self.fma_stream_fifo.is_empty()
-                && self.fma_demux.video.is_empty()
-            {
-                self.or_fmv_word(FMV_ISR, FMV_IRQ_NDAT);
             }
         }
     }

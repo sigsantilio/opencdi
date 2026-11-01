@@ -54,13 +54,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!(">>> Inspecting game boot: {}", game_path_str);
+    let has_disc = game_path_str != "none" && !game_path_str.is_empty();
     let game_path = PathBuf::from(&game_path_str);
-    if !game_path.exists() {
+    if has_disc && !game_path.exists() {
         eprintln!("Error: game file not found: {}", game_path_str);
         std::process::exit(1);
     }
 
-    let is_pal = game_path_str.to_lowercase().contains("europe") || game_path_str.to_lowercase().contains("(e)");
+    let is_pal = game_path_str.to_lowercase().contains("europe") || game_path_str.to_lowercase().contains("(e)") || !has_disc;
 
     let mut bus = CdiBus::new();
     let bios_path = find_file("bios/cdi220b.rom").expect("cdi220b.rom non trovata");
@@ -70,7 +71,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let dvc_path = find_file("dvc/vmpega.rom").expect("vmpega.rom non trovata");
     bus.load_dvc_rom(&dvc_path)?;
-    bus.load_cdrom(&game_path)?;
+    if has_disc {
+        bus.load_cdrom(&game_path)?;
+    }
     bus.set_video_mode(if is_pal {
         opencdi::mcd212::VideoMode::Pal
     } else {
@@ -87,10 +90,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut path_names: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
     let mut pending_open: Option<(String, u32)> = None;
 
-    let mut button_pressed = false;
+    let _button_pressed = false;
     let mut pa_44080_logged = false;
     let mut srq_traced = false;
     let mut srq_countdown = 0;
+    let mut bd13_a6: u32 = 0;
+    let mut prev_bd13_state: (u16, u8, u32, u16, u8, u8, u8, u8) = (0xFFFF, 0xFF, 0, 0xFFFF, 0xFF, 0xFF, 0xFF, 0xFF);
 
     for frame in 1..=max_frames {
         // Se un disco è presente, avvia automaticamente la riproduzione una sola volta quando la shell del BIOS è pronta
@@ -181,9 +186,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut line_cycles = cycle_debt;
             while line_cycles < cyc_per_line as i32 {
                 let remaining = (cyc_per_line as i32 - line_cycles).max(1);
-                let budget = if (frame >= 1670 && frame <= 1676) || (frame >= 1703 && frame <= 1704) { 1 } else { remaining.min(32) };
+                let has_win = bd13_a6 != 0 && bus.read_long(bd13_a6.wrapping_sub(0x7EAC)) != 0;
+                let budget = if has_win || frame >= 5500 { 1 } else { remaining.min(32) };
                 bus.current_pc = cpu.pc;
                 bus.current_line_cycle = line_cycles.max(0) as u32;
+                if cpu.pc >= 0x00DE1080 && cpu.pc < 0x00DF7000 && bd13_a6 == 0 {
+                    bd13_a6 = cpu.a(6);
+                    println!(">>> [Frame {}] Captured cdi_bd13 A6 = 0x{:08X}", frame, bd13_a6);
+                }
 
 
 
@@ -224,7 +234,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!(">>> [Frame {} Line {}] CALLED 0x005F7C (start_game caller)!", frame, line);
                 }
                 if cpu.pc == 0xDE8CD4 {
-                    println!(">>> [Frame {} Line {}] CALLED 0x007C54 (setup_game SQ001ST001SG001)!", frame, line);
+                    println!(">>> [Frame {} Line {}] CALLED 0xDE8CD4 (setup_game)!", frame, line);
+                }
+                if cpu.pc == 0xDED6E8 {
+                    let s_ptr = cpu.d(1);
+                    let mut s = String::new();
+                    if s_ptr > 0x1000 && s_ptr < 0x1000000 {
+                        for k in 0..20 {
+                            let b = bus.read_byte(s_ptr + k);
+                            if b == 0 { break; }
+                            s.push(b as char);
+                        }
+                    }
+                    println!(">>> [Frame {} Line {}] LOOKUP SCENE 0xDED6E8: '{}' (ptr=0x{:08X})", frame, line, s, s_ptr);
+                }
+                if cpu.pc == 0xDF11A2 || cpu.pc == 0xDF123A {
+                    let a6 = cpu.a(6);
+                    let state = cpu.d(0) & 0xFF;
+                    let win_ptr = bus.read_long(a6.wrapping_sub(0x7EAC));
+                    let cur_idx = bus.read_word(a6.wrapping_sub(0x711A));
+                    let scene_ptr = bus.read_long(a6.wrapping_sub(0x7EBC) + (cur_idx as u32) * 4);
+                    let mut scene_name = String::new();
+                    let name_ptr = bus.read_long(scene_ptr);
+                    if name_ptr > 0x1000 && name_ptr < 0x1000000 {
+                        for k in 0..20 {
+                            let b = bus.read_byte(name_ptr + k);
+                            if b == 0 { break; }
+                            scene_name.push(b as char);
+                        }
+                    }
+                    println!(">>> [Frame {}] SCENE ACTIVE (PC=0x{:06X}): idx={}, scene='{}' (0x{:08X}), state_7ea0={}, win_ptr=0x{:08X}",
+                        frame, cpu.pc, cur_idx, scene_name, scene_ptr, state, win_ptr);
+                    if win_ptr != 0 {
+                        let w_start = bus.read_long(win_ptr);
+                        let w_end = bus.read_long(win_ptr + 4);
+                        println!("    Decision Window [{}..{}]:", w_start, w_end);
+                        for ch in 0..6u32 {
+                            let off = ch * 6;
+                            let btype = bus.read_word(win_ptr + off + 8) & 0xFF;
+                            let tptr = bus.read_long(win_ptr + off + 0xA);
+                            let mut tstr = String::new();
+                            if tptr > 0x1000 && tptr < 0x1000000 {
+                                for k in 0..20 {
+                                    let b = bus.read_byte(tptr + k);
+                                    if b == 0 { break; }
+                                    tstr.push(b as char);
+                                }
+                            }
+                            println!("      Choice {}: branch_type={}, target=0x{:08X} ('{}')", ch, btype, tptr, tstr);
+                        }
+                    }
+                }
+                if cpu.pc == 0xDF1D18 {
+                    let a6 = cpu.a(6);
+                    let t = bus.read_long(a6.wrapping_sub(0x7EF0));
+                    println!(">>> [Frame {}] 0x5008 START TIME CAPTURED: -7ec8 = {} (0x{:08X})", frame, t, t);
                 }
                 if cpu.pc == 0xDF18C8 {
                     println!(">>> [Frame {} Line {}] HIT 0x010848 (event 0x200C preloader)!", frame, line);
@@ -237,7 +301,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if cpu.pc == 0xDF21B4 {
                     let sp = cpu.a(7);
                     let evt = bus.read_long(sp + 0x26);
-                    println!(">>> [Frame {} Line {}] DISPATCH EVENT 0x{:04X}", frame, line, evt);
+                    if (evt != 0x5002 && evt != 0x8001) || frame % 50 == 0 {
+                        println!(">>> [Frame {} Line {}] DISPATCH EVENT 0x{:04X}", frame, line, evt);
+                    }
+                }
+                if cpu.pc == 0xDF1D68 || cpu.pc == 0xDF1D8C {
+                    let sp = cpu.a(7);
+                    let a6 = cpu.a(6);
+                    let elapsed = bus.read_long(sp + 0xA);
+                    let win_ptr = bus.read_long(a6.wrapping_sub(0x7EAC));
+                    let w_start = bus.read_long(win_ptr);
+                    let w_end = bus.read_long(win_ptr + 4);
+                    let state = bus.read_byte(a6.wrapping_sub(0x7EA0));
+                    let choice = bus.read_word(a6.wrapping_sub(0x7E9E));
+                    if frame % 10 == 0 || state == 1 {
+                        println!(">>> [Frame {}] DECISION CHECK (PC=0x{:06X}): state={}, elapsed={}, win=[{}..{}], choice={}",
+                            frame, cpu.pc, state, elapsed, w_start, w_end, choice);
+                    }
+                    // When decision window opens (state == 1) and no choice made yet, simulate moving left (dx = -30)!
+                    if cpu.pc == 0xDF1D8C && choice == 0 {
+                        let (mx, my) = (bus.slave.device_mouse_x, bus.slave.device_mouse_y);
+                        println!(">>> [Frame {}] SIMULATING LEFT INPUT IN DECISION WINDOW!", frame);
+                        bus.slave.update_mouse(mx.saturating_sub(30), my, 0);
+                    }
+                }
+                if cpu.pc == 0xDF1EFE {
+                    let a6 = cpu.a(6);
+                    let choice = bus.read_word(a6.wrapping_sub(0x7E9E));
+                    let win_ptr = bus.read_long(a6.wrapping_sub(0x7EAC));
+                    let off = (choice as u32) * 6;
+                    let branch_type = bus.read_word(win_ptr + off + 8) & 0xFF;
+                    let target_ptr = bus.read_long(win_ptr + off + 0xA);
+                    let mut target_str = String::new();
+                    if target_ptr > 0x1000 && target_ptr < 0x1000000 {
+                        for k in 0..20 {
+                            let b = bus.read_byte(target_ptr + k);
+                            if b == 0 { break; }
+                            target_str.push(b as char);
+                        }
+                    }
+                    println!(">>> [Frame {}] DECISION WINDOW EXPIRED at 0xDF1EFE! choice={}, branch_type={}, target_ptr=0x{:08X} ('{}')",
+                        frame, choice, branch_type, target_ptr, target_str);
+                }
+                if cpu.pc == 0xDF1DA0 {
+                    println!(">>> [Frame {}] IMMEDIATE BRANCH at 0xDF1DA0!", frame);
+                }
+                if cpu.pc == 0xDF1EE6 {
+                    println!(">>> [Frame {}] DEFERRED BRANCH at 0xDF1EE6!", frame);
+                }
+                if cpu.pc == 0xDEFF96 {
+                    let a6 = cpu.a(6);
+                    let dir = bus.read_long(a6.wrapping_sub(0x7A5E));
+                    let state = bus.read_byte(a6.wrapping_sub(0x7EA0));
+                    println!(">>> [Frame {}] PLAYER DIRECTION REGISTERED at 0xDEFF96! dir={}, state_7ea0={}", frame, dir, state);
+                }
+                if cpu.pc == 0xDE9380 {
+                    let sp = cpu.a(7);
+                    let arg = bus.read_long(sp + 4);
+                    println!(">>> [Frame {}] SCENE PLAY CALLBACK 0xDE9380! arg=0x{:08X} (err=0x{:04X})", frame, arg, arg >> 16);
+                }
+                if cpu.pc == 0xDF1168 {
+                    let a6 = cpu.a(6);
+                    println!(">>> [Frame {}] EVENT 0x100B at 0xDF1168: -7020={}, -7018={}",
+                        frame, bus.read_byte(a6.wrapping_sub(0x7020)), bus.read_byte(a6.wrapping_sub(0x7018)));
+                }
+                if cpu.pc == 0xDF101C {
+                    let a6 = cpu.a(6);
+                    println!(">>> [Frame {}] EVENT 0x100C at 0xDF101C: -701e={}",
+                        frame, bus.read_byte(a6.wrapping_sub(0x701E)));
                 }
 
 
@@ -268,28 +399,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if cpu.pc == 0xDF149E {
                     println!(">>> REACHED DF149E (exited loop) at Frame {} Line {}!", frame, line);
                 }
-                if frame >= 821 && frame <= 830 {
-                    let op = bus.read_word(cpu.pc);
-                    if (op & 0xFF00) == 0x6100 || (op & 0xFFC0) == 0x4E80 || (op & 0xFFC0) == 0x4EC0 {
-                        println!("CALL at Frame {} Line {}: PC=0x{:06X}, op=0x{:04X}", frame, line, cpu.pc, op);
-                    }
-                }
-
-
-
-                if cpu.pc >= 0xE54312 && cpu.pc <= 0xE54386 {
-                    println!(">>> [Frame {} Line {}] PC=0x{:06X}! D0=0x{:X}, D1=0x{:X}, 170=0x{:X}, 17F=0x{:X}, 180=0x{:X}, 16E=0x{:X}",
-                        frame, line, cpu.pc, cpu.d(0), cpu.d(1),
-                        bus.read_long(cpu.a(2) + 0x170), bus.read_byte(cpu.a(2) + 0x17F),
-                        bus.read_long(cpu.a(2) + 0x180), bus.read_word(cpu.a(2) + 0x16E));
-                }
-                if cpu.pc == 0xE54380 {
-                    println!(">>> [Frame {} Line {}] HIT 0xE54380 (ori.w #$200, $13c(a2))! D0=0x{:X}, D1=0x{:X}, 170=0x{:X}, 17F=0x{:X}, 180=0x{:X}, 16E=0x{:X}",
-                        frame, line, cpu.d(0), cpu.d(1),
-                        bus.read_long(cpu.a(2) + 0x170), bus.read_byte(cpu.a(2) + 0x17F),
-                        bus.read_long(cpu.a(2) + 0x180), bus.read_word(cpu.a(2) + 0x16E));
-                }
-
                 let batch = cpu.run_for_cycles(&mut bus, budget);
                 let mut batch_cycles = batch.cycles + bus.consume_wait_cycles();
 
@@ -370,36 +479,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 0x0008 => {
-                                    if trace_now {
+                                    if trace_now && (cpu.d(1) != 0x5002 || frame % 50 == 0) {
                                         println!("[Frame {}] F$Send to proc=0x{:X}, sig=0x{:X} at PC=0x{:06X}",
                                             frame, cpu.d(0), cpu.d(1), caller_pc);
-                                        let mut mod_hdr = caller_pc & !1;
-                                        while mod_hdr > 0x000000 && caller_pc - mod_hdr < 0x20000 {
-                                            if bus.read_word(mod_hdr) == 0x4AFC {
-                                                let name_off = bus.read_long(mod_hdr + 12);
-                                                let mut mname = String::new();
-                                                for k in 0..32 {
-                                                    let b = bus.read_byte(mod_hdr + name_off + k);
-                                                    if b == 0 || b == 0x0D { break; }
-                                                    mname.push(b as char);
-                                                }
-                                                println!("   -> In module '{}' (header at 0x{:06X})", mname, mod_hdr);
-                                                break;
-                                            }
-                                            mod_hdr -= 2;
-                                        }
-                                        println!("   -> Registers: D0=0x{:X}, D1=0x{:X}, D2=0x{:X}, D3=0x{:X}, A0=0x{:X}, A1=0x{:X}, A2=0x{:X}, A6=0x{:X}, A7=0x{:X}",
-                                            cpu.d(0), cpu.d(1), cpu.d(2), cpu.d(3), cpu.a(0), cpu.a(1), cpu.a(2), cpu.a(6), cpu.a(7));
-                                        let sp = cpu.a(7);
-                                        println!("   -> Stack: [0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}]",
-                                            bus.read_long(sp), bus.read_long(sp+4), bus.read_long(sp+8), bus.read_long(sp+12),
-                                            bus.read_long(sp+16), bus.read_long(sp+20), bus.read_long(sp+24), bus.read_long(sp+28));
-                                        print!("   -> Code around PC:");
-                                        for off in (caller_pc.saturating_sub(32)..caller_pc + 32).step_by(2) {
-                                            if off == caller_pc { print!(" [PC]"); }
-                                            print!(" {:04X}", bus.read_word(off));
-                                        }
-                                        println!();
                                     }
                                 }
                                 0x0088 => {
@@ -674,27 +756,42 @@ for (i, w) in bus.mcd212.plane_b.windows(4).enumerate() {
                     println!("   PB at DCP1 (0x{:X}): {:02X?}", dcp1, &bus.mcd212.plane_b[dcp1..dcp1+64]);
                 }
             }
-            // First press button 1 at frame 1100 to skip attract / enter menu
-            if !button_pressed && false && frame >= 1100 {
-                println!(">>> [Frame {}] USER CLICKS BUTTON 1 TO SKIP ATTRACT...", frame);
-                let (mx, my) = (bus.slave.device_mouse_x, bus.slave.device_mouse_y);
-                bus.slave.update_mouse(mx, my, 1);
-                button_pressed = true;
-            } else if button_pressed && frame == 1130 {
-                println!(">>> [Frame {}] USER RELEASES BUTTON 1...", frame);
-                let (mx, my) = (bus.slave.device_mouse_x, bus.slave.device_mouse_y);
-                bus.slave.update_mouse(mx, my, 0);
-            }
+            // No manual click at 2750: let SQ001ST001SG001 play into the first interactive scene
+        }
 
-            // Second press button 1 at frame 2750 to start game from menu
-            if frame == 2750 {
-                println!(">>> [Frame {}] USER CLICKS BUTTON 1 TO START GAME FROM MENU...", frame);
-                let (mx, my) = (bus.slave.device_mouse_x, bus.slave.device_mouse_y);
-                bus.slave.update_mouse(mx, my, 1);
-            } else if frame == 2780 {
-                println!(">>> [Frame {}] USER RELEASES BUTTON 1...", frame);
-                let (mx, my) = (bus.slave.device_mouse_x, bus.slave.device_mouse_y);
-                bus.slave.update_mouse(mx, my, 0);
+        if bd13_a6 != 0 && frame >= 1945 {
+            let cur_idx = bus.read_word(bd13_a6.wrapping_sub(0x711A));
+            let state_7ea0 = bus.read_byte(bd13_a6.wrapping_sub(0x7EA0));
+            let win_ptr = bus.read_long(bd13_a6.wrapping_sub(0x7EAC));
+            let choice = bus.read_word(bd13_a6.wrapping_sub(0x7E9E));
+            let f_7020 = bus.read_byte(bd13_a6.wrapping_sub(0x7020));
+            let f_702e = bus.read_byte(bd13_a6.wrapping_sub(0x702E));
+            let f_7016 = bus.read_byte(bd13_a6.wrapping_sub(0x7016));
+            let f_7018 = bus.read_byte(bd13_a6.wrapping_sub(0x7018));
+            let t_cur = bus.read_long(bd13_a6.wrapping_sub(0x7EF0));
+            let t_start = bus.read_long(bd13_a6.wrapping_sub(0x7EC8));
+            let cur_tuple = (cur_idx, state_7ea0, win_ptr, choice, f_7020, f_702e, f_7016, f_7018);
+            if cur_tuple != prev_bd13_state || (win_ptr != 0 && frame % 10 == 0) {
+                prev_bd13_state = cur_tuple;
+                let scene_ptr = bus.read_long(bd13_a6.wrapping_sub(0x7EBC) + ((cur_idx & 3) as u32) * 4);
+                let mut sname = String::new();
+                if scene_ptr > 0x1000 && scene_ptr < 0x1000000 {
+                    let nptr = bus.read_long(scene_ptr);
+                    if nptr > 0x1000 && nptr < 0x1000000 {
+                        for k in 0..20 {
+                            let b = bus.read_byte(nptr + k);
+                            if b == 0 { break; }
+                            sname.push(b as char);
+                        }
+                    }
+                }
+                let (w_s, w_e) = if win_ptr > 0x1000 && win_ptr < 0x1000000 {
+                    (bus.read_long(win_ptr), bus.read_long(win_ptr + 4))
+                } else { (0, 0) };
+                println!(
+                    ">>> [Frame {} BD13 STATE] idx={} ('{}'), state_7ea0={}, win=0x{:08X} [{}..{}], choice={}, t_cur={}, t_start={}, elapsed={}, flags(7020={},702e={},7016={},7018={})",
+                    frame, cur_idx, sname, state_7ea0, win_ptr, w_s, w_e, choice, t_cur, t_start, t_cur.wrapping_sub(t_start), f_7020, f_702e, f_7016, f_7018
+                );
             }
         }
 

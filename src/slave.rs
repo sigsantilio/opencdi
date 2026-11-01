@@ -35,8 +35,18 @@ impl Default for SlaveChannel {
     }
 }
 
+const ATTENUATION_TABLE: [u8; 46] = [
+    0xff, 0xe4, 0xcb, 0xb5, 0xa2, 0x90, 0x80, 0x72,
+    0x66, 0x5b, 0x51, 0x48, 0x40, 0x39, 0x33, 0x2e,
+    0x29, 0x24, 0x20, 0x1d, 0x1a, 0x17, 0x14, 0x12,
+    0x10, 0x0e, 0x0d, 0x0b, 0x0a, 0x09, 0x08, 0x07,
+    0x06, 0x06, 0x05, 0x05, 0x04, 0x04, 0x03, 0x03,
+    0x03, 0x02, 0x02, 0x02, 0x02, 0x01,
+];
+
 pub struct SlaveHle {
     pub channels: [SlaveChannel; 4],
+    pub attenuation: [u8; 4],
 
     // Mouse coordinates (0..767, 0..559)
     pub device_mouse_x: i32,
@@ -48,9 +58,9 @@ pub struct SlaveHle {
     pub center_y: i32,
 
     // Previous input values to detect changes
-    input_mouse_x: i32,
-    input_mouse_y: i32,
-    input_mouse_btn: u8,
+    pub input_mouse_x: i32,
+    pub input_mouse_y: i32,
+    pub input_mouse_btn: u8,
 
     pub irq_pending: bool,
     pub has_disc: bool,
@@ -68,6 +78,7 @@ impl SlaveHle {
     pub fn new() -> Self {
         Self {
             channels: [SlaveChannel::default(); 4],
+            attenuation: [0xFF, 0, 0xFF, 0],
 
             device_mouse_x: 384,
             device_mouse_y: 280,
@@ -270,6 +281,16 @@ impl SlaveHle {
                         }
                     }
                 } else if ch.in_index == ch.in_count {
+                    if (ch.in_buf[0] & 0xF0) == 0xC0 {
+                        for i in 0..4 {
+                            let idx = ch.in_buf[i + 1] as usize;
+                            self.attenuation[i] = if idx < ATTENUATION_TABLE.len() {
+                                ATTENUATION_TABLE[idx]
+                            } else {
+                                0
+                            };
+                        }
+                    }
                     ch.in_index = 0;
                     ch.in_count = 0;
                 }
@@ -354,12 +375,24 @@ impl SlaveHle {
 
     pub fn prepare_readback(&mut self, ch_idx: usize, data: &[u8], cmd: u8, assert_irq: bool) {
         let ch = &mut self.channels[ch_idx];
-        // CH0: pacchetto arrivato mentre il precedente è in lettura -> stage (last-wins), nessuna promozione ora
-        if ch_idx == 0 && ch.out_count > 0 && ch.out_index > 0 {
-            ch.pending_count = data.len().min(ch.pending_buf.len());
-            ch.pending_cmd = cmd;
-            for (i, &b) in data.iter().take(ch.pending_count).enumerate() {
-                ch.pending_buf[i] = b;
+        // CH0 (Pointing Device): se c'è già un pacchetto attivo in out_buf (anche se out_index == 0),
+        // non sovrascrivere out_buf per evitare la perdita di click/spari o la corruzione di letture in corso.
+        if ch_idx == 0 && ch.out_count > 0 {
+            let new_has_btn = (data[0] & 0x38) != 0x08;
+            let pending_has_btn = ch.pending_count > 0 && (ch.pending_buf[0] & 0x38) != 0x08;
+
+            if !pending_has_btn || new_has_btn {
+                ch.pending_count = data.len().min(ch.pending_buf.len());
+                ch.pending_cmd = cmd;
+                for (i, &b) in data.iter().take(ch.pending_count).enumerate() {
+                    ch.pending_buf[i] = b;
+                }
+            } else {
+                // Preserva il bottone già in attesa in pending_buf, aggiornando solo le coordinate di puntamento
+                ch.pending_buf[0] = (ch.pending_buf[0] & 0x38) | (data[0] & !0x38);
+                ch.pending_buf[1] = data[1];
+                ch.pending_buf[2] = data[2];
+                ch.pending_buf[3] = data[3];
             }
             return;
         }
@@ -407,7 +440,7 @@ opencdi::impl_state!(SlaveChannel {
 } skip {});
 
 opencdi::impl_state!(SlaveHle {
-    channels, device_mouse_x, device_mouse_y, device_mouse_updated, mouse_btn, center_x, center_y,
+    channels, attenuation, device_mouse_x, device_mouse_y, device_mouse_updated, mouse_btn, center_x, center_y,
     input_mouse_x, input_mouse_y, input_mouse_btn,
     irq_pending, has_disc, disc_state, disc_timer, xbus_interrupt_enable, video_mode, stream_counter, reset_request,
 } skip {
