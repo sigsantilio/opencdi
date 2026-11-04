@@ -60,7 +60,7 @@ The goal of the project is to accurately preserve and run the software and multi
 ## Building and Running
 
 ### Prerequisites
-- [Rust & Cargo](https://rustup.rs/) (version 1.70 or newer).
+- [Rust & Cargo](https://rustup.rs/) (version 1.93 or newer).
 
 ### Building from Source
 ```bash
