@@ -181,7 +181,7 @@ unsafe extern "C" fn input_state_cb(port: c_uint, device: c_uint, _index: c_uint
 }
 
 fn usage() -> ! {
-    eprintln!("usage: test_host <core.so> <system_dir> [frames=600] [game_path|none] [--replay <script|@file> | --memory] [--sample <n>] [--roundtrip <frame>] [--option <key>=<value>]... [--audio-out <file.s16>] [--state-out <frame> <file>] [--state-in <file>]");
+    eprintln!("usage: test_host <core.so> <system_dir> [frames=600] [game_path|none] [--replay <script|@file> | --memory] [--sample <n>] [--roundtrip <frame>] [--option <key>=<value>]... [--audio-out <file.s16>] [--state-out <frame> <file>] [--state-in <file>] [--timing <slow_ms>]");
     std::process::exit(2);
 }
 
@@ -283,6 +283,7 @@ fn main() {
     let mut audio_out: Option<String> = None;
     let mut state_out: Option<(u64, String)> = None;
     let mut state_in: Option<String> = None;
+    let mut timing: Option<f64> = None;
     let mut i = if a.len() > 4 && !a[4].starts_with("--") { 5 } else { 4 };
     while i < a.len() {
         match a[i].as_str() {
@@ -311,6 +312,7 @@ fn main() {
                 i += 2;
             }
             "--state-in" => { i += 1; state_in = Some(a.get(i).cloned().unwrap_or_else(|| usage())); }
+            "--timing" => { i += 1; timing = Some(a.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())); }
             _ => usage(),
         }
         i += 1;
@@ -388,7 +390,11 @@ fn main() {
         init();
 
         let gi = game.as_ref().map(|p| GameInfo { path: p.as_ptr(), data: std::ptr::null(), size: 0, meta: std::ptr::null() });
+        let t = std::time::Instant::now();
         let ok = load_game(gi.as_ref().map_or(std::ptr::null(), |g| g as *const GameInfo));
+        if timing.is_some() {
+            eprintln!("LOAD ms={:.1}", t.elapsed().as_secs_f64() * 1e3);
+        }
         assert!(ok, "retro_load_game failed");
         let mut av = AvInfo::default();
         get_av_info(&mut av);
@@ -407,6 +413,7 @@ fn main() {
         if memory.is_some() || replay.as_ref().is_some_and(Replay::has_pointer) {
             set_port(0, DEVICE_POINTER);
         }
+        let times = std::cell::RefCell::new(Vec::<f64>::new());
         let step = |frame: u64, replay: &mut Option<Replay>, memory: &mut Option<Memory>| {
             if let Some(r) = replay.as_mut() {
                 let (pointer, pad) = r.at(frame);
@@ -417,7 +424,15 @@ fn main() {
                 let pointer = mm.at(frame, ram);
                 with_host(|h| h.pointer = pointer);
             }
+            let t = std::time::Instant::now();
             run();
+            if let Some(slow) = timing {
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                times.borrow_mut().push(ms);
+                if ms >= slow {
+                    eprintln!("SLOW frame={} ms={:.1}", frame + 1, ms);
+                }
+            }
             if let Some((at, f)) = &state_out {
                 if frame + 1 == *at {
                     let size = serialize_size();
@@ -493,6 +508,18 @@ fn main() {
             return;
         }
 
+        if timing.is_some() {
+            let mut t = times.take();
+            let total: f64 = t.iter().sum();
+            let worst = t.iter().cloned().enumerate().fold((0, 0.0), |m, (i, v)| if v > m.1 { (i + 1, v) } else { m });
+            t.sort_by(|a, b| a.total_cmp(b));
+            let pct = |p: f64| t.get(((t.len() as f64 * p) as usize).min(t.len().saturating_sub(1))).copied().unwrap_or(0.0);
+            let over = |ms: f64| t.iter().filter(|&&v| v >= ms).count();
+            eprintln!(
+                "TIMING frames={} mean_ms={:.2} p50_ms={:.2} p99_ms={:.2} max_ms={:.1} max_frame={} over20={} over40={} over100={}",
+                t.len(), total / t.len().max(1) as f64, pct(0.5), pct(0.99), worst.1, worst.0, over(20.0), over(40.0), over(100.0)
+            );
+        }
         if let Some(f) = &audio_out {
             std::fs::write(f, with_host(|h| h.audio_out.take()).unwrap_or_default()).expect("write audio");
         }
