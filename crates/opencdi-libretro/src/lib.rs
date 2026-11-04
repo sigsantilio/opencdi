@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-// Looked up case-insensitively in the system directory and BIOS_SUBDIRS, in this order; Mono-IV images are reported, not booted.
+// Looked up case-insensitively in the system directory and BIOS_SUBDIRS, in this order; Mono-IV images boot only with the opencdi_mono4 option on.
 pub const BIOS_NAMES: &[&str] = &["cdi220b.rom", "cdi200.rom", "cdimono1.zip", "cdibios.zip", "cdi.rom", "cdi220.rom", "cdi490a.rom", "cdi490a.zip"];
 // Cartridge ROM, looked up the same way; cdimono1.zip carries vmpega.rom next to the system ROMs.
 pub const DVC_NAMES: &[&str] = &["vmpega.rom", "cdimono1.zip", "cdibios.zip"];
