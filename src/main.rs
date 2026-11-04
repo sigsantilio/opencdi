@@ -368,7 +368,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     MD5:   AC0D468BE366779C9DF633BE98DA250A\n\n\
                 Alternative Supported BIOSes:\n\
                   • cdi200.rom, cdi.rom, cdimono1.zip / cdibios.zip\n\
-                  • cdi220.rom is a truncated dump; cdi490a.rom is not emulated yet\n\n\
+                  • cdi220.rom is a truncated dump; cdi490a.rom (CD-i 490) is experimental\n\n\
                 Where to place the BIOS ROM:\n\
                   1. In a 'bios/' subfolder next to opencdi.exe\n\
                   2. OR directly in the same folder as opencdi.exe\n\

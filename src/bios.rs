@@ -334,7 +334,9 @@ pub fn inspect(mut data: Vec<u8>) -> BiosImage {
             msg += ": known good dump";
             Status::Ok
         };
-        if !k.board.emulated() {
+        if k.board == Board::Mono4 {
+            msg += "; the Mono-IV board is experimental and is only picked when no Mono-I system ROM is found";
+        } else if !k.board.emulated() {
             msg += &format!("; the {} board is not emulated yet, so it will not boot", k.board.name());
         }
         return BiosImage { report: report(status, Some(k), Some(k.board), swap, sha, msg), data };
