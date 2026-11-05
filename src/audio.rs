@@ -152,8 +152,10 @@ impl Resampler {
     }
 }
 
-// Silence put in front of a stream that starts from empty, so sector-sized bursts never run dry (about 54 ms).
-pub const PREFILL: usize = 2048;
+// Silence in front of an ADPCM stream that starts from empty: one sector period, as the decoder needs a whole sector first.
+pub const ADPCM_LATENCY: usize = OUT_RATE as usize / 75;
+// Silence in front of the MPEG stream when it starts from empty (about 54 ms).
+pub const MPEG_LATENCY: usize = 2048;
 // An MPEG stream holding more than this (two seconds) is reported; nothing is dropped.
 const MPEG_WARN: usize = 2 * OUT_RATE as usize;
 
@@ -169,14 +171,14 @@ pub struct Stream {
 }
 
 impl Stream {
-    // Queues `src`; holding more than `bound` frames is reported once per stream start (`what` names stream and level).
-    pub fn push(&mut self, src: &[Frame], bound: usize, what: &dyn Fn() -> String) {
+    // Queues `src`, after `latency` frames of silence when the stream starts; holding more than `bound` frames is reported once per start.
+    pub fn push(&mut self, src: &[Frame], latency: usize, bound: usize, what: &dyn Fn() -> String) {
         if src.is_empty() {
             return;
         }
         self.frames_in += src.len() as u64;
         if !self.primed {
-            self.fifo.resize(self.fifo.len() + PREFILL, (0.0, 0.0));
+            self.fifo.resize(self.fifo.len() + latency, (0.0, 0.0));
             self.primed = true;
             self.warned = false;
             self.restarts += 1;
@@ -228,7 +230,7 @@ pub struct SectorKind {
 impl SectorKind {
     // Start latency plus one playing and one waiting sector.
     fn bound(&self) -> usize {
-        PREFILL + 2 * self.frames
+        ADPCM_LATENCY + 2 * self.frames
     }
 
     fn level(&self) -> String {
@@ -320,7 +322,7 @@ impl CdiAudio {
         self.resampler.process(a, &mut self.scratch);
         self.resampler.process(b, &mut self.scratch);
         pcm.clear();
-        self.mpeg.push(&self.scratch, MPEG_WARN, &|| format!("mpeg {} Hz", rate));
+        self.mpeg.push(&self.scratch, MPEG_LATENCY, MPEG_WARN, &|| format!("mpeg {} Hz", rate));
     }
 
     // Appends the mixed frames made since the last call; returns how many.
@@ -490,7 +492,7 @@ impl CdiAudio {
         let final_samples = self.apply_matrix(final_samples);
 
         let k = SectorKind { frames: final_samples.len(), is_8bit, is_stereo, rate: sample_rate };
-        self.main.push(&final_samples, k.bound(), &|| format!("main {}", k.level()));
+        self.main.push(&final_samples, ADPCM_LATENCY, k.bound(), &|| format!("main {}", k.level()));
     }
 
     pub fn decode_audio_map_sector(&mut self, payload: &[u8], is_stereo: bool, is_8bit: bool, sample_rate: u32) {
@@ -512,7 +514,7 @@ impl CdiAudio {
         let final_samples = self.apply_matrix(final_samples);
 
         let k = SectorKind { frames: final_samples.len(), is_8bit, is_stereo, rate: sample_rate };
-        self.sfx.push(&final_samples, k.bound(), &|| format!("sfx {}", k.level()));
+        self.sfx.push(&final_samples, ADPCM_LATENCY, k.bound(), &|| format!("sfx {}", k.level()));
     }
 }
 
@@ -753,9 +755,9 @@ mod tests {
         }
         let mut a = CdiAudio::new();
         a.decode_sector(&payload, false, true, 37800);
-        let mut out = vec![(0.0, 0.0); PREFILL + 1];
+        let mut out = vec![(0.0, 0.0); ADPCM_LATENCY + 1];
         a.main.mix_into(&mut out);
-        let first = out[PREFILL].0;
+        let first = out[ADPCM_LATENCY].0;
         assert_eq!(first, 256.0 / 32768.0);
     }
 
@@ -819,17 +821,18 @@ mod tests {
 
     #[test]
     fn stream_prefills_pads_and_warns() {
+        const PREFILL: usize = 2048;
         let mut c = Stream::default();
         let what = || "test".to_string();
-        c.push(&[(0.5, 0.5); 100], usize::MAX, &what);
+        c.push(&[(0.5, 0.5); 100], PREFILL, usize::MAX, &what);
         assert_eq!(c.len(), PREFILL + 100);
         let mut out = vec![(0.0, 0.0); PREFILL + 150];
         c.mix_into(&mut out);
         assert_eq!(out[PREFILL - 1], (0.0, 0.0));
         assert_eq!(out[PREFILL], (0.5, 0.5));
         assert_eq!(out[PREFILL + 100], (0.0, 0.0));
-        c.push(&[(0.25, 0.25); 3000], PREFILL + 2000, &what);
-        c.push(&[(0.25, 0.25); 10], PREFILL + 2000, &what);
+        c.push(&[(0.25, 0.25); 3000], PREFILL, PREFILL + 2000, &what);
+        c.push(&[(0.25, 0.25); 10], PREFILL, PREFILL + 2000, &what);
         assert_eq!((c.len(), c.restarts, c.warnings), (PREFILL + 3010, 2, 1));
     }
 
@@ -838,7 +841,7 @@ mod tests {
         use opencdi::savestate::{Reader, State};
         let sector = VideoMode::Ntsc.cycles_per_sector();
         let run = |a: &mut CdiAudio, v: f32| {
-            a.main.push(&[(v, -v); 700], usize::MAX, &String::new);
+            a.main.push(&[(v, -v); 700], ADPCM_LATENCY, usize::MAX, &String::new);
             a.push_mpeg(&mut VecDeque::from(vec![(0.2, 0.3); 1152]), 44_100);
             for _ in 0..262 {
                 a.advance(960, sector);
