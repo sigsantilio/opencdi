@@ -1,10 +1,9 @@
-mod audio;
 mod input;
 pub mod libretro;
 
-use audio::Pacer;
 use input::{Input, Table};
 use libretro::*;
+use opencdi::audio;
 use opencdi::bios;
 use opencdi::machine::Machine;
 use opencdi::mcd212::{VideoMode, SCREEN_HEIGHT, SCREEN_WIDTH};
@@ -88,9 +87,8 @@ struct Core {
     spec: Option<LoadSpec>,
     temp_disc: Option<PathBuf>,
     mix: Vec<(f32, f32)>,
-    sfx: Vec<(f32, f32)>,
     pcm: Vec<i16>,
-    pacer: Pacer,
+    frames_out: u64,
     input: Input,
     uart_line: Vec<u8>,
     state_buf: Vec<u8>,
@@ -110,10 +108,9 @@ static CORE: Mutex<Core> = Mutex::new(Core {
     spec: None,
     temp_disc: None,
     mix: Vec::new(),
-    sfx: Vec::new(),
     uart_line: Vec::new(),
     pcm: Vec::new(),
-    pacer: Pacer::new(),
+    frames_out: 0,
     input: Input::new(),
     state_buf: Vec::new(),
     state_size: 0,
@@ -326,7 +323,6 @@ fn boot(spec: &LoadSpec) -> Result<Machine, String> {
     m.set_video_mode(spec.mode);
     m.reset();
     m.bus.uart_capture = Some(Vec::new());
-    m.bus.dvc_audio_capture = Some(Vec::new());
     Ok(m)
 }
 
@@ -512,32 +508,22 @@ pub extern "C" fn retro_reset() {
             Ok(m) => {
                 core.machine = Some(m);
                 core.input.reset();
-                core.pacer.reset();
+                core.frames_out = 0;
             }
             Err(e) => log(RETRO_LOG_ERROR, &format!("reset failed: {}", e)),
         }
     })
 }
 
-// Moves this field's emulator audio into the pacer and sends exactly one field of frames.
+// Sends the frames the emulation made this frame, hard-clipped to 16 bits.
 fn send_audio(core: &mut Core, batch: retro_audio_sample_batch_t) {
-    let Core { machine, mix, sfx, pcm, pacer, .. } = core;
+    let Core { machine, mix, pcm, frames_out, .. } = core;
     let Some(m) = machine.as_mut() else { return };
-    let audio = &m.bus.cdic.audio;
     mix.clear();
-    sfx.clear();
-    mix.extend(lock(&audio.sample_queue).drain(..));
-    sfx.extend(lock(&audio.sfx_queue).drain(..));
-    pacer.main.push(mix);
-    pacer.sfx.push(sfx);
-    if let Some(cap) = m.bus.dvc_audio_capture.as_mut() {
-        pacer.push_mpeg(cap, m.bus.dvc.audio_sample_rate);
-        cap.clear();
-    }
-    let out = pacer.field(m.bus.mcd212.video_mode);
+    *frames_out += m.drain_audio(mix) as u64;
     let Some(f) = batch else { return };
     pcm.clear();
-    pcm.extend(out.iter().flat_map(|&(l, r)| [opencdi::audio::to_i16(l), opencdi::audio::to_i16(r)]));
+    pcm.extend(mix.iter().flat_map(|&(l, r)| [audio::to_i16(l), audio::to_i16(r)]));
     let mut done = 0;
     let frames = pcm.len() / 2;
     while done < frames {
@@ -579,13 +565,12 @@ pub extern "C" fn retro_run() {
     })
 }
 
-// Fills `core.state_buf` with the machine state plus the input translator's and audio pacer's state.
+// Fills `core.state_buf` with the machine state plus the input translator's state.
 fn save_state(core: &mut Core) -> bool {
-    let Core { machine, input, pacer, state_buf, .. } = core;
+    let Core { machine, input, state_buf, .. } = core;
     let Some(m) = machine.as_ref() else { return false };
     let mut fe = Vec::new();
     input.save(&mut fe);
-    pacer.save(&mut fe);
     m.save_state(&fe, state_buf);
     true
 }
@@ -635,7 +620,7 @@ pub extern "C" fn retro_unserialize(data: *const c_void, len: usize) -> bool {
         // SAFETY: the frontend passes a readable buffer of `len` bytes.
         let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, len) };
         let mut core = lock(&CORE);
-        let Core { machine, input, pacer, .. } = &mut *core;
+        let Core { machine, input, .. } = &mut *core;
         let Some(m) = machine.as_mut() else { return false };
         let fe = match m.load_state(bytes) {
             Ok(fe) => fe,
@@ -648,14 +633,6 @@ pub extern "C" fn retro_unserialize(data: *const c_void, len: usize) -> bool {
         if let Err(e) = input.load(&mut r) {
             log(RETRO_LOG_WARN, &format!("savestate input section: {}", e));
             input.reset();
-            return false;
-        }
-        // States from before the pacer have no audio section; start with empty FIFOs.
-        if r.remaining() == 0 {
-            pacer.reset();
-        } else if let Err(e) = pacer.load(&mut r) {
-            log(RETRO_LOG_WARN, &format!("savestate audio section: {}", e));
-            pacer.reset();
             return false;
         }
         true
@@ -732,7 +709,7 @@ fn load(game: *const retro_game_info) -> Result<(), String> {
     core.spec = Some(spec);
     core.temp_disc = temp;
     core.input.reset();
-    core.pacer.reset();
+    core.frames_out = 0;
     core.state_size = 0;
     Ok(())
 }
@@ -740,11 +717,11 @@ fn load(game: *const retro_game_info) -> Result<(), String> {
 fn unload() {
     let mut core = lock(&CORE);
     flush_uart_line(&mut core.uart_line);
-    if core.machine.is_some() {
-        let p = &core.pacer;
+    if let Some(m) = core.machine.as_ref() {
+        let a = &m.bus.cdic.audio;
         log(RETRO_LOG_INFO, &format!(
             "audio: {} frames sent; received main={} sfx={} mpeg={}; prefill restarts main={} sfx={} mpeg={}; dropped main={} sfx={} mpeg={}",
-            p.frames_out, p.main.frames_in, p.sfx.frames_in, p.mpeg.frames_in, p.main.restarts, p.sfx.restarts, p.mpeg.restarts, p.main.dropped, p.sfx.dropped, p.mpeg.dropped
+            core.frames_out, a.main.frames_in, a.sfx.frames_in, a.mpeg.frames_in, a.main.restarts, a.sfx.restarts, a.mpeg.restarts, a.main.dropped, a.sfx.dropped, a.mpeg.dropped
         ));
     }
     core.machine = None;

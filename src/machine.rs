@@ -5,7 +5,6 @@ use crate::os9_trace::Os9Trace;
 use crate::savestate::{self, Identity, Reader, State, StateError};
 use m68k::{CpuCore, CpuType};
 use std::path::Path;
-use std::sync::atomic::Ordering;
 
 pub struct Machine {
     pub bus: CdiBus,
@@ -115,18 +114,9 @@ impl Machine {
         &self.bus.mcd212.framebuffer[..]
     }
 
-    /// Appends the main, sfx and DVC queues to `out`; returns the DVC rate when it held samples, else the source rate.
-    pub fn drain_audio(&mut self, out: &mut Vec<(f32, f32)>) -> u32 {
-        let audio = &self.bus.cdic.audio;
-        for q in [&audio.sample_queue, &audio.sfx_queue] {
-            out.extend(q.lock().unwrap().drain(..));
-        }
-        let before = out.len();
-        out.extend(audio.dvc_queue.lock().unwrap().drain(..));
-        if out.len() > before {
-            return audio.dvc_rate.load(Ordering::Relaxed);
-        }
-        audio.source_rate.load(Ordering::Relaxed)
+    /// Appends the frames made since the last call at OUT_RATE; returns how many.
+    pub fn drain_audio(&mut self, out: &mut Vec<(f32, f32)>) -> usize {
+        self.bus.cdic.audio.drain(out)
     }
 
     pub fn run_frame(&mut self) {
@@ -214,6 +204,7 @@ impl Machine {
 
             bus.tick_board(cyc_per_line);
         }
+        bus.cdic.audio.end_frame(bus.dvc.audio_sample_rate);
         bus.counters.end_frame();
         // A double fault parks the CPU for good; say so once instead of idling silently.
         if cpu.is_halted() && !bus.counters.halted {

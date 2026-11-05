@@ -1,3 +1,4 @@
+use opencdi::audio::to_i16;
 use opencdi::input_script::{self, Event, Player};
 use opencdi::bus::BoardKind;
 use opencdi::machine::Machine;
@@ -22,15 +23,16 @@ fn video_hash(h: u64, fb: &[u32]) -> u64 {
     h
 }
 
-fn drain_audio(m: &mut Machine, buf: &mut Vec<(f32, f32)>, h: &mut u64, samples: &mut u64) {
+// Hashes the frames the last run_frame made; counts them and those that are not silent.
+fn drain_audio(m: &mut Machine, buf: &mut Vec<(f32, f32)>, h: &mut u64, samples: &mut u64, nonzero: &mut u64) {
     buf.clear();
-    let rate = m.drain_audio(buf);
+    m.drain_audio(buf);
     for &(l, r) in buf.iter() {
         *h = fnv(*h, &l.to_bits().to_le_bytes());
         *h = fnv(*h, &r.to_bits().to_le_bytes());
         *samples += 1;
+        *nonzero += (l != 0.0 || r != 0.0) as u64;
     }
-    *h = fnv(*h, &rate.to_le_bytes());
 }
 
 fn dump_ppm(fb: &[u32], path: &str) {
@@ -42,7 +44,7 @@ fn dump_ppm(fb: &[u32], path: &str) {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: harness <bios.rom> <disc|none> <frames> [--dvc <rom>] [--ppm <out.ppm>] [--ntsc] [--autoplay [--print-autoplay-script]] [--input <script|@file>] [--sample <n> [--sample-audio]] [--dump-every <n> <prefix>] [--roundtrip <frame>] [--nvram-out <file>] [--counters] [--idle-pc <hex>] [--board mono1|mono4]");
+    eprintln!("usage: harness <bios.rom> <disc|none> <frames> [--dvc <rom>] [--ppm <out.ppm>] [--ntsc] [--autoplay [--print-autoplay-script]] [--input <script|@file>] [--sample <n> [--sample-audio]] [--dump-every <n> <prefix>] [--roundtrip <frame>] [--nvram-out <file>] [--counters] [--idle-pc <hex>] [--board mono1|mono4] [--audio-out <file.s16>]");
     std::process::exit(2);
 }
 
@@ -67,12 +69,14 @@ fn main() {
     let mut counters = false;
     let mut board: Option<BoardKind> = None;
     let mut idle_pc: Option<u32> = None;
+    let mut audio_out: Option<(String, Vec<u8>)> = None;
     let mut i = 4;
     while i < a.len() {
         match a[i].as_str() {
             "--dvc" => { i += 1; dvc = a.get(i); }
             "--ppm" => { i += 1; ppm = a.get(i); }
             "--nvram-out" => { i += 1; nvram_out = a.get(i); }
+            "--audio-out" => { i += 1; audio_out = Some((a.get(i).cloned().unwrap_or_else(|| usage()), Vec::new())); }
             "--ntsc" => ntsc = true,
             "--counters" => counters = true,
             "--board" => {
@@ -127,6 +131,7 @@ fn main() {
     let mut video_all = FNV_OFFSET;
     let mut audio_all = FNV_OFFSET;
     let mut audio_samples = 0u64;
+    let mut audio_nonzero = 0u64;
     let mut disc_launched = false;
     let mut shell_ready_count = 0u32;
     let mut audio_buf: Vec<(f32, f32)> = Vec::new();
@@ -143,7 +148,7 @@ fn main() {
                 let mut buf = Vec::new();
                 m.save_state(&[], &mut buf);
                 saved = Some((buf, disc_launched, shell_ready_count, player.clone()));
-                (video_all, audio_all, audio_samples) = (FNV_OFFSET, FNV_OFFSET, 0);
+                (video_all, audio_all, audio_samples, audio_nonzero) = (FNV_OFFSET, FNV_OFFSET, 0, 0);
             }
             if autoplay && m.bus.cdrom.is_some() && !disc_launched {
                 let (bus, cpu) = (&mut m.bus, &m.cpu);
@@ -191,7 +196,10 @@ fn main() {
             }
 
             video_all = video_hash(video_all, m.framebuffer());
-            drain_audio(&mut m, &mut audio_buf, &mut audio_all, &mut audio_samples);
+            drain_audio(&mut m, &mut audio_buf, &mut audio_all, &mut audio_samples, &mut audio_nonzero);
+            if let Some((_, bytes)) = audio_out.as_mut() {
+                bytes.extend(audio_buf.iter().flat_map(|&(l, r)| [to_i16(l), to_i16(r)]).flat_map(i16::to_le_bytes));
+            }
             if sample_audio {
                 win_samples += audio_buf.len() as u64;
                 win_nonzero += audio_buf.iter().filter(|&&(l, r)| l != 0.0 || r != 0.0).count() as u64;
@@ -220,7 +228,7 @@ fn main() {
                     m.save_state(&[], &mut again);
                     eprintln!("ROUNDTRIP-RESAVE {} size={}", if &again == buf { "same" } else { "DIFF" }, buf.len());
                     (disc_launched, shell_ready_count, player) = (*dl, *src, pl.clone());
-                    (video_all, audio_all, audio_samples) = (FNV_OFFSET, FNV_OFFSET, 0);
+                    (video_all, audio_all, audio_samples, audio_nonzero) = (FNV_OFFSET, FNV_OFFSET, 0, 0);
                     start = at;
                     continue 'passes;
                 }
@@ -245,12 +253,15 @@ fn main() {
     if let Some(p) = ppm {
         dump_ppm(m.framebuffer(), p);
     }
+    if let Some((p, bytes)) = &audio_out {
+        std::fs::write(p, bytes).expect("write audio");
+    }
     if let Some(p) = nvram_out {
         std::fs::write(p, &m.bus.nvram.ram[..]).expect("write nvram");
     }
     println!(
-        "\nHARNESS frames={} pc={:08x} nonblack={} video_last={:016x} video_all={:016x} audio={:016x} audio_samples={}",
-        frames, m.cpu.pc, nonblack, video_last, video_all, audio_all, audio_samples
+        "\nHARNESS frames={} pc={:08x} nonblack={} video_last={:016x} video_all={:016x} audio={:016x} audio_samples={} audio_nonzero={}",
+        frames, m.cpu.pc, nonblack, video_last, video_all, audio_all, audio_samples, audio_nonzero
     );
     if counters || idle_pc.is_some() {
         let idle = idle_first.map_or("none".to_string(), |f| f.to_string());

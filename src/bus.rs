@@ -54,7 +54,6 @@ pub struct CdiBus {
     pub scc_uart_cmd: u8,
     pub scc_uart_tx_irq: bool,
     pub uart_capture: Option<Vec<u8>>, // Some: UART bytes are collected for the host instead of printed
-    pub dvc_audio_capture: Option<Vec<(f32, f32)>>, // Some: DVC PCM at dvc.audio_sample_rate goes here instead of the sample queue
     pub current_pc: u32,
     pub trace_setup: bool,
 
@@ -94,7 +93,6 @@ impl CdiBus {
             scc_uart_cmd: 0,
             scc_uart_tx_irq: false,
             uart_capture: None,
-            dvc_audio_capture: None,
             current_pc: 0,
             trace_setup: false,
 
@@ -351,6 +349,7 @@ impl CdiBus {
                 self.tick_dvc(cycles);
             }
         }
+        self.cdic.audio.advance(cycles, self.mcd212.video_mode.cycles_per_sector());
     }
 
     /// Highest external interrupt level the board peripherals request (0 for none).
@@ -410,23 +409,7 @@ impl CdiBus {
             self.dvc.vsync_hz = if self.mcd212.video_mode == crate::mcd212::VideoMode::Pal { 50.0 } else { 60.0 };
             self.dvc.on_vsync();
         }
-        if let Some(cap) = self.dvc_audio_capture.as_mut() {
-            cap.extend(self.dvc.audio_out.drain(..));
-        } else if line == 0 && self.dvc.is_fitted() && !self.dvc.audio_out.is_empty() {
-            if let Ok(mut dq) = self.cdic.audio.dvc_queue.lock() {
-                self.cdic.audio.dvc_rate.store(self.dvc.audio_sample_rate, std::sync::atomic::Ordering::Relaxed);
-                let max_samples = self.dvc.audio_sample_rate as usize;
-                let add_len = self.dvc.audio_out.len();
-                let current_len = dq.len();
-                if current_len + add_len > max_samples {
-                    let overflow = (current_len + add_len) - max_samples;
-                    let to_drain = overflow.min(current_len);
-                    dq.drain(0..to_drain);
-                }
-                let vol = if self.cdic.audio.muted { 0.0 } else { self.cdic.audio.volume };
-                dq.extend(self.dvc.audio_out.drain(..).map(|(l, r)| (l * vol, r * vol)));
-            }
-        }
+        self.cdic.audio.pending_mpeg.extend(self.dvc.audio_out.drain(..));
         frame_done
     }
 
@@ -1606,5 +1589,5 @@ opencdi::impl_state!(CdiBus {
     mono4, sys_ram, dvc, cdic, dma, mcd212, nvram, slave, shared_in4_owner, scc_timer, scc_uart_cmd, scc_uart_tx_irq,
     current_pc, wait_cycles, current_line_cycle, emulate_wait_states, current_frame,
 } skip {
-    board, onchip_loud, mono4_bus_errors, rom, cdrom, uart_capture, dvc_audio_capture, trace_setup, watch_addr1, watch_addr2, watch_enabled, trace_fmv, taps, counters,
+    board, onchip_loud, mono4_bus_errors, rom, cdrom, uart_capture, trace_setup, watch_addr1, watch_addr2, watch_enabled, trace_fmv, taps, counters,
 });

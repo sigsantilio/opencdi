@@ -319,9 +319,7 @@ impl Cdic {
         if is_seek {
             self.audio.left_state.reset();
             self.audio.right_state.reset();
-            if let Ok(mut q) = self.audio.sample_queue.lock() {
-                q.clear();
-            }
+            self.audio.pending_main.clear();
         }
 
         info!(
