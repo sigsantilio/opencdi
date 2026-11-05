@@ -367,7 +367,7 @@ fn spill_to_temp(data: &[u8]) -> Result<PathBuf, String> {
 }
 
 fn fps(mode: VideoMode) -> f64 {
-    audio::field_rate(mode)
+    audio::frame_rate(mode)
 }
 
 fn region_of(mode: VideoMode) -> c_uint {
@@ -537,8 +537,7 @@ fn send_audio(core: &mut Core, batch: retro_audio_sample_batch_t) {
     let out = pacer.field(m.bus.mcd212.video_mode);
     let Some(f) = batch else { return };
     pcm.clear();
-    let to_i16 = |x: f32| (x.clamp(-1.0, 1.0) * 32767.0) as i16;
-    pcm.extend(out.iter().flat_map(|&(l, r)| [to_i16(l), to_i16(r)]));
+    pcm.extend(out.iter().flat_map(|&(l, r)| [opencdi::audio::to_i16(l), opencdi::audio::to_i16(r)]));
     let mut done = 0;
     let frames = pcm.len() / 2;
     while done < frames {

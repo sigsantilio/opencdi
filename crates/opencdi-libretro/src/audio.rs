@@ -1,25 +1,13 @@
 use opencdi::mcd212::VideoMode;
 use std::collections::VecDeque;
 
-pub type Frame = (f32, f32);
+pub use opencdi::audio::{Frame, OUT_RATE, frame_rate};
+use opencdi::audio::{OutputClock, Resampler, frame_cycles};
 
-// CD-i ADPCM output rate; 18900 Hz streams arrive already doubled.
-pub const OUT_RATE: u32 = 37800;
-const SECTORS_PER_SECOND: u64 = 75;
-const SAMPLES_PER_SECTOR: u64 = OUT_RATE as u64 / SECTORS_PER_SECOND;
 // Silence put in front of a stream that starts from empty, so sector-sized bursts never run dry (about 54 ms).
 pub const PREFILL: usize = 2048;
 // Most frames one channel may hold (about 0.43 s); the oldest are dropped beyond it.
 pub const FIFO_CAP: usize = 16384;
-
-pub fn frame_cycles(mode: VideoMode) -> u64 {
-    mode.total_scanlines() as u64 * mode.cycles_per_scanline() as u64
-}
-
-// Field rate on the CD sector clock (75 sectors per second), so one field of audio is exactly what the emulation produces.
-pub fn field_rate(mode: VideoMode) -> f64 {
-    (SECTORS_PER_SECOND * mode.cycles_per_sector() as u64) as f64 / frame_cycles(mode) as f64
-}
 
 // One audio stream at OUT_RATE between the emulation and the frontend.
 #[derive(Default)]
@@ -74,58 +62,13 @@ impl Channel {
 
 opencdi::impl_state!(Channel { fifo, primed } skip { restarts, dropped, frames_in });
 
-fn gcd(mut a: u32, mut b: u32) -> u32 {
-    while b != 0 {
-        (a, b) = (b, a % b);
-    }
-    a
-}
-
-// Linear interpolation to OUT_RATE with an exact rational step; plain f32 ops (no FMA), so results are the same on every IEEE-754 target.
-#[derive(Default)]
-pub struct Resampler {
-    rate: u32,
-    num: u32,
-    den: u32,
-    pos: u32,
-    prev: Frame,
-}
-
-impl Resampler {
-    pub fn set_rate(&mut self, rate: u32) {
-        if rate == 0 || rate == self.rate {
-            return;
-        }
-        let g = gcd(rate, OUT_RATE);
-        (self.rate, self.num, self.den, self.pos) = (rate, rate / g, OUT_RATE / g, 0);
-    }
-
-    pub fn process(&mut self, input: &[Frame], out: &mut Vec<Frame>) {
-        if self.den == 0 {
-            return;
-        }
-        let den = self.den as f32;
-        for &cur in input {
-            while self.pos < self.den {
-                let t = self.pos as f32 / den;
-                out.push((self.prev.0 + (cur.0 - self.prev.0) * t, self.prev.1 + (cur.1 - self.prev.1) * t));
-                self.pos += self.num;
-            }
-            self.pos -= self.den;
-            self.prev = cur;
-        }
-    }
-}
-
-opencdi::impl_state!(Resampler { rate, num, den, pos, prev } skip {});
-
 // Hands the frontend exactly one field of audio per retro_run: CDIC main and audio-map streams plus DVC MPEG audio resampled.
 pub struct Pacer {
     pub main: Channel,
     pub sfx: Channel,
     pub mpeg: Channel,
     resampler: Resampler,
-    rem: u64,
+    clock: OutputClock,
     scratch: Vec<Frame>,
     out: Vec<Frame>,
     pub frames_out: u64,
@@ -137,8 +80,8 @@ impl Pacer {
             main: Channel::new(),
             sfx: Channel::new(),
             mpeg: Channel::new(),
-            resampler: Resampler { rate: 0, num: 0, den: 0, pos: 0, prev: (0.0, 0.0) },
-            rem: 0,
+            resampler: Resampler::new(),
+            clock: OutputClock { rem: 0 },
             scratch: Vec::new(),
             out: Vec::new(),
             frames_out: 0,
@@ -149,13 +92,9 @@ impl Pacer {
         *self = Pacer::new();
     }
 
-    // Frames due this field: 504 per sector times the sectors the field lasts, remainder carried.
+    // Frames due this field: OUT_RATE / 75 per sector times the sectors the field lasts, remainder carried.
     fn field_len(&mut self, mode: VideoMode) -> usize {
-        self.rem += SAMPLES_PER_SECTOR * frame_cycles(mode);
-        let sector = mode.cycles_per_sector() as u64;
-        let n = self.rem / sector;
-        self.rem %= sector;
-        n as usize
+        self.clock.advance(frame_cycles(mode), mode.cycles_per_sector())
     }
 
     pub fn push_mpeg(&mut self, pcm: &[Frame], rate: u32) {
@@ -180,24 +119,12 @@ impl Pacer {
     }
 }
 
-opencdi::impl_state!(Pacer { main, sfx, mpeg, resampler, rem } skip { scratch, out, frames_out });
+opencdi::impl_state!(Pacer { main, sfx, mpeg, resampler, clock } skip { scratch, out, frames_out });
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use opencdi::savestate::{Reader, State};
-
-    #[test]
-    fn field_rate_and_lengths_follow_the_sector_clock() {
-        let mut p = Pacer::new();
-        let pal: usize = (0..1000).map(|_| p.field_len(VideoMode::Pal)).sum();
-        assert_eq!(pal, (504u64 * 299_520 * 1000 / 200_000) as usize);
-        assert!((field_rate(VideoMode::Pal) - 50.0801).abs() < 1e-4);
-        let mut p = Pacer::new();
-        let lens: Vec<usize> = (0..4).map(|_| p.field_len(VideoMode::Ntsc)).collect();
-        assert_eq!(lens, [629, 629, 630, 629]);
-        assert!((field_rate(VideoMode::Ntsc) - 60.0543).abs() < 1e-4);
-    }
 
     #[test]
     fn channel_prefills_pads_and_caps() {
@@ -211,33 +138,6 @@ mod tests {
         assert_eq!(out[PREFILL + 100], (0.0, 0.0));
         c.push(&[(0.25, 0.25); FIFO_CAP]);
         assert_eq!((c.len(), c.restarts, c.dropped), (FIFO_CAP, 2, PREFILL as u64));
-    }
-
-    // Counts rising zero crossings of the left channel.
-    fn crossings(s: &[Frame]) -> usize {
-        s.windows(2).filter(|w| w[0].0 < 0.0 && w[1].0 >= 0.0).count()
-    }
-
-    #[test]
-    fn resampler_keeps_pitch_for_mp2_rates() {
-        for rate in [32_000u32, 44_100, 48_000, 37_800] {
-            let tone = 1000.0f64;
-            let input: Vec<Frame> = (0..rate as usize * 2)
-                .map(|i| {
-                    let v = (2.0 * std::f64::consts::PI * tone * (i as f64 + 0.25) / rate as f64).sin() as f32;
-                    (v, v)
-                })
-                .collect();
-            let mut r = Resampler::default();
-            r.set_rate(rate);
-            let mut out = Vec::new();
-            for chunk in input.chunks(1152) {
-                r.process(chunk, &mut out);
-            }
-            let want = OUT_RATE as usize * 2;
-            assert!(out.len().abs_diff(want) <= 1, "{} Hz: {} frames, want {}", rate, out.len(), want);
-            assert!(crossings(&out[..OUT_RATE as usize]).abs_diff(1000) <= 1, "{} Hz: {} crossings", rate, crossings(&out[..OUT_RATE as usize]));
-        }
     }
 
     #[test]

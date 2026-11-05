@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, Ordering};
 use log::{info, warn, error};
+use crate::mcd212::VideoMode;
 #[cfg(feature = "host")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -63,6 +64,88 @@ impl Upsampler {
             out.push(b);
             out.push((mid(a.0, b.0, c.0, d.0), mid(a.1, b.1, c.1, d.1)));
             self.hist = [b, c, d];
+        }
+    }
+}
+
+pub type Frame = (f32, f32);
+
+// Rate of the emulated audio output; 18.9 kHz ADPCM arrives already doubled.
+pub const OUT_RATE: u32 = 37_800;
+const SECTORS_PER_SECOND: u64 = 75;
+
+pub fn frame_cycles(mode: VideoMode) -> u64 {
+    mode.total_scanlines() as u64 * mode.cycles_per_scanline() as u64
+}
+
+// Video frame rate on the CD sector clock (75 sectors per second), so one frame of audio is exactly what the emulation produces.
+pub fn frame_rate(mode: VideoMode) -> f64 {
+    (SECTORS_PER_SECOND * mode.cycles_per_sector() as u64) as f64 / frame_cycles(mode) as f64
+}
+
+// Hard clip at full scale, then scale to 16 bits.
+pub fn to_i16(x: f32) -> i16 {
+    (x.clamp(-1.0, 1.0) * 32767.0) as i16
+}
+
+// Output frames due for the cycles ticked: OUT_RATE / 75 per sector period, remainder carried.
+#[derive(Default, Clone, Copy, PartialEq, Debug)]
+pub struct OutputClock {
+    pub rem: u64,
+}
+
+impl OutputClock {
+    pub fn advance(&mut self, cycles: u64, sector_cycles: u32) -> usize {
+        self.rem += (OUT_RATE as u64 / SECTORS_PER_SECOND) * cycles;
+        let n = self.rem / sector_cycles as u64;
+        self.rem %= sector_cycles as u64;
+        n as usize
+    }
+}
+
+fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+// Linear interpolation to OUT_RATE with an exact rational step; plain f32 ops (no FMA), so results are the same on every IEEE-754 target.
+#[derive(Default, Clone, PartialEq, Debug)]
+pub struct Resampler {
+    rate: u32,
+    num: u32,
+    den: u32,
+    pos: u32,
+    prev: Frame,
+}
+
+impl Resampler {
+    pub const fn new() -> Self {
+        Resampler { rate: 0, num: 0, den: 0, pos: 0, prev: (0.0, 0.0) }
+    }
+
+    pub fn set_rate(&mut self, rate: u32) {
+        if rate == 0 || rate == self.rate {
+            return;
+        }
+        let g = gcd(rate, OUT_RATE);
+        (self.rate, self.num, self.den, self.pos) = (rate, rate / g, OUT_RATE / g, 0);
+    }
+
+    pub fn process(&mut self, input: &[Frame], out: &mut Vec<Frame>) {
+        if self.den == 0 {
+            return;
+        }
+        let den = self.den as f32;
+        for &cur in input {
+            while self.pos < self.den {
+                let t = self.pos as f32 / den;
+                out.push((self.prev.0 + (cur.0 - self.prev.0) * t, self.prev.1 + (cur.1 - self.prev.1) * t));
+                self.pos += self.num;
+            }
+            self.pos -= self.den;
+            self.prev = cur;
         }
     }
 }
@@ -619,6 +702,8 @@ impl HostAudioOutput {
 }
 
 opencdi::impl_state!(ChannelState { s0, s1 } skip {});
+opencdi::impl_state!(OutputClock { rem } skip {});
+opencdi::impl_state!(Resampler { rate, num, den, pos, prev } skip {});
 
 // Host queues are not state (the frontend drains them every frame); volume and mute are host settings.
 impl opencdi::savestate::State for CdiAudio {
@@ -699,5 +784,49 @@ mod tests {
         assert_eq!((out[4], out[6]), ((1.0, -1.0), (2.0, -2.0)));
         assert_eq!(out[5], (1.5, -1.5));
         assert_eq!(up.hist, [x[1], x[2], x[3]]);
+    }
+
+    #[test]
+    fn frame_rate_and_lengths_follow_the_sector_clock() {
+        let mut c = OutputClock::default();
+        let pal: usize = (0..1000).map(|_| c.advance(frame_cycles(VideoMode::Pal), VideoMode::Pal.cycles_per_sector())).sum();
+        assert_eq!(pal, (504u64 * 299_520 * 1000 / 200_000) as usize);
+        assert!((frame_rate(VideoMode::Pal) - 50.0801).abs() < 1e-4);
+        let mut c = OutputClock::default();
+        let lens: Vec<usize> = (0..4).map(|_| c.advance(frame_cycles(VideoMode::Ntsc), VideoMode::Ntsc.cycles_per_sector())).collect();
+        assert_eq!(lens, [629, 629, 630, 629]);
+        assert!((frame_rate(VideoMode::Ntsc) - 60.0543).abs() < 1e-4);
+    }
+
+    // Counts rising zero crossings of the left channel.
+    fn crossings(s: &[Frame]) -> usize {
+        s.windows(2).filter(|w| w[0].0 < 0.0 && w[1].0 >= 0.0).count()
+    }
+
+    #[test]
+    fn resampler_keeps_pitch_for_mp2_rates() {
+        for rate in [32_000u32, 44_100, 48_000, 37_800] {
+            let tone = 1000.0f64;
+            let input: Vec<Frame> = (0..rate as usize * 2)
+                .map(|i| {
+                    let v = (2.0 * std::f64::consts::PI * tone * (i as f64 + 0.25) / rate as f64).sin() as f32;
+                    (v, v)
+                })
+                .collect();
+            let mut r = Resampler::default();
+            r.set_rate(rate);
+            let mut out = Vec::new();
+            for chunk in input.chunks(1152) {
+                r.process(chunk, &mut out);
+            }
+            let want = OUT_RATE as usize * 2;
+            assert!(out.len().abs_diff(want) <= 1, "{} Hz: {} frames, want {}", rate, out.len(), want);
+            assert!(crossings(&out[..OUT_RATE as usize]).abs_diff(1000) <= 1, "{} Hz: {} crossings", rate, crossings(&out[..OUT_RATE as usize]));
+        }
+    }
+
+    #[test]
+    fn to_i16_clips_hard() {
+        assert_eq!((to_i16(2.0), to_i16(-2.0), to_i16(0.5)), (32767, -32767, 16383));
     }
 }
