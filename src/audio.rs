@@ -205,6 +205,12 @@ impl Stream {
         self.fifo.len()
     }
 
+    // Drops the unplayed frames; the next push starts the stream again.
+    pub fn clear(&mut self) {
+        self.fifo.clear();
+        self.primed = false;
+    }
+
     pub fn is_empty(&self) -> bool {
         self.fifo.is_empty()
     }
