@@ -19,6 +19,9 @@ pub const REG_DMACTL: u32 = 0x42;
 pub const REG_ID: u32 = 0x44;
 pub const REG_TEST: u32 = 0x46;
 pub const REG_TACS: u32 = 0x08;
+pub const REG_TCM1: u32 = 0x0C;
+pub const REG_ACM2: u32 = 0x10;
+pub const REG_FILE: u32 = 0x12;
 pub const REG_ATT_LEFT: u32 = 0x20;
 pub const REG_ATT_RIGHT: u32 = 0x22;
 /// Left-to-left and right-to-right open, the cross paths muted.
@@ -85,6 +88,7 @@ pub struct Ciap {
     pub audio_coding: [u8; 2], // coding captured from ASHDW when the CPU queued each buffer
     pub event_armed: bool, // APCR 0x20 written while a buffer was queued
     pub asel: bool, // CCR 0x0008: chip plays audio sectors of the TACS channels until CCR 0x0100
+    pub selecting: bool, // file and channel selection, in effect from the second sector after CCR 0x0008
     pub audio_buffers: u64,
     pub audio_sectors: u64,
     pub audio_overlap: u64, // TACS sectors played while CPU-fed playback ran
@@ -107,7 +111,7 @@ pub struct Ciap {
 
 impl Default for Ciap {
     fn default() -> Self {
-        Self { ram: vec![0; WINDOW_SIZE], regs: power_on_regs(), running: false, q_mode: false, lba: 0, drive_active: false, audio_playing: false, audio_wait: 0, audio_next: 0, audio_coding: [0; 2], event_armed: false, asel: false, audio_buffers: 0, audio_sectors: 0, audio_overlap: 0, toc: false, toc_index: 0, start_delay: 0, drive_stopped: false, cycles: 0, dma_request: None, seeks: 0, sectors: 0, skipped: 0, dmas: 0, byteswap: false, descrambled: 0, q_reports: 0, loud: Loud::default(), trace: false }
+        Self { ram: vec![0; WINDOW_SIZE], regs: power_on_regs(), running: false, q_mode: false, lba: 0, drive_active: false, audio_playing: false, audio_wait: 0, audio_next: 0, audio_coding: [0; 2], event_armed: false, asel: false, selecting: false, audio_buffers: 0, audio_sectors: 0, audio_overlap: 0, toc: false, toc_index: 0, start_delay: 0, drive_stopped: false, cycles: 0, dma_request: None, seeks: 0, sectors: 0, skipped: 0, dmas: 0, byteswap: false, descrambled: 0, q_reports: 0, loud: Loud::default(), trace: false }
     }
 }
 
@@ -131,7 +135,7 @@ impl Ciap {
         (self.running, self.q_mode, self.lba, self.drive_active) = (false, false, 0, false);
         (self.start_delay, self.drive_stopped, self.toc, self.toc_index) = (0, false, false, 0);
         (self.dma_request, self.cycles) = (None, 0);
-        (self.audio_playing, self.audio_wait, self.audio_next, self.audio_coding, self.asel) = (false, 0, 0, [0; 2], false);
+        (self.audio_playing, self.audio_wait, self.audio_next, self.audio_coding, self.asel, self.selecting) = (false, 0, 0, [0; 2], false, false);
         self.event_armed = false;
     }
 
@@ -406,10 +410,18 @@ impl Ciap {
             return;
         }
         self.repair(lba, &mut raw);
+        let (file, channel, submode) = (raw[16], raw[17], raw[18]);
+        let selecting = std::mem::replace(&mut self.selecting, self.asel);
+        if selecting && !self.selected(file, channel, submode) {
+            self.skipped += 1;
+            if self.trace {
+                eprintln!("CIAP SECTOR {} file {} channel {} submode {:02X} not selected", lba, file, channel, submode);
+            }
+            return;
+        }
         if self.q_mode {
             self.q_locator(cd, lba);
         }
-        let (file, channel, submode) = (raw[16], raw[17], raw[18]);
         // Form 2 audio on a TACS channel, with selection on, is played by the chip as it passes.
         if self.tacs_selected(submode, channel) {
             let coding = raw[23];
@@ -481,6 +493,13 @@ impl Ciap {
         }
     }
 
+    // Selected: file match, and for data, audio and video sectors (end markers among them too) the channel in the mask, or audio on a TACS channel.
+    fn selected(&self, file: u8, channel: u8, submode: u8) -> bool {
+        let mask = self.reg(REG_TCM1) as u32 | (self.reg(REG_ACM2) as u32) << 16;
+        let tacs = submode & 0x24 == 0x24 && self.reg(REG_TACS) & (1 << (channel & 15)) != 0;
+        file as u16 == self.reg(REG_FILE) & 0xFF && (submode & 0x0E == 0 || mask & (1 << (channel & 31)) != 0 || tacs)
+    }
+
     // Selection on, Form 2 audio submode, channel in TACS.
     fn tacs_selected(&self, submode: u8, channel: u8) -> bool {
         self.asel && submode & 0x24 == 0x24 && self.reg(REG_TACS) & (1 << (channel & 15)) != 0
@@ -527,7 +546,7 @@ impl Ciap {
         match v {
             0x0094 => (self.running, self.q_mode) = (true, true),
             0x00C4 => (self.running, self.q_mode) = (true, false),
-            0x0100 => (self.running, self.q_mode, self.asel) = (false, false, false),
+            0x0100 => (self.running, self.q_mode, self.asel, self.selecting) = (false, false, false, false),
             0x0044 => (self.running, self.q_mode) = (true, true),
             0x0080 => self.running = true,
             0x0010 => self.q_mode = true,
@@ -552,7 +571,7 @@ impl Ciap {
     }
 }
 
-opencdi::impl_state!(Ciap { ram, regs, running, q_mode, lba, drive_active, audio_playing, audio_wait, audio_next, audio_coding, event_armed, asel, toc, toc_index, start_delay, cycles, byteswap } skip { descrambled, q_reports, audio_buffers, audio_sectors, audio_overlap, drive_stopped, dma_request, seeks, sectors, skipped, dmas, loud, trace });
+opencdi::impl_state!(Ciap { ram, regs, running, q_mode, lba, drive_active, audio_playing, audio_wait, audio_next, audio_coding, event_armed, asel, selecting, toc, toc_index, start_delay, cycles, byteswap } skip { descrambled, q_reports, audio_buffers, audio_sectors, audio_overlap, drive_stopped, dma_request, seeks, sectors, skipped, dmas, loud, trace });
 
 #[cfg(test)]
 mod tests {
@@ -766,5 +785,23 @@ mod tests {
         assert_eq!(c.peek_reg(REG_BMAN) & 0x03, 0x01);
         c.reset();
         assert_eq!(c.peek_reg(REG_BMAN), BMAN_RESET);
+    }
+
+    #[test]
+    fn selection_needs_the_file_and_for_typed_sectors_the_channel() {
+        let mut c = Ciap::default();
+        c.write_reg(REG_FILE, 1, 0);
+        c.write_reg(REG_TCM1, 0x8000, 0);
+        c.write_reg(REG_ACM2, 0x0000, 0);
+        assert!(c.selected(1, 15, 0x64) && c.selected(1, 15, 0x65) && !c.selected(0, 15, 0x64));
+        // Another channel's end of record is not selected; a sector without type bits needs only the file.
+        assert!(!c.selected(1, 12, 0x65) && c.selected(1, 12, 0x60));
+        // Audio on a TACS channel outside the data mask still reaches the audio path.
+        c.write_reg(REG_TACS, 0x1000, 0);
+        assert!(c.selected(1, 12, 0x64) && !c.selected(1, 12, 0x48));
+        c.write_reg(REG_CCR, 0x0008, 0);
+        c.selecting = true;
+        c.write_reg(REG_CCR, 0x0100, 0);
+        assert!(!c.asel && !c.selecting);
     }
 }
