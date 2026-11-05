@@ -720,8 +720,8 @@ fn unload() {
     if let Some(m) = core.machine.as_ref() {
         let a = &m.bus.cdic.audio;
         log(RETRO_LOG_INFO, &format!(
-            "audio: {} frames sent; received main={} sfx={} mpeg={}; prefill restarts main={} sfx={} mpeg={}; dropped main={} sfx={} mpeg={}",
-            core.frames_out, a.main.frames_in, a.sfx.frames_in, a.mpeg.frames_in, a.main.restarts, a.sfx.restarts, a.mpeg.restarts, a.main.dropped, a.sfx.dropped, a.mpeg.dropped
+            "audio: {} frames sent; received main={} sfx={} mpeg={}; prefill restarts main={} sfx={} mpeg={}; hold warnings main={} sfx={} mpeg={}",
+            core.frames_out, a.main.frames_in, a.sfx.frames_in, a.mpeg.frames_in, a.main.restarts, a.sfx.restarts, a.mpeg.restarts, a.main.warnings, a.sfx.warnings, a.mpeg.warnings
         ));
     }
     core.machine = None;

@@ -154,23 +154,23 @@ impl Resampler {
 
 // Silence put in front of a stream that starts from empty, so sector-sized bursts never run dry (about 54 ms).
 pub const PREFILL: usize = 2048;
-// Most frames one stream may hold (about 0.43 s); the oldest are dropped beyond it.
-pub const FIFO_CAP: usize = 16384;
-// Most decoded ADPCM frames held between two output frames; the oldest are dropped beyond it.
-const PENDING_CAP: usize = 37800 / 4;
+// An MPEG stream holding more than this (two seconds) is reported; nothing is dropped.
+const MPEG_WARN: usize = 2 * OUT_RATE as usize;
 
 // One stream of the output mix at OUT_RATE.
 #[derive(Default, Clone, PartialEq, Debug)]
 pub struct Stream {
     fifo: VecDeque<Frame>,
     primed: bool,
+    warned: bool,
     pub restarts: u64,
-    pub dropped: u64,
+    pub warnings: u64,
     pub frames_in: u64,
 }
 
 impl Stream {
-    pub fn push(&mut self, src: &[Frame]) {
+    // Queues `src`; holding more than `bound` frames is reported once per stream start (`what` names stream and level).
+    pub fn push(&mut self, src: &[Frame], bound: usize, what: &dyn Fn() -> String) {
         if src.is_empty() {
             return;
         }
@@ -178,13 +178,14 @@ impl Stream {
         if !self.primed {
             self.fifo.resize(self.fifo.len() + PREFILL, (0.0, 0.0));
             self.primed = true;
+            self.warned = false;
             self.restarts += 1;
         }
         self.fifo.extend(src.iter().copied());
-        if self.fifo.len() > FIFO_CAP {
-            let n = self.fifo.len() - FIFO_CAP;
-            self.fifo.drain(..n);
-            self.dropped += n as u64;
+        if self.fifo.len() > bound && !self.warned {
+            self.warned = true;
+            self.warnings += 1;
+            eprintln!("audio: {} stream holds {} frames, more than {}", what(), self.fifo.len(), bound);
         }
     }
 
@@ -209,12 +210,25 @@ impl Stream {
     }
 }
 
-fn push_capped(q: &mut Vec<Frame>, samples: &[Frame]) {
-    if q.len() + samples.len() > PENDING_CAP {
-        let n = (q.len() + samples.len() - PENDING_CAP).min(q.len());
-        q.drain(..n);
+// Coding of the last ADPCM sector a stream received: output frames per sector and the level, for the hold bound.
+#[derive(Default, Clone, Copy, PartialEq, Debug)]
+pub struct SectorKind {
+    pub frames: usize,
+    pub is_8bit: bool,
+    pub is_stereo: bool,
+    pub rate: u32,
+}
+
+impl SectorKind {
+    // Start latency plus one playing and one waiting sector.
+    fn bound(&self) -> usize {
+        PREFILL + 2 * self.frames
     }
-    q.extend_from_slice(samples);
+
+    fn level(&self) -> String {
+        let level = if self.is_8bit { "A" } else if self.rate == 18900 { "C" } else { "B" };
+        format!("level {} {}", level, if self.is_stereo { "stereo" } else { "mono" })
+    }
 }
 
 // The board's audio output: decoders and the DVC feed three streams, mixed once per video frame at OUT_RATE.
@@ -236,6 +250,8 @@ pub struct CdiAudio {
     pub main: Stream,
     pub sfx: Stream,
     pub mpeg: Stream,
+    main_kind: SectorKind,
+    sfx_kind: SectorKind,
     resampler: Resampler,
     clock: OutputClock,
     due: usize,
@@ -267,6 +283,8 @@ impl CdiAudio {
             main: Stream::default(),
             sfx: Stream::default(),
             mpeg: Stream::default(),
+            main_kind: SectorKind::default(),
+            sfx_kind: SectorKind::default(),
             resampler: Resampler::new(),
             clock: OutputClock::default(),
             due: 0,
@@ -296,16 +314,17 @@ impl CdiAudio {
 
     // Moves the frame's decoded audio into the streams and mixes the frames due; `dvc_rate` is the DVC PCM rate.
     pub fn end_frame(&mut self, dvc_rate: u32) {
-        self.main.push(&self.pending_main);
+        let (mk, sk) = (self.main_kind, self.sfx_kind);
+        self.main.push(&self.pending_main, mk.bound(), &|| format!("main {}", mk.level()));
         self.pending_main.clear();
-        self.sfx.push(&self.pending_sfx);
+        self.sfx.push(&self.pending_sfx, sk.bound(), &|| format!("sfx {}", sk.level()));
         self.pending_sfx.clear();
         if !self.pending_mpeg.is_empty() {
             self.resampler.set_rate(dvc_rate);
             self.scratch.clear();
             self.resampler.process(&self.pending_mpeg, &mut self.scratch);
             self.pending_mpeg.clear();
-            self.mpeg.push(&self.scratch);
+            self.mpeg.push(&self.scratch, MPEG_WARN, &|| format!("mpeg {} Hz", dvc_rate));
         }
         let start = self.out.len();
         self.out.resize(start + std::mem::take(&mut self.due), (0.0, 0.0));
@@ -481,7 +500,8 @@ impl CdiAudio {
         let final_samples = Self::upsample_if_needed(&mut self.upsampler, samples, sample_rate);
         let final_samples = self.apply_matrix(final_samples);
 
-        push_capped(&mut self.pending_main, &final_samples);
+        self.main_kind = SectorKind { frames: final_samples.len(), is_8bit, is_stereo, rate: sample_rate };
+        self.pending_main.extend_from_slice(&final_samples);
     }
 
     pub fn decode_audio_map_sector(&mut self, payload: &[u8], is_stereo: bool, is_8bit: bool, sample_rate: u32) {
@@ -502,7 +522,8 @@ impl CdiAudio {
         let final_samples = Self::upsample_if_needed(&mut self.map_upsampler, samples, sample_rate);
         let final_samples = self.apply_matrix(final_samples);
 
-        push_capped(&mut self.pending_sfx, &final_samples);
+        self.sfx_kind = SectorKind { frames: final_samples.len(), is_8bit, is_stereo, rate: sample_rate };
+        self.pending_sfx.extend_from_slice(&final_samples);
     }
 }
 
@@ -679,11 +700,11 @@ opencdi::impl_state!(ChannelState { s0, s1 } skip {});
 opencdi::impl_state!(OutputClock { rem } skip {});
 opencdi::impl_state!(Resampler { rate, num, den, pos, prev } skip {});
 
-opencdi::impl_state!(Stream { fifo, primed } skip { restarts, dropped, frames_in });
+opencdi::impl_state!(Stream { fifo, primed } skip { warned, restarts, warnings, frames_in });
 
 impl opencdi::savestate::State for CdiAudio {
     fn save(&self, w: &mut Vec<u8>) {
-        let Self { left_state, right_state, map_left_state, map_right_state, upsampler, map_upsampler, attenuation, matrix: _, total_sectors_decoded, pending_main, pending_sfx, pending_mpeg, main, sfx, mpeg, resampler, clock, due, out, scratch: _ } = self;
+        let Self { left_state, right_state, map_left_state, map_right_state, upsampler, map_upsampler, attenuation, matrix: _, total_sectors_decoded, pending_main, pending_sfx, pending_mpeg, main, sfx, mpeg, main_kind: _, sfx_kind: _, resampler, clock, due, out, scratch: _ } = self;
         for s in [left_state, right_state, map_left_state, map_right_state] {
             s.save(w);
         }
@@ -704,7 +725,7 @@ impl opencdi::savestate::State for CdiAudio {
     }
 
     fn load(&mut self, r: &mut opencdi::savestate::Reader) -> Result<(), opencdi::savestate::StateError> {
-        let Self { left_state, right_state, map_left_state, map_right_state, upsampler, map_upsampler, attenuation, matrix: _, total_sectors_decoded, pending_main, pending_sfx, pending_mpeg, main, sfx, mpeg, resampler, clock, due, out, scratch: _ } = self;
+        let Self { left_state, right_state, map_left_state, map_right_state, upsampler, map_upsampler, attenuation, matrix: _, total_sectors_decoded, pending_main, pending_sfx, pending_mpeg, main, sfx, mpeg, main_kind: _, sfx_kind: _, resampler, clock, due, out, scratch: _ } = self;
         for s in [left_state, right_state, map_left_state, map_right_state] {
             s.load(r)?;
         }
@@ -816,17 +837,19 @@ mod tests {
     }
 
     #[test]
-    fn stream_prefills_pads_and_caps() {
+    fn stream_prefills_pads_and_warns() {
         let mut c = Stream::default();
-        c.push(&[(0.5, 0.5); 100]);
+        let what = || "test".to_string();
+        c.push(&[(0.5, 0.5); 100], usize::MAX, &what);
         assert_eq!(c.len(), PREFILL + 100);
         let mut out = vec![(0.0, 0.0); PREFILL + 150];
         c.mix_into(&mut out);
         assert_eq!(out[PREFILL - 1], (0.0, 0.0));
         assert_eq!(out[PREFILL], (0.5, 0.5));
         assert_eq!(out[PREFILL + 100], (0.0, 0.0));
-        c.push(&[(0.25, 0.25); FIFO_CAP]);
-        assert_eq!((c.len(), c.restarts, c.dropped), (FIFO_CAP, 2, PREFILL as u64));
+        c.push(&[(0.25, 0.25); 3000], PREFILL + 2000, &what);
+        c.push(&[(0.25, 0.25); 10], PREFILL + 2000, &what);
+        assert_eq!((c.len(), c.restarts, c.warnings), (PREFILL + 3010, 2, 1));
     }
 
     #[test]

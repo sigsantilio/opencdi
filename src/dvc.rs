@@ -1239,11 +1239,7 @@ impl Dvc {
                 self.or_fma_word(FMA_ISR, 0x0004);
                 self.fma_decoded_since_play += self.mp2.pcm.len() as u64;
                 self.extend_playout(self.mp2.pcm.len());
-                while let Some(sample) = self.mp2.pcm.pop_front() {
-                    if self.audio_out.len() < 32 * 1024 {
-                        self.audio_out.push_back(sample);
-                    }
-                }
+                self.audio_out.extend(self.mp2.pcm.drain(..));
             }
         }
 
@@ -1257,11 +1253,7 @@ impl Dvc {
                 self.or_fma_word(FMA_ISR, 0x0004);
                 self.fma_decoded_since_play += self.mp2.pcm.len() as u64;
                 self.extend_playout(self.mp2.pcm.len());
-                while let Some(sample) = self.mp2.pcm.pop_front() {
-                    if self.audio_out.len() < 32 * 1024 {
-                        self.audio_out.push_back(sample);
-                    }
-                }
+                self.audio_out.extend(self.mp2.pcm.drain(..));
             }
         }
 
