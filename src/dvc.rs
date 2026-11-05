@@ -449,6 +449,8 @@ pub struct Dvc {
     pub mp2: Mp2Decoder,
     pub audio_sample_rate: u32,
     pub audio_out: VecDeque<(f32, f32)>,
+    // Set by an FMA stop or stream reset; the bus clears the unplayed output audio in the same line.
+    pub audio_stopped: bool,
 
     pub video_decoder: Option<Video>,
     pub video_width: usize,
@@ -525,6 +527,7 @@ impl Dvc {
             mp2: Mp2Decoder::default(),
             audio_sample_rate: 44_100,
             audio_out: VecDeque::with_capacity(16 * 1024),
+            audio_stopped: false,
 
             video_decoder: None,
             video_width: 352,
@@ -582,6 +585,7 @@ impl Dvc {
         self.fma_demux.clear();
         self.mp2.reset();
         self.audio_out.clear();
+        self.audio_stopped = true;
         self.video_decoder = None;
         self.frames_decoded_count = 0;
         self.frames_presented_count = 0;
@@ -932,6 +936,8 @@ impl Dvc {
                     self.fma_stream_fifo.clear();
                     self.fma_demux.clear();
                     self.mp2.reset();
+                    self.audio_out.clear();
+                    self.audio_stopped = true;
                     self.fma_decoded_since_play = 0;
                     self.fma_playout_end = 0;
                     self.set_fma_word(0x02, 0x0200);
