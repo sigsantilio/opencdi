@@ -409,7 +409,7 @@ impl CdiBus {
             self.dvc.vsync_hz = if self.mcd212.video_mode == crate::mcd212::VideoMode::Pal { 50.0 } else { 60.0 };
             self.dvc.on_vsync();
         }
-        self.cdic.audio.pending_mpeg.extend(self.dvc.audio_out.drain(..));
+        self.cdic.audio.push_mpeg(&mut self.dvc.audio_out, self.dvc.audio_sample_rate);
         frame_done
     }
 

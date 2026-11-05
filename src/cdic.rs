@@ -319,7 +319,6 @@ impl Cdic {
         if is_seek {
             self.audio.left_state.reset();
             self.audio.right_state.reset();
-            self.audio.pending_main.clear();
             self.audio.main.clear();
         }
 

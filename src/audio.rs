@@ -237,7 +237,7 @@ impl SectorKind {
     }
 }
 
-// The board's audio output: decoders and the DVC feed three streams, mixed once per video frame at OUT_RATE.
+// The board's audio output: decoders and the DVC feed three streams, mixed at OUT_RATE as the board is ticked.
 pub struct CdiAudio {
     pub left_state: ChannelState,
     pub right_state: ChannelState,
@@ -249,18 +249,12 @@ pub struct CdiAudio {
     /// Gains left-to-left, left-to-right, right-to-right, right-to-left; None passes the stereo pair unchanged.
     pub matrix: Option<[f32; 4]>,
     pub total_sectors_decoded: u64,
-    // Decoded since the last mix: ADPCM disc or CPU-fed, audio map or TACS, DVC PCM at its own rate.
-    pub pending_main: Vec<Frame>,
-    pub pending_sfx: Vec<Frame>,
-    pub pending_mpeg: Vec<Frame>,
+    // ADPCM disc or CPU-fed, audio map or TACS, DVC MPEG audio.
     pub main: Stream,
     pub sfx: Stream,
     pub mpeg: Stream,
-    main_kind: SectorKind,
-    sfx_kind: SectorKind,
     resampler: Resampler,
     clock: OutputClock,
-    due: usize,
     out: Vec<Frame>,
     scratch: Vec<Frame>,
 }
@@ -283,23 +277,17 @@ impl CdiAudio {
             attenuation: [0xFF, 0, 0xFF, 0],
             matrix: None,
             total_sectors_decoded: 0,
-            pending_main: Vec::new(),
-            pending_sfx: Vec::new(),
-            pending_mpeg: Vec::new(),
             main: Stream::default(),
             sfx: Stream::default(),
             mpeg: Stream::default(),
-            main_kind: SectorKind::default(),
-            sfx_kind: SectorKind::default(),
             resampler: Resampler::new(),
             clock: OutputClock::default(),
-            due: 0,
             out: Vec::new(),
             scratch: Vec::new(),
         }
     }
 
-    // Player reset: decoders and undelivered samples go; what the output already holds plays on.
+    // Player reset: the decoders restart; what the streams already hold plays on.
     pub fn reset(&mut self) {
         self.left_state.reset();
         self.right_state.reset();
@@ -308,36 +296,31 @@ impl CdiAudio {
         self.upsampler = Upsampler::default();
         self.map_upsampler = Upsampler::default();
         self.attenuation = [0xFF, 0, 0xFF, 0];
-        self.pending_main.clear();
-        self.pending_sfx.clear();
-        self.pending_mpeg.clear();
     }
 
-    // Counts the output frames due for `cycles` of board time.
+    // Mixes the output frames that fall in `cycles` of board time.
     pub fn advance(&mut self, cycles: u32, sector_cycles: u32) {
-        self.due += self.clock.advance(cycles as u64, sector_cycles);
+        let n = self.clock.advance(cycles as u64, sector_cycles);
+        let start = self.out.len();
+        self.out.resize(start + n, (0.0, 0.0));
+        let frames = &mut self.out[start..];
+        self.main.mix_into(frames);
+        self.sfx.mix_into(frames);
+        self.mpeg.mix_into(frames);
     }
 
-    // Moves the frame's decoded audio into the streams and mixes the frames due; `dvc_rate` is the DVC PCM rate.
-    pub fn end_frame(&mut self, dvc_rate: u32) {
-        let (mk, sk) = (self.main_kind, self.sfx_kind);
-        self.main.push(&self.pending_main, mk.bound(), &|| format!("main {}", mk.level()));
-        self.pending_main.clear();
-        self.sfx.push(&self.pending_sfx, sk.bound(), &|| format!("sfx {}", sk.level()));
-        self.pending_sfx.clear();
-        if !self.pending_mpeg.is_empty() {
-            self.resampler.set_rate(dvc_rate);
-            self.scratch.clear();
-            self.resampler.process(&self.pending_mpeg, &mut self.scratch);
-            self.pending_mpeg.clear();
-            self.mpeg.push(&self.scratch, MPEG_WARN, &|| format!("mpeg {} Hz", dvc_rate));
+    // Queues decoded DVC PCM, resampled from `rate` to OUT_RATE.
+    pub fn push_mpeg(&mut self, pcm: &mut VecDeque<Frame>, rate: u32) {
+        if pcm.is_empty() {
+            return;
         }
-        let start = self.out.len();
-        self.out.resize(start + std::mem::take(&mut self.due), (0.0, 0.0));
-        let frame = &mut self.out[start..];
-        self.main.mix_into(frame);
-        self.sfx.mix_into(frame);
-        self.mpeg.mix_into(frame);
+        self.resampler.set_rate(rate);
+        self.scratch.clear();
+        let (a, b) = pcm.as_slices();
+        self.resampler.process(a, &mut self.scratch);
+        self.resampler.process(b, &mut self.scratch);
+        pcm.clear();
+        self.mpeg.push(&self.scratch, MPEG_WARN, &|| format!("mpeg {} Hz", rate));
     }
 
     // Appends the mixed frames made since the last call; returns how many.
@@ -506,8 +489,8 @@ impl CdiAudio {
         let final_samples = Self::upsample_if_needed(&mut self.upsampler, samples, sample_rate);
         let final_samples = self.apply_matrix(final_samples);
 
-        self.main_kind = SectorKind { frames: final_samples.len(), is_8bit, is_stereo, rate: sample_rate };
-        self.pending_main.extend_from_slice(&final_samples);
+        let k = SectorKind { frames: final_samples.len(), is_8bit, is_stereo, rate: sample_rate };
+        self.main.push(&final_samples, k.bound(), &|| format!("main {}", k.level()));
     }
 
     pub fn decode_audio_map_sector(&mut self, payload: &[u8], is_stereo: bool, is_8bit: bool, sample_rate: u32) {
@@ -528,8 +511,8 @@ impl CdiAudio {
         let final_samples = Self::upsample_if_needed(&mut self.map_upsampler, samples, sample_rate);
         let final_samples = self.apply_matrix(final_samples);
 
-        self.sfx_kind = SectorKind { frames: final_samples.len(), is_8bit, is_stereo, rate: sample_rate };
-        self.pending_sfx.extend_from_slice(&final_samples);
+        let k = SectorKind { frames: final_samples.len(), is_8bit, is_stereo, rate: sample_rate };
+        self.sfx.push(&final_samples, k.bound(), &|| format!("sfx {}", k.level()));
     }
 }
 
@@ -710,7 +693,7 @@ opencdi::impl_state!(Stream { fifo, primed } skip { warned, restarts, warnings, 
 
 impl opencdi::savestate::State for CdiAudio {
     fn save(&self, w: &mut Vec<u8>) {
-        let Self { left_state, right_state, map_left_state, map_right_state, upsampler, map_upsampler, attenuation, matrix: _, total_sectors_decoded, pending_main, pending_sfx, pending_mpeg, main, sfx, mpeg, main_kind: _, sfx_kind: _, resampler, clock, due, out, scratch: _ } = self;
+        let Self { left_state, right_state, map_left_state, map_right_state, upsampler, map_upsampler, attenuation, matrix: _, total_sectors_decoded, main, sfx, mpeg, resampler, clock, out, scratch: _ } = self;
         for s in [left_state, right_state, map_left_state, map_right_state] {
             s.save(w);
         }
@@ -718,20 +701,16 @@ impl opencdi::savestate::State for CdiAudio {
         total_sectors_decoded.save(w);
         upsampler.hist.save(w);
         map_upsampler.hist.save(w);
-        for q in [pending_main, pending_sfx, pending_mpeg] {
-            q.save(w);
-        }
         for s in [main, sfx, mpeg] {
             s.save(w);
         }
         resampler.save(w);
         clock.save(w);
-        (*due as u64).save(w);
         out.save(w);
     }
 
     fn load(&mut self, r: &mut opencdi::savestate::Reader) -> Result<(), opencdi::savestate::StateError> {
-        let Self { left_state, right_state, map_left_state, map_right_state, upsampler, map_upsampler, attenuation, matrix: _, total_sectors_decoded, pending_main, pending_sfx, pending_mpeg, main, sfx, mpeg, main_kind: _, sfx_kind: _, resampler, clock, due, out, scratch: _ } = self;
+        let Self { left_state, right_state, map_left_state, map_right_state, upsampler, map_upsampler, attenuation, matrix: _, total_sectors_decoded, main, sfx, mpeg, resampler, clock, out, scratch: _ } = self;
         for s in [left_state, right_state, map_left_state, map_right_state] {
             s.load(r)?;
         }
@@ -739,17 +718,11 @@ impl opencdi::savestate::State for CdiAudio {
         total_sectors_decoded.load(r)?;
         upsampler.hist.load(r)?;
         map_upsampler.hist.load(r)?;
-        for q in [pending_main, pending_sfx, pending_mpeg] {
-            q.load(r)?;
-        }
         for s in [main, sfx, mpeg] {
             s.load(r)?;
         }
         resampler.load(r)?;
         clock.load(r)?;
-        let mut d = 0u64;
-        d.load(r)?;
-        *due = d as usize;
         out.load(r)?;
         Ok(())
     }
@@ -780,7 +753,9 @@ mod tests {
         }
         let mut a = CdiAudio::new();
         a.decode_sector(&payload, false, true, 37800);
-        let first = a.pending_main[0].0;
+        let mut out = vec![(0.0, 0.0); PREFILL + 1];
+        a.main.mix_into(&mut out);
+        let first = out[PREFILL].0;
         assert_eq!(first, 256.0 / 32768.0);
     }
 
@@ -863,12 +838,11 @@ mod tests {
         use opencdi::savestate::{Reader, State};
         let sector = VideoMode::Ntsc.cycles_per_sector();
         let run = |a: &mut CdiAudio, v: f32| {
-            a.pending_main.extend_from_slice(&[(v, -v); 700]);
-            a.pending_mpeg.extend_from_slice(&[(0.2, 0.3); 1152]);
+            a.main.push(&[(v, -v); 700], usize::MAX, &String::new);
+            a.push_mpeg(&mut VecDeque::from(vec![(0.2, 0.3); 1152]), 44_100);
             for _ in 0..262 {
                 a.advance(960, sector);
             }
-            a.end_frame(44_100);
         };
         let mut a = CdiAudio::new();
         run(&mut a, 0.1);

@@ -204,7 +204,6 @@ impl Machine {
 
             bus.tick_board(cyc_per_line);
         }
-        bus.cdic.audio.end_frame(bus.dvc.audio_sample_rate);
         bus.counters.end_frame();
         // A double fault parks the CPU for good; say so once instead of idling silently.
         if cpu.is_halted() && !bus.counters.halted {
