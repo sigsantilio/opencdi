@@ -154,8 +154,6 @@ impl Resampler {
 
 // Silence in front of an ADPCM stream that starts from empty: one sector period, as the decoder needs a whole sector first.
 pub const ADPCM_LATENCY: usize = OUT_RATE as usize / 75;
-// Silence in front of the MPEG stream when it starts from empty (about 54 ms).
-pub const MPEG_LATENCY: usize = 2048;
 // An MPEG stream holding more than this (two seconds) is reported; nothing is dropped.
 const MPEG_WARN: usize = 2 * OUT_RATE as usize;
 
@@ -311,7 +309,7 @@ impl CdiAudio {
         self.mpeg.mix_into(frames);
     }
 
-    // Queues decoded DVC PCM, resampled from `rate` to OUT_RATE.
+    // Queues decoded DVC PCM, resampled from `rate` to OUT_RATE; it plays from the next output frame, a start delay belongs to the decoder.
     pub fn push_mpeg(&mut self, pcm: &mut VecDeque<Frame>, rate: u32) {
         if pcm.is_empty() {
             return;
@@ -322,7 +320,13 @@ impl CdiAudio {
         self.resampler.process(a, &mut self.scratch);
         self.resampler.process(b, &mut self.scratch);
         pcm.clear();
-        self.mpeg.push(&self.scratch, MPEG_LATENCY, MPEG_WARN, &|| format!("mpeg {} Hz", rate));
+        self.mpeg.push(&self.scratch, 0, MPEG_WARN, &|| format!("mpeg {} Hz", rate));
+    }
+
+    // FMA stop or reset: the unplayed DVC audio and the resampler history go.
+    pub fn stop_mpeg(&mut self) {
+        self.mpeg.clear();
+        self.resampler = Resampler::new();
     }
 
     // Appends the mixed frames made since the last call; returns how many.
@@ -834,6 +838,17 @@ mod tests {
         c.push(&[(0.25, 0.25); 3000], PREFILL, PREFILL + 2000, &what);
         c.push(&[(0.25, 0.25); 10], PREFILL, PREFILL + 2000, &what);
         assert_eq!((c.len(), c.restarts, c.warnings), (PREFILL + 3010, 2, 1));
+    }
+
+    #[test]
+    fn mpeg_plays_without_start_latency() {
+        let mut a = CdiAudio::new();
+        a.push_mpeg(&mut VecDeque::from(vec![(0.25, 0.25); 1152]), OUT_RATE);
+        a.advance(960, VideoMode::Pal.cycles_per_sector());
+        let mut out = Vec::new();
+        a.drain(&mut out);
+        // The linear resampler delays by one input frame; no silence is added in front.
+        assert_eq!((out[0], out[1]), ((0.0, 0.0), (0.25, 0.25)));
     }
 
     #[test]

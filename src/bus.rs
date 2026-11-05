@@ -349,6 +349,9 @@ impl CdiBus {
                 self.tick_dvc(cycles);
             }
         }
+        if std::mem::take(&mut self.dvc.audio_stopped) {
+            self.cdic.audio.stop_mpeg();
+        }
         self.cdic.audio.advance(cycles, self.mcd212.video_mode.cycles_per_sector());
     }
 
