@@ -328,9 +328,9 @@ impl MpegSystemDemux {
         self.clock_at(self.pack_bytes)
     }
 
-    /// Clock extrapolated by the 1/75 s tick (2,304 bytes each) once more than 4,703 bytes passed without a pack header.
+    /// Clock extrapolated by the 1/75 s tick (2,352 bytes each) once more than 4,703 bytes passed without a pack header.
     pub fn tick_clock(&mut self) -> Option<u64> {
-        self.tick_bytes += 2304;
+        self.tick_bytes += 2352;
         if self.tick_bytes > 4703 { self.clock_at(self.tick_bytes) } else { None }
     }
 
@@ -2066,12 +2066,11 @@ mod timing_tests {
     }
 
     #[test]
-    fn tick_clock_waits_for_three_ticks_without_a_pack() {
+    fn tick_clock_waits_for_two_ticks_without_a_pack() {
         let mut d = MpegSystemDemux::default();
         d.feed(&pack(0, 3528));
         assert_eq!(d.tick_clock(), None);
-        assert_eq!(d.tick_clock(), None);
-        assert_eq!(d.tick_clock(), Some(3 * 2304 * 450 / 3528));
+        assert_eq!(d.tick_clock(), Some(2 * 2352 * 450 / 3528));
         d.feed(&pack(900, 3528));
         assert_eq!(d.tick_bytes, 0);
     }
