@@ -63,6 +63,8 @@ pub struct SlaveHle {
     pub input_mouse_btn: u8,
 
     pub irq_pending: bool,
+    // Reply interrupt raised at the next scanline tick, so it never lands inside the command write sequence.
+    pub irq_deferred: bool,
     pub has_disc: bool,
     pub disc_state: u8,
     pub disc_timer: u32,
@@ -92,6 +94,7 @@ impl SlaveHle {
             input_mouse_btn: 0,
 
             irq_pending: false,
+            irq_deferred: false,
             has_disc: false,
             disc_state: 0x00,
             disc_timer: 0,
@@ -115,6 +118,7 @@ impl SlaveHle {
         self.input_mouse_x = -1;
         self.input_mouse_y = -1;
         self.irq_pending = false;
+        self.irq_deferred = false;
         self.reset_request = false;
         self.disc_timer = 0;
         self.disc_state = if self.has_disc { 0x41 } else { 0x00 };
@@ -138,6 +142,10 @@ impl SlaveHle {
     }
 
     pub fn tick(&mut self, cycles: u32) {
+        if self.irq_deferred {
+            self.irq_deferred = false;
+            self.irq_pending = true;
+        }
         if self.has_disc && self.disc_state == 0x41 {
             self.disc_timer += cycles;
             if self.disc_timer >= 4_500_000 {
@@ -403,7 +411,7 @@ impl SlaveHle {
             ch.out_buf[i] = b;
         }
         if assert_irq {
-            self.irq_pending = true;
+            self.irq_deferred = true;
         }
     }
 

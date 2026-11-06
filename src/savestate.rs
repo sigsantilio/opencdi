@@ -329,6 +329,7 @@ pub fn save_state_to_file<P: AsRef<Path>>(
     w.write_i32(bus.slave.input_mouse_y);
     w.write_u8(bus.slave.input_mouse_btn);
     w.write_bool(bus.slave.irq_pending);
+    w.write_bool(bus.slave.irq_deferred);
     w.write_bool(bus.slave.has_disc);
     w.write_u8(bus.slave.disc_state);
     w.write_u32(bus.slave.disc_timer);
@@ -709,6 +710,7 @@ pub fn load_state_from_file<P: AsRef<Path>>(
     bus.slave.input_mouse_y = r.read_i32()?;
     bus.slave.input_mouse_btn = r.read_u8()?;
     bus.slave.irq_pending = r.read_bool()?;
+    bus.slave.irq_deferred = r.read_bool()?;
     bus.slave.has_disc = r.read_bool()?;
     bus.slave.disc_state = r.read_u8()?;
     bus.slave.disc_timer = r.read_u32()?;
