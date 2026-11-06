@@ -155,6 +155,8 @@ impl Resampler {
 
 // Silence in front of an ADPCM stream that starts from empty: one sector period, as the decoder needs a whole sector first.
 pub const ADPCM_LATENCY: usize = OUT_RATE as usize / 75;
+// An MPEG stream starts one Layer II frame late, so decode times quantised to 1/75 s cannot run it dry.
+pub const MPEG_LATENCY: usize = 1152;
 // An MPEG stream holding more than this (two seconds) is reported; nothing is dropped.
 const MPEG_WARN: usize = 2 * OUT_RATE as usize;
 
@@ -331,7 +333,7 @@ impl CdiAudio {
         }
     }
 
-    // Queues decoded DVC PCM as it is; MPEG audio is 44.1 kHz, another rate is reported once and plays at the wrong pitch. It plays from the next output frame, a start delay belongs to the decoder.
+    // Queues decoded DVC PCM as it is; MPEG audio is 44.1 kHz, another rate is reported once and plays at the wrong pitch. It plays MPEG_LATENCY frames after the stream starts.
     pub fn push_mpeg(&mut self, pcm: &mut VecDeque<Frame>, rate: u32) {
         if pcm.is_empty() {
             return;
@@ -342,7 +344,7 @@ impl CdiAudio {
         }
         self.scratch.clear();
         self.scratch.extend(pcm.drain(..));
-        self.mpeg.push(&self.scratch, 0, MPEG_WARN, &|| format!("mpeg {} Hz", rate));
+        self.mpeg.push(&self.scratch, MPEG_LATENCY, MPEG_WARN, &|| format!("mpeg {} Hz", rate));
     }
 
     // FMA stop or reset: the unplayed DVC audio goes.
@@ -732,7 +734,7 @@ mod tests {
     fn player_attenuation_acts_on_adpcm_at_the_mix_and_not_on_mpeg() {
         let mut a = CdiAudio::new();
         a.main.push(&[(0.5, 0.25); 4000], 0, usize::MAX, &String::new);
-        a.push_mpeg(&mut VecDeque::from(vec![(0.1, 0.1); 4000]), 44_100);
+        a.mpeg.push(&[(0.1, 0.1); 4000], 0, usize::MAX, &String::new);
         let sector = VideoMode::Pal.cycles_per_sector();
         let mut out = Vec::new();
         a.advance(960, sector, None, None);
@@ -749,7 +751,7 @@ mod tests {
     fn cartridge_attenuation_acts_on_mpeg_only() {
         let mut a = CdiAudio::new();
         a.main.push(&[(0.5, 0.25); 100], 0, usize::MAX, &String::new);
-        a.push_mpeg(&mut VecDeque::from(vec![(0.4, 0.2); 100]), 44_100);
+        a.mpeg.push(&[(0.4, 0.2); 100], 0, usize::MAX, &String::new);
         a.advance(960, VideoMode::Pal.cycles_per_sector(), None, Some([0.5, 0.0, 0.5, 0.0]));
         let mut out = Vec::new();
         a.drain(&mut out);
@@ -857,13 +859,14 @@ mod tests {
     }
 
     #[test]
-    fn mpeg_plays_without_start_latency() {
+    fn mpeg_starts_one_frame_late() {
         let mut a = CdiAudio::new();
         a.push_mpeg(&mut VecDeque::from(vec![(0.25, 0.25); 1152]), 44_100);
+        assert_eq!(a.mpeg.len(), MPEG_LATENCY + 1152);
         a.advance(960, VideoMode::Pal.cycles_per_sector(), None, None);
         let mut out = Vec::new();
         a.drain(&mut out);
-        assert_eq!((out[0], out[1]), ((0.25, 0.25), (0.25, 0.25)));
+        assert_eq!((out[0], out[1]), ((0.0, 0.0), (0.0, 0.0)));
     }
 
     #[test]
