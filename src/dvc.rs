@@ -260,6 +260,12 @@ pub struct AudioEvent {
 }
 
 const DUE_RING: usize = 32;
+// Decode times are 31 bits (a 33-bit timestamp in 22.5 kHz units) and wrap.
+const CLOCK_MASK: u64 = 0x7FFF_FFFF;
+
+fn clock_before(a: u64, b: u64) -> bool {
+    a.wrapping_sub(b) & CLOCK_MASK >= 0x4000_0000
+}
 
 impl MpegSystemDemux {
     pub fn clear(&mut self) {
@@ -295,17 +301,17 @@ impl MpegSystemDemux {
     /// Schedules one decode per frame interval after the last scheduled time, up to but not including `until`.
     pub fn backfill(&mut self, until: u64) {
         let (Some(last), true) = (self.last_due, self.interval != 0) else { return };
-        let mut next = last + self.interval;
-        while next < until {
+        let mut next = (last + self.interval) & CLOCK_MASK;
+        while clock_before(next, until) {
             self.save_due(next);
-            next += self.interval;
+            next = (next + self.interval) & CLOCK_MASK;
         }
     }
 
     /// Removes and counts the scheduled times before `clock`.
     pub fn pop_due(&mut self, clock: u64) -> usize {
         let mut n = 0;
-        while self.due.front().is_some_and(|&t| t < clock) {
+        while self.due.front().is_some_and(|&t| clock_before(t, clock)) {
             self.due.pop_front();
             n += 1;
         }
@@ -314,7 +320,7 @@ impl MpegSystemDemux {
 
     fn clock_at(&self, bytes: u64) -> Option<u64> {
         let base = self.scr_base?;
-        (self.mux_rate != 0).then(|| base + bytes * 450 / self.mux_rate)
+        (self.mux_rate != 0).then(|| (base + bytes * 450 / self.mux_rate) & CLOCK_MASK)
     }
 
     /// Decode clock in 22.5 kHz units: the last pack's SCR plus the bytes fed since, at the mux rate.
@@ -2221,5 +2227,19 @@ mod timing_tests {
         assert_eq!(a.audio_out, b.audio_out);
         assert_eq!(a.get_fma_word(FMA_ISR), b.get_fma_word(FMA_ISR));
         assert_eq!(a.fma_demux.due, b.fma_demux.due);
+    }
+
+    #[test]
+    fn schedule_survives_the_timestamp_wrap() {
+        let mut d = dvc();
+        let wrap = 1u64 << 33;
+        feed(&mut d, &stream(wrap - 9_000, Some(wrap - 1_000), 1));
+        assert!(d.audio_out.is_empty());
+        feed(&mut d, &pack(wrap - 300, 3528));
+        assert_eq!(d.audio_out.len(), 1152);
+        feed(&mut d, &pack(500, 3528));
+        feed(&mut d, &audio_packet(Some(5_000), &loud_frame()));
+        feed(&mut d, &pack(6_000, 3528));
+        assert_eq!(d.audio_out.len(), 2 * 1152);
     }
 }
