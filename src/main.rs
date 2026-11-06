@@ -80,7 +80,8 @@ Usage: opencdi [options] [disc image (cue, chd, iso, bin)]
 
   --rom <path>        System BIOS (default: search bios/, the current and the program directory)
   --frames <n>        Quit after n emulated frames
-  --mouse             Start in mouse mode (host mouse drives the CD-i pointer)
+  --mouse             Start in mouse mode (host mouse drives the CD-i pointer; click in the window to capture it)
+  --mouse-speed <f>   Scale captured mouse motion (default 1.0)
   --recent [n]        List the recent disc images, or boot recent image number n
   --no-host-input     Ignore host keyboard, mouse and gamepads; never grab the cursor
   --bios, --standalone  Boot the BIOS shell without a disc
@@ -315,6 +316,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flag_value = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
     let rom_arg = flag_value("--rom").map(PathBuf::from);
     let max_frames: Option<u64> = flag_value("--frames").and_then(|s| s.parse().ok());
+    let mouse_speed: f64 = flag_value("--mouse-speed").and_then(|s| s.parse().ok()).filter(|v: &f64| v.is_finite() && *v > 0.0).unwrap_or(1.0);
 
     let mut m = Machine::new();
     m.bus.slave.debug_log = has_flag("--slave-debug");
@@ -497,7 +499,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mouse_right: false,
         mouse_middle: false,
         prev_middle: false,
-        mouse_captured: true,
+        mouse_captured: false,
+        mouse_speed,
         host_input: !has_flag("--no-host-input"),
         run_in_menu: has_flag("--run-in-menu"),
         in_modal_pump: false,
@@ -638,6 +641,7 @@ struct App {
     mouse_middle: bool,
     prev_middle: bool,
     mouse_captured: bool,
+    mouse_speed: f64,
     host_input: bool,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     run_in_menu: bool,
@@ -864,7 +868,6 @@ impl App {
                             self.m.bus.reset_system();
                             self.m.cpu.reset(&mut self.m.bus);
                             self.reset_state();
-                            self.mouse_captured = true;
                             self.m.bus.emulate_wait_states = true;
                             self.next_frame_time = Instant::now();
                             self.reset_telemetry();
@@ -893,7 +896,6 @@ impl App {
                     self.m.bus.reset_system();
                     self.m.cpu.reset(&mut self.m.bus);
                     self.reset_state();
-                    self.mouse_captured = true;
                     self.m.bus.emulate_wait_states = true;
                     self.next_frame_time = Instant::now();
                     self.reset_telemetry();
@@ -1580,8 +1582,8 @@ impl ApplicationHandler for App {
         if let (DeviceEvent::MouseMotion { delta: (dx, dy) }, Some((x, y))) = (event, self.rel_pointer) {
             let (_, _, w, h) = self.image_rect;
             if w > 0 && h > 0 {
-                let x = (x + dx * SCREEN_WIDTH as f64 / w as f64).clamp(0.0, (SCREEN_WIDTH - 1) as f64);
-                let y = (y + dy * SCREEN_HEIGHT as f64 / h as f64).clamp(0.0, (SCREEN_HEIGHT - 1) as f64);
+                let x = (x + dx * self.mouse_speed * SCREEN_WIDTH as f64 / w as f64).clamp(0.0, (SCREEN_WIDTH - 1) as f64);
+                let y = (y + dy * self.mouse_speed * SCREEN_HEIGHT as f64 / h as f64).clamp(0.0, (SCREEN_HEIGHT - 1) as f64);
                 self.rel_pointer = Some((x, y));
             }
         }
