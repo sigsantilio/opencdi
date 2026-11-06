@@ -1,7 +1,7 @@
 // OpenCDi Release Build - 2026-09-29 15:45
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 use std::path::{Path, PathBuf};
-use log::{info, error};
+use log::{info, error, warn};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -80,6 +80,8 @@ Usage: opencdi [options] [disc image (cue, chd, iso, bin)]
 
   --rom <path>        System BIOS (default: search bios/, the current and the program directory)
   --frames <n>        Quit after n emulated frames
+  --fullscreen        Start in borderless fullscreen
+  --monitor <n>       Monitor for fullscreen, 0-based (default: the window's current monitor)
   --mouse             Start in mouse mode (host mouse drives the CD-i pointer)
   --recent [n]        List the recent disc images, or boot recent image number n
   --no-host-input     Ignore host keyboard, mouse and gamepads; never grab the cursor
@@ -315,6 +317,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flag_value = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
     let rom_arg = flag_value("--rom").map(PathBuf::from);
     let max_frames: Option<u64> = flag_value("--frames").and_then(|s| s.parse().ok());
+    let monitor: Option<usize> = flag_value("--monitor").and_then(|s| s.parse().ok());
 
     let mut m = Machine::new();
     m.bus.slave.debug_log = has_flag("--slave-debug");
@@ -498,6 +501,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mouse_middle: false,
         prev_middle: false,
         mouse_captured: true,
+        monitor,
+        start_fullscreen: has_flag("--fullscreen"),
         host_input: !has_flag("--no-host-input"),
         run_in_menu: has_flag("--run-in-menu"),
         in_modal_pump: false,
@@ -638,6 +643,8 @@ struct App {
     mouse_middle: bool,
     prev_middle: bool,
     mouse_captured: bool,
+    monitor: Option<usize>,
+    start_fullscreen: bool,
     host_input: bool,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     run_in_menu: bool,
@@ -696,7 +703,20 @@ impl App {
                 // A maximised window is restored by the platform itself
                 self.windowed = Some((window.outer_position().ok(), window.inner_size())).filter(|_| !window.is_maximized());
             }
-            window.set_fullscreen(if full { Some(Fullscreen::Borderless(None)) } else { None });
+            let mode = full.then(|| match self.monitor {
+                Some(n) => match window.available_monitors().nth(n) {
+                    Some(mon) => Fullscreen::Borderless(Some(mon)),
+                    None => {
+                        warn!("Monitor {} not found, using the current monitor", n);
+                        Fullscreen::Borderless(None)
+                    }
+                },
+                None => Fullscreen::Borderless(None),
+            });
+            window.set_fullscreen(mode);
+            // The menu bar is hidden in fullscreen and put back before the window geometry is restored
+            #[cfg(target_os = "windows")]
+            gui::set_menu_visible(self.hwnd(), !full);
             self.restore_check = None;
             if !full && self.windowed.is_some() {
                 self.restore_windowed();
@@ -1508,6 +1528,9 @@ impl ApplicationHandler for App {
             if let Some(window) = &self.window {
                 let _ = window.request_inner_size(LogicalSize::new(SCREEN_WIDTH as f64, SCREEN_HEIGHT as f64));
             }
+        }
+        if self.start_fullscreen {
+            self.toggle_fullscreen();
         }
         let now = Instant::now();
         self.run_at = now;

@@ -307,6 +307,17 @@ fn modal<R>(hwnd: *mut std::ffi::c_void, f: impl FnOnce() -> R) -> R {
     r
 }
 
+// Detaches or re-attaches the menu bar (fullscreen hides it)
+pub fn set_menu_visible(hwnd: *mut std::ffi::c_void, visible: bool) {
+    unsafe {
+        if MENU_HANDLE.is_null() {
+            return;
+        }
+        SetMenu(hwnd, if visible { MENU_HANDLE } else { std::ptr::null_mut() });
+        DrawMenuBar(hwnd);
+    }
+}
+
 pub fn update_input_device_menu(mode: InputDeviceMode) {
     unsafe {
         if !MENU_HANDLE.is_null() {
