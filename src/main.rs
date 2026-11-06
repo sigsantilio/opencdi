@@ -80,6 +80,7 @@ Usage: opencdi [options] [disc image (cue, chd, iso, bin)]
 
   --rom <path>        System BIOS (default: search bios/, the current and the program directory)
   --frames <n>        Quit after n emulated frames
+  --no-autoplay       Leave the BIOS shell waiting instead of clicking PLAY CD-I for the user
   --mouse             Start in mouse mode (host mouse drives the CD-i pointer)
   --recent [n]        List the recent disc images, or boot recent image number n
   --no-host-input     Ignore host keyboard, mouse and gamepads; never grab the cursor
@@ -498,6 +499,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mouse_middle: false,
         prev_middle: false,
         mouse_captured: true,
+        no_autoplay: has_flag("--no-autoplay"),
         host_input: !has_flag("--no-host-input"),
         run_in_menu: has_flag("--run-in-menu"),
         in_modal_pump: false,
@@ -638,6 +640,7 @@ struct App {
     mouse_middle: bool,
     prev_middle: bool,
     mouse_captured: bool,
+    no_autoplay: bool,
     host_input: bool,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     run_in_menu: bool,
@@ -1056,7 +1059,7 @@ impl App {
                 (0x0000C000u32, m.bus.peek_long(0x0000C000u32.wrapping_add(0xFFFF9172)).unwrap_or(0))
             };
 
-            if shell_state >= 2 {
+            if shell_state >= 2 && !self.no_autoplay {
                 self.shell_ready_count += 1;
                 if self.shell_ready_count == 1 || self.shell_ready_count == 150 {
                     m.bus.slave.update_mouse(575, 335, 0);
@@ -1224,7 +1227,7 @@ impl App {
             }
         }
 
-        if !self.disc_launched && m.bus.cdrom.is_some() {
+        if !self.disc_launched && m.bus.cdrom.is_some() && !self.no_autoplay {
             // During automatic boot sequence, do not let host mouse drift override PLAY CD-I auto-click
         } else {
             match self.input_device_mode {
@@ -1661,5 +1664,7 @@ mod tests {
         assert_eq!(v(&["--recent", "2", "--mouse"]), None);
         assert_eq!(v(&["--recent", "disc.cue"]), Some("disc.cue".into()));
         assert_eq!(v(&["--mouse", "--bios"]), None);
+        assert_eq!(v(&["--no-autoplay", "disc.cue"]), Some("disc.cue".into()));
+        assert_eq!(v(&["disc.cue", "--no-autoplay"]), Some("disc.cue".into()));
     }
 }
