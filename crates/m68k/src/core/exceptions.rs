@@ -364,6 +364,9 @@ impl CpuCore {
         // Jump to vector
         self.jump_vector(bus, vector::ADDRESS_ERROR);
 
+        if self.cpu_type == super::types::CpuType::SCC68070 {
+            return super::timing_070::exception_clocks(vector::ADDRESS_ERROR);
+        }
         50 // Cycles for address error
     }
 
@@ -598,6 +601,9 @@ impl CpuCore {
         // Jump to vector
         self.jump_vector(bus, vector::BUS_ERROR);
 
+        if self.cpu_type == super::types::CpuType::SCC68070 {
+            return super::timing_070::exception_clocks(vector::BUS_ERROR);
+        }
         50 // Cycles for bus error
     }
 
@@ -708,6 +714,9 @@ impl CpuCore {
 
     /// Get cycles for exception processing.
     fn exception_cycles(&self, vector: u32) -> i32 {
+        if self.cpu_type == super::types::CpuType::SCC68070 {
+            return super::timing_070::exception_clocks(vector);
+        }
         match vector {
             vector::RESET_SSP | vector::RESET_PC => 40,
             vector::BUS_ERROR | vector::ADDRESS_ERROR => 50,

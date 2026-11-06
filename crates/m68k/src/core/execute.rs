@@ -1305,6 +1305,8 @@ impl CpuCore {
         // bus time actually consumed.
         self.cycles_remaining -= if self.cpu_type == super::types::CpuType::M68010 {
             46
+        } else if self.cpu_type == super::types::CpuType::SCC68070 {
+            super::timing_070::INTERRUPT_CLOCKS
         } else {
             44
         };
