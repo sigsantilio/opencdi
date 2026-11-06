@@ -57,13 +57,16 @@ impl Machine {
         let cpu = &mut self.cpu;
         let mut trace = self.os9_trace.as_deref_mut();
         if let Some(t) = trace.as_deref_mut() {
-            t.next_frame();
+            t.next_frame(bus);
         }
         bus.slave.video_mode = bus.mcd212.video_mode;
         let total_lines = bus.mcd212.video_mode.total_scanlines();
         let cyc_per_line = bus.mcd212.video_mode.cycles_per_scanline();
         let mut cycle_debt: i32 = 0;
         for line in 0..total_lines {
+            if let Some(t) = trace.as_deref_mut() {
+                t.set_line(line);
+            }
             bus.tick_scanline(line);
 
             if bus.mcd212.vblank_irq {

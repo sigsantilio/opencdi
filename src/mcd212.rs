@@ -173,6 +173,8 @@ pub struct Mcd212 {
     pub external_video_line: [u32; 768],
     pub external_video_present: [bool; 768],
     pub trace_dca: bool,
+    // Executed ICA/DCA instructions (line, path, word) for the OS-9 tracer's display log; None when off.
+    pub dc_log: Option<Vec<(u16, u8, u32)>>,
 }
 
 impl Mcd212 {
@@ -271,6 +273,7 @@ impl Mcd212 {
             external_video_line: [0xFF00_0000; 768],
             external_video_present: [false; 768],
             trace_dca: false,
+            dc_log: None,
         };
         mcd.init_default_palette();
         mcd
@@ -766,6 +769,7 @@ impl Mcd212 {
                 ])
             };
             addr += 2;
+            if let Some(log) = self.dc_log.as_mut() { log.push((self.scanline as u16, PATH as u8, cmd)); }
 
             match (cmd >> 24) as u8 {
                 0x00..=0x0F => return, // STOP
@@ -836,6 +840,7 @@ impl Mcd212 {
                 ])
             };
             addr += 2;
+            if let Some(log) = self.dc_log.as_mut() { log.push((self.scanline as u16, PATH as u8, cmd)); }
             count += 4;
 
             if trace_this {

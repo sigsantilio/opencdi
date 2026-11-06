@@ -24,6 +24,9 @@ pub struct Os9Trace {
     frame: u64,
     pending: Vec<Pending>,
     modules: Vec<(u32, u32, String)>,
+    line: usize,
+    dc: bool,
+    dc_prev: Vec<(u16, u8, u32)>,
 }
 
 impl Os9Trace {
@@ -33,11 +36,52 @@ impl Os9Trace {
         let file = File::create(&path).map_err(|e| eprintln!("CDI_OS9_TRACE: {e}")).ok()?;
         let mut out = BufWriter::new(file);
         let _ = writeln!(out, "# os9 trace: C=call R=return; regs before/after; str=a0 text for name calls; mem=32 bytes at a0 for status calls");
-        Some(Box::new(Self { out, seq: 0, frame: 0, pending: Vec::new(), modules: Vec::new() }))
+        let dc = std::env::var_os("CDI_DC_TRACE").is_some();
+        Some(Box::new(Self { out, seq: 0, frame: 0, pending: Vec::new(), modules: Vec::new(), line: 0, dc, dc_prev: Vec::new() }))
     }
 
-    pub fn next_frame(&mut self) {
+    /// Start of a field; with `CDI_DC_TRACE` set also logs (V lines) the display instructions that changed against the field before.
+    pub fn next_frame(&mut self, bus: &mut CdiBus) {
+        if self.dc {
+            let cur = bus.mcd212.dc_log.replace(Vec::new()).unwrap_or_default();
+            if self.frame > 0 {
+                self.log_dc_diff(&cur);
+            }
+            self.dc_prev = cur;
+        }
         self.frame += 1;
+    }
+
+    pub fn set_line(&mut self, line: usize) {
+        self.line = line;
+    }
+
+    // One V line per (path, scanline) whose executed instruction list differs from the previous field: changed index:old>new.
+    fn log_dc_diff(&mut self, cur: &[(u16, u8, u32)]) {
+        let group = |v: &[(u16, u8, u32)]| {
+            let mut m: std::collections::BTreeMap<(u8, u16), Vec<u32>> = Default::default();
+            for &(l, p, c) in v {
+                m.entry((p, l)).or_default().push(c);
+            }
+            m
+        };
+        let (a, b) = (group(&self.dc_prev), group(cur));
+        let keys: std::collections::BTreeSet<_> = a.keys().chain(b.keys()).copied().collect();
+        for k in keys {
+            let (o, n) = (a.get(&k).map_or(&[][..], |v| v), b.get(&k).map_or(&[][..], |v| v));
+            if o == n {
+                continue;
+            }
+            let mut line = format!("V f={} p={} l={} n={}", self.frame, k.0, k.1, n.len());
+            for i in 0..o.len().max(n.len()) {
+                let (x, y) = (o.get(i), n.get(i));
+                if x != y {
+                    let f = |w: Option<&u32>| w.map_or("-".to_string(), |w| format!("{w:08X}"));
+                    let _ = write!(line, " {}:{}>{}", i, f(x), f(y));
+                }
+            }
+            let _ = writeln!(self.out, "{line}");
+        }
     }
 
     pub fn has_pending(&self) -> bool {
@@ -51,8 +95,8 @@ impl Os9Trace {
         let sup = cpu.s_flag != 0;
         let module = self.module_at(bus, cpu.ppc);
         let mut line = format!(
-            "C {} f={} t={} code={:02X} pc={:06X} mod={} sup={} ",
-            self.seq, self.frame, trap, code, cpu.ppc, module, sup as u8
+            "C {} f={} l={} t={} code={:02X} pc={:06X} mod={} sup={} ",
+            self.seq, self.frame, self.line, trap, code, cpu.ppc, module, sup as u8
         );
         push_regs(&mut line, cpu, true);
         if trap == 0 && NAME_CALLS.contains(&code) {
@@ -92,7 +136,7 @@ impl Os9Trace {
         };
         let p = self.pending.remove(i);
         let cc = cpu.get_ccr() & 1;
-        let mut line = format!("R {} f={} cc={} err={:04X} ", p.seq, self.frame, cc, cpu.d(1) & 0xFFFF);
+        let mut line = format!("R {} f={} l={} cc={} err={:04X} ", p.seq, self.frame, self.line, cc, cpu.d(1) & 0xFFFF);
         push_regs(&mut line, cpu, false);
         let _ = writeln!(self.out, "{line}");
     }
