@@ -356,7 +356,8 @@ impl CdiBus {
             BoardKind::Mono1 => self.cdic.audio.slave_gains(),
             BoardKind::Mono4 => self.mono4.as_deref().and_then(|m| m.ciap.attenuation()),
         };
-        self.cdic.audio.advance(cycles, self.mcd212.video_mode.cycles_per_sector(), gains);
+        let dvc_gains = if self.dvc.is_fitted() { self.dvc.audio_gains() } else { None };
+        self.cdic.audio.advance(cycles, self.mcd212.video_mode.cycles_per_sector(), gains, dvc_gains);
     }
 
     /// Highest external interrupt level the board peripherals request (0 for none).

@@ -28,6 +28,10 @@ pub const FMV_SCRPOS_Y: usize = 0x74;
 pub const FB_MAX_W: usize = 768;
 pub const FB_MAX_H: usize = 576;
 
+// VMPEG DSP attenuation targets (four bytes, 1 dB steps, bit 7 mute), kept in the register file; IMPEG keeps its two words at 0x20C/0x20E.
+const FMA_ATT: usize = 0x90;
+const IMPEG_ATT: usize = 0x100 + 0x0C;
+
 // FMA Register Byte Offsets (within 0xE03000..0xE030FF)
 pub const FMA_CMD: usize = 0x00;
 pub const FMA_MODE: usize = 0x04;
@@ -464,6 +468,8 @@ pub struct Dvc {
     pub audio_out: VecDeque<(f32, f32)>,
     // Set by an FMA stop or stream reset; the bus clears the unplayed output audio in the same line.
     pub audio_stopped: bool,
+    // VMPEG DSP attenuation upload in progress: bytes taken so far (None when idle).
+    dsp_att: Option<(usize, [u8; 4])>,
 
     pub video_decoder: Option<Video>,
     pub video_width: usize,
@@ -547,6 +553,7 @@ impl Dvc {
             audio_sample_rate: 44_100,
             audio_out: VecDeque::with_capacity(16 * 1024),
             audio_stopped: false,
+            dsp_att: None,
 
             video_decoder: None,
             video_width: 352,
@@ -561,6 +568,7 @@ impl Dvc {
             has_valid_frame: false,
         };
         d.reset_regs();
+        d.mute_impeg_attenuation();
         d
     }
 
@@ -579,6 +587,7 @@ impl Dvc {
         self.reset_stream();
         self.reset_regs();
         self.impeg_regs.fill(0);
+        self.mute_impeg_attenuation();
         self.impeg_fw.fill(0);
         (self.impeg_pio, self.impeg_hi_valid) = (false, false);
     }
@@ -634,6 +643,8 @@ impl Dvc {
         self.set_fma_word(0x06, 0x0900);
         self.set_fma_word(0x0E, 0x0042);
         self.set_fma_word(0x24, 0x0004); // HF2 DSP flag ready
+        self.fma_regs[FMA_ATT..FMA_ATT + 4].fill(0x80); // the cartridge powers up muted
+        self.dsp_att = None;
 
         // FMV defaults
         self.set_fmv_word(FMV_TIMER, 55);
@@ -1061,6 +1072,46 @@ impl Dvc {
         self.write_word(addr, data);
     }
 
+    fn mute_impeg_attenuation(&mut self) {
+        self.impeg_regs[IMPEG_ATT..IMPEG_ATT + 4].fill(0x3F);
+    }
+
+    // Player-style gains (left-left, left-right, right-right, right-left) of the cartridge's own attenuator; None while it passes stereo straight through.
+    // Bytes in register order: left-left, left-right, right-left, right-right (inferred from the straight pair 0, mute, mute, 0 both drivers write at Play).
+    pub fn audio_gains(&self) -> Option<[f32; 4]> {
+        let g = if self.impeg {
+            let r = &self.impeg_regs[IMPEG_ATT..IMPEG_ATT + 4];
+            // IMPEG: 6-bit fields in 2 dB steps, 0x3F mute.
+            r.iter().map(|&b| if b & 0x3F == 0x3F { 0.0 } else { 10f32.powf(-((b & 0x3F) as f32) / 10.0) }).collect::<Vec<f32>>()
+        } else {
+            let r = &self.fma_regs[FMA_ATT..FMA_ATT + 4];
+            // VMPEG: 1 dB steps, bit 7 mute.
+            r.iter().map(|&b| if b & 0x80 != 0 { 0.0 } else { 10f32.powf(-(b as f32) / 20.0) }).collect::<Vec<f32>>()
+        };
+        if g[0] == 1.0 && g[1] == 0.0 && g[2] == 0.0 && g[3] == 1.0 {
+            return None;
+        }
+        Some([g[0], g[1], g[3], g[2]])
+    }
+
+    // DSP host write: index 1 with a target in 0x90..0x93 starts an attenuation upload, then four index 7 bytes follow.
+    fn dsp_write(&mut self, index: u16, data: u16) {
+        match (index, self.dsp_att) {
+            (1, _) if (0x90..=0x93).contains(&(data & 0xFF)) => self.dsp_att = Some((0, [0; 4])),
+            (7, Some((n, mut b))) => {
+                b[n] = data as u8;
+                if n == 3 {
+                    self.fma_regs[FMA_ATT..FMA_ATT + 4].copy_from_slice(&b);
+                    self.dsp_att = None;
+                } else {
+                    self.dsp_att = Some((n + 1, b));
+                }
+            }
+            (2, _) => {}
+            _ => self.dsp_att = None,
+        }
+    }
+
     pub fn handle_fma_write(&mut self, offset: usize) {
         let value = self.get_fma_word(offset);
         match offset {
@@ -1102,6 +1153,7 @@ impl Dvc {
             FMA_ISR => {
                 self.acknowledge_fma_isr();
             }
+            0x24 if !self.impeg => self.dsp_write(self.get_fma_word(0x22), value),
             _ => {}
         }
     }
@@ -1615,7 +1667,7 @@ opencdi::impl_state!(Dvc {
     underflow_count, fma_underflow_count, fma_decoded_since_play, fma_playout_end, has_valid_frame,
     impeg_regs, impeg_pio, impeg_hi_valid,
 } skip {
-    rom, impeg, impeg_fw, impeg_ivec_zero_logged, cpu_hz, audio_stopped,
+    rom, impeg, impeg_fw, impeg_ivec_zero_logged, cpu_hz, audio_stopped, dsp_att,
 });
 
 opencdi::impl_state!(MpegSystemDemux {
@@ -1712,6 +1764,48 @@ mod impeg_tests {
         opencdi::savestate::State::load(&mut e, &mut opencdi::savestate::Reader::new(&buf)).unwrap();
         assert_eq!((e.impeg_pio, e.impeg_regs[0x11C], e.impeg_regs[0x11D]), (true, 0x3D, 0x14));
         d.reset();
-        assert!(!d.impeg_pio && d.impeg_regs.iter().all(|&b| b == 0));
+        assert!(!d.impeg_pio && d.impeg_regs[..IMPEG_ATT].iter().all(|&b| b == 0) && d.impeg_regs[IMPEG_ATT..IMPEG_ATT + 4] == [0x3F; 4]);
+    }
+
+    fn dsp(d: &mut Dvc, index: u16, data: u16) {
+        d.write_word(0xE03022, index);
+        d.write_word(0xE03024, data);
+    }
+
+    #[test]
+    fn vmpeg_attenuation_powers_up_muted_and_follows_the_dsp_upload() {
+        let mut d = Dvc::new();
+        assert_eq!(d.audio_gains(), Some([0.0; 4]));
+        // Program words on other indexes are not attenuation.
+        for (i, v) in [(5, 0x0A), (6, 0xF0), (7, 0x80)] {
+            dsp(&mut d, i, v);
+        }
+        assert_eq!(d.audio_gains(), Some([0.0; 4]));
+        dsp(&mut d, 0, 0xF2);
+        dsp(&mut d, 1, 0x93);
+        for b in [0x00, 0x80, 0x80, 0x00] {
+            dsp(&mut d, 7, b);
+        }
+        assert_eq!(d.audio_gains(), None);
+        dsp(&mut d, 1, 0x93);
+        for b in [10, 0x80, 0x80, 0x00] {
+            dsp(&mut d, 7, b);
+        }
+        let g = d.audio_gains().unwrap();
+        assert!((g[0] - 0.316_227_77).abs() < 1e-4 && g[1] == 0.0 && g[2] == 1.0 && g[3] == 0.0);
+    }
+
+    #[test]
+    fn impeg_attenuation_powers_up_muted_and_follows_its_registers() {
+        let mut d = Dvc::new();
+        d.impeg = true;
+        d.reset();
+        assert_eq!(d.audio_gains(), Some([0.0; 4]));
+        d.write_word(0xE0420C, 0x003F);
+        d.write_word(0xE0420E, 0x3F00);
+        assert_eq!(d.audio_gains(), None);
+        d.write_word(0xE0420C, 0x0A3F);
+        let g = d.audio_gains().unwrap();
+        assert!((g[0] - 0.1).abs() < 1e-4 && g[1] == 0.0 && g[2] == 1.0 && g[3] == 0.0);
     }
 }

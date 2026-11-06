@@ -94,6 +94,13 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
     a
 }
 
+// Four-path gain matrix (left-left, left-right, right-right, right-left) on a stereo run.
+fn apply_gains(frames: &mut [Frame], [ll, lr, rr, rl]: [f32; 4]) {
+    for (l, r) in frames.iter_mut() {
+        (*l, *r) = (*l * ll + *r * rl, *r * rr + *l * lr);
+    }
+}
+
 // Polyphase Catmull-Rom resampler to OUT_RATE with an exact rational step; plain f32 ops (no FMA), so results are the same on every IEEE-754 target.
 #[derive(Default, Clone, PartialEq, Debug)]
 pub struct Resampler {
@@ -298,20 +305,30 @@ impl CdiAudio {
         Some(g)
     }
 
-    // Mixes the output frames that fall in `cycles` of board time; `gains` is the player attenuation as it stands now, applied to the ADPCM streams only.
-    pub fn advance(&mut self, cycles: u32, sector_cycles: u32, gains: Option<[f32; 4]>) {
+    // Mixes the output frames that fall in `cycles` of board time; `gains` is the player attenuation as it stands now (ADPCM streams only), `dvc_gains` the cartridge's own (MPEG stream only).
+    pub fn advance(&mut self, cycles: u32, sector_cycles: u32, gains: Option<[f32; 4]>, dvc_gains: Option<[f32; 4]>) {
         let n = self.clock.advance(cycles as u64, sector_cycles);
         let start = self.out.len();
         self.out.resize(start + n, (0.0, 0.0));
         let frames = &mut self.out[start..];
         self.main.mix_into(frames);
         self.sfx.mix_into(frames);
-        if let Some([ll, lr, rr, rl]) = gains {
-            for (l, r) in frames.iter_mut() {
-                (*l, *r) = (*l * ll + *r * rl, *r * rr + *l * lr);
-            }
+        if let Some(g) = gains {
+            apply_gains(frames, g);
         }
-        self.mpeg.mix_into(frames);
+        match dvc_gains {
+            Some(g) if !self.mpeg.is_empty() => {
+                self.scratch.clear();
+                self.scratch.resize(n, (0.0, 0.0));
+                self.mpeg.mix_into(&mut self.scratch);
+                apply_gains(&mut self.scratch, g);
+                for (o, s) in self.out[start..].iter_mut().zip(self.scratch.iter()) {
+                    o.0 += s.0;
+                    o.1 += s.1;
+                }
+            }
+            _ => self.mpeg.mix_into(frames),
+        }
     }
 
     // Queues decoded DVC PCM as it is; MPEG audio is 44.1 kHz, another rate is reported once and plays at the wrong pitch. It plays from the next output frame, a start delay belongs to the decoder.
@@ -718,14 +735,25 @@ mod tests {
         a.push_mpeg(&mut VecDeque::from(vec![(0.1, 0.1); 4000]), 44_100);
         let sector = VideoMode::Pal.cycles_per_sector();
         let mut out = Vec::new();
-        a.advance(960, sector, None);
-        a.advance(960, sector, Some([1.0, 1.0, 1.0, 1.0]));
-        a.advance(960, sector, Some([0.0, 0.0, 1.0, 0.0]));
+        a.advance(960, sector, None, None);
+        a.advance(960, sector, Some([1.0, 1.0, 1.0, 1.0]), None);
+        a.advance(960, sector, Some([0.0, 0.0, 1.0, 0.0]), None);
         a.drain(&mut out);
         let n = out.len() / 3;
         assert_eq!(out[0], (0.6, 0.35));
         assert_eq!(out[n + 1], (0.85, 0.85));
         assert_eq!(out[2 * n + 1], (0.1, 0.35));
+    }
+
+    #[test]
+    fn cartridge_attenuation_acts_on_mpeg_only() {
+        let mut a = CdiAudio::new();
+        a.main.push(&[(0.5, 0.25); 100], 0, usize::MAX, &String::new);
+        a.push_mpeg(&mut VecDeque::from(vec![(0.4, 0.2); 100]), 44_100);
+        a.advance(960, VideoMode::Pal.cycles_per_sector(), None, Some([0.5, 0.0, 0.5, 0.0]));
+        let mut out = Vec::new();
+        a.drain(&mut out);
+        assert_eq!(out[0], (0.7, 0.35));
     }
 
     #[test]
@@ -832,7 +860,7 @@ mod tests {
     fn mpeg_plays_without_start_latency() {
         let mut a = CdiAudio::new();
         a.push_mpeg(&mut VecDeque::from(vec![(0.25, 0.25); 1152]), 44_100);
-        a.advance(960, VideoMode::Pal.cycles_per_sector(), None);
+        a.advance(960, VideoMode::Pal.cycles_per_sector(), None, None);
         let mut out = Vec::new();
         a.drain(&mut out);
         assert_eq!((out[0], out[1]), ((0.25, 0.25), (0.25, 0.25)));
@@ -846,7 +874,7 @@ mod tests {
             a.main.push(&[(v, -v); 700], ADPCM_LATENCY, usize::MAX, &String::new);
             a.push_mpeg(&mut VecDeque::from(vec![(0.2, 0.3); 1152]), 44_100);
             for _ in 0..262 {
-                a.advance(960, sector, None);
+                a.advance(960, sector, None, None);
             }
         };
         let mut a = CdiAudio::new();
