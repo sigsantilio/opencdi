@@ -70,6 +70,13 @@ pub const FMA_MODE_DRAIN: u16 = 0x1F;  // madriv mode: 7 = play, 0x1F = drain at
 // MPEG Audio Layer-II Decoder (oxideav-mp2)
 // =========================================================================
 
+/// One decoded frame: samples per channel, sample rate and the four header bytes.
+pub struct DecodedFrame {
+    pub samples: usize,
+    pub rate: u32,
+    pub header: [u8; 4],
+}
+
 pub struct Mp2Decoder {
     state: oxideav_mp2::frame::FrameDecodeState,
     pub pcm: VecDeque<(f32, f32)>,
@@ -114,9 +121,22 @@ impl Mp2Decoder {
     pub fn decode_available(&mut self, input: &mut VecDeque<u8>) -> u64 {
         let mut decoded = 0;
         let mut scanned = 0u64;
+        while self.decode_frame(input, &mut scanned).is_some() {
+            decoded += 1;
+        }
+        decoded
+    }
+
+    /// Decodes the next whole frame into `pcm`; `None` when the input holds no whole frame.
+    pub fn decode_one(&mut self, input: &mut VecDeque<u8>) -> Option<DecodedFrame> {
+        let mut scanned = 0u64;
+        self.decode_frame(input, &mut scanned)
+    }
+
+    fn decode_frame(&mut self, input: &mut VecDeque<u8>, scanned: &mut u64) -> Option<DecodedFrame> {
         loop {
             if input.len() < 4 {
-                break;
+                return None;
             }
             let head = [input[0], input[1], input[2], input[3]];
             let header = match oxideav_mp2::header::FrameHeader::parse(&head) {
@@ -129,14 +149,14 @@ impl Mp2Decoder {
                         self.synchronized = false;
                     } else {
                         self.resync_bytes += 1;
-                        scanned += 1;
+                        *scanned += 1;
                     }
                     continue;
                 }
             };
             let frame_size = header.frame_size_bytes();
             if input.len() < frame_size {
-                break;
+                return None;
             }
             let contiguous = input.make_contiguous();
             match oxideav_mp2::frame::decode_frame_with(&contiguous[..frame_size], &mut self.state) {
@@ -144,9 +164,9 @@ impl Mp2Decoder {
                     if frame.header.sample_rate > 0 {
                         self.last_sample_rate = frame.header.sample_rate;
                     }
+                    let samples = frame.pcm.first().map_or(0, Vec::len);
                     if self.conceal_discontinuity_frame {
-                        if scanned != 0 {
-                            let samples = frame.pcm.first().map_or(0, Vec::len);
+                        if *scanned != 0 {
                             self.pcm.extend(std::iter::repeat((0.0f32, 0.0f32)).take(samples));
                             self.concealed_frames += 1;
                         }
@@ -156,8 +176,8 @@ impl Mp2Decoder {
                     self.last_frame.clear();
                     self.last_frame.extend_from_slice(&contiguous[..frame_size]);
                     input.drain(..frame_size);
-                    decoded += 1;
                     self.synchronized = true;
+                    return Some(DecodedFrame { samples, rate: self.last_sample_rate, header: head });
                 }
                 Err(_) => {
                     input.pop_front();
@@ -168,7 +188,21 @@ impl Mp2Decoder {
                 }
             }
         }
-        decoded
+    }
+
+    /// Samples per frame and sample rate of the frame at the head of the input, if its header parses.
+    pub fn peek_interval(input: &VecDeque<u8>) -> Option<(u32, u32)> {
+        if input.len() < 4 {
+            return None;
+        }
+        let head = [input[0], input[1], input[2], input[3]];
+        let h = oxideav_mp2::header::FrameHeader::parse(&head).ok()?;
+        Some((if h.lsf { 576 } else { 1152 }, h.sample_rate))
+    }
+
+    /// Decode-time spacing of a frame in 22.5 kHz units, rounded up.
+    pub fn interval_units(samples: u32, rate: u32) -> u64 {
+        if rate == 0 { 0 } else { (u64::from(samples) * 22_500 + u64::from(rate) - 1) / u64::from(rate) }
     }
 
     // A trailing partial frame cannot be decoded, so it does not keep the decoder fed.
@@ -210,6 +244,12 @@ pub struct MpegSystemDemux {
     pub selected_audio_stream: Option<u8>,
     pub selected_video_stream: Option<u8>,
     pub program_ends: u64,
+    /// Decode clock: pack SCR in 22.5 kHz units and mux rate in 50 byte/s units, set at each pack header.
+    pub scr_base: Option<u64>,
+    pub mux_rate: u64,
+    /// Bytes fed since the last pack header (4 at the header itself); the tick path counts its own bytes.
+    pub pack_bytes: u64,
+    pub tick_bytes: u64,
 }
 
 impl MpegSystemDemux {
@@ -224,6 +264,31 @@ impl MpegSystemDemux {
         self.first_audio_pts = None;
         self.last_audio_pts = None;
         self.program_ends = 0;
+        self.scr_base = None;
+        self.mux_rate = 0;
+        self.pack_bytes = 0;
+        self.tick_bytes = 0;
+    }
+
+    fn clock_at(&self, bytes: u64) -> Option<u64> {
+        let base = self.scr_base?;
+        (self.mux_rate != 0).then(|| base + bytes * 450 / self.mux_rate)
+    }
+
+    /// Decode clock in 22.5 kHz units: the last pack's SCR plus the bytes fed since, at the mux rate.
+    pub fn clock(&self) -> Option<u64> {
+        self.clock_at(self.pack_bytes)
+    }
+
+    /// Clock extrapolated by the 1/75 s tick (2,304 bytes each) once more than 4,703 bytes passed without a pack header.
+    pub fn tick_clock(&mut self) -> Option<u64> {
+        self.tick_bytes += 2304;
+        if self.tick_bytes > 4703 { self.clock_at(self.tick_bytes) } else { None }
+    }
+
+    fn eat(&mut self, n: usize) {
+        self.pending.drain(..n);
+        self.pack_bytes += n as u64;
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
@@ -245,7 +310,7 @@ impl MpegSystemDemux {
                 return;
             };
             if prefix != 0 {
-                self.pending.drain(..prefix);
+                self.eat(prefix);
             }
             if self.pending.len() < 4 {
                 return;
@@ -258,8 +323,13 @@ impl MpegSystemDemux {
                         return;
                     }
                     if self.pending[4] & 0xF0 == 0x20 {
-                        self.last_scr = Some(Self::decode_mpeg1_scr(&self.pending[4..9]));
+                        let scr = Self::decode_mpeg1_scr(&self.pending[4..9]);
+                        self.last_scr = Some(scr);
+                        self.scr_base = Some(scr >> 2);
+                        self.mux_rate = Self::decode_mpeg1_mux(&self.pending[9..12]);
                         self.pending.drain(..12);
+                        self.pack_bytes = 4;
+                        self.tick_bytes = 0;
                     } else {
                         if self.pending.len() < 14 {
                             return;
@@ -268,11 +338,11 @@ impl MpegSystemDemux {
                         if self.pending.len() < size {
                             return;
                         }
-                        self.pending.drain(..size);
+                        self.eat(size);
                     }
                 }
                 0xB9 => { // ISO Program End
-                    self.pending.drain(..4);
+                    self.eat(4);
                     self.program_ends += 1;
                 }
                 _ => {
@@ -284,14 +354,15 @@ impl MpegSystemDemux {
                         let Some(next) = Self::find_prefix(&self.pending[4..]).map(|v| v + 4) else {
                             return;
                         };
-                        self.pending.drain(..next);
+                        self.eat(next);
                         continue;
                     }
                     let packet_len = 6 + payload_len;
                     if self.pending.len() < packet_len {
                         return;
                     }
-                    let packet: Vec<u8> = self.pending.drain(..packet_len).collect();
+                    let packet: Vec<u8> = self.pending[..packet_len].to_vec();
+                    self.eat(packet_len);
                     self.consume_packet(stream_id, &packet);
                 }
             }
@@ -333,6 +404,10 @@ impl MpegSystemDemux {
             | (u64::from(bytes[2] & 0xFE) << 14)
             | (u64::from(bytes[3]) << 7)
             | u64::from(bytes[4] >> 1)
+    }
+
+    fn decode_mpeg1_mux(bytes: &[u8]) -> u64 {
+        (u64::from(bytes[0] & 0x7F) << 15) | (u64::from(bytes[1]) << 7) | u64::from(bytes[2] >> 1)
     }
 
     fn pes_payload(packet: &[u8]) -> Option<(&[u8], Option<u64>, Option<u64>)> {
@@ -1672,7 +1747,7 @@ opencdi::impl_state!(Dvc {
 
 opencdi::impl_state!(MpegSystemDemux {
     pending, video, audio, last_scr, first_video_pts, last_video_pts, last_video_dts, first_audio_pts, last_audio_pts,
-    selected_audio_stream, selected_video_stream, program_ends,
+    selected_audio_stream, selected_video_stream, program_ends, scr_base, mux_rate, pack_bytes, tick_bytes,
 } skip {});
 
 // The oxideav filterbank is private to that crate; its V buffer holds only the last frame's subband samples, so replaying that frame on load rebuilds it.
@@ -1807,5 +1882,111 @@ mod impeg_tests {
         d.write_word(0xE0420C, 0x0A3F);
         let g = d.audio_gains().unwrap();
         assert!((g[0] - 0.1).abs() < 1e-4 && g[1] == 0.0 && g[2] == 1.0 && g[3] == 0.0);
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    // Silent Layer II frame at 44.1 kHz, 192 kbit/s, stereo, no padding (626 bytes).
+    pub(super) fn silent_frame() -> Vec<u8> {
+        let mut f = vec![0u8; 626];
+        f[..4].copy_from_slice(&[0xFF, 0xFD, 0xA0, 0x00]);
+        f
+    }
+
+    // MPEG-1 pack header: SCR in 90 kHz ticks, mux rate in 50 byte/s units.
+    pub(super) fn pack(scr: u64, mux: u32) -> Vec<u8> {
+        vec![
+            0, 0, 1, 0xBA,
+            0x21 | (((scr >> 30) & 7) as u8) << 1,
+            (scr >> 22) as u8,
+            0x01 | (((scr >> 15) & 0x7F) as u8) << 1,
+            (scr >> 7) as u8,
+            0x01 | ((scr & 0x7F) as u8) << 1,
+            0x80 | ((mux >> 15) & 0x7F) as u8,
+            (mux >> 7) as u8,
+            0x01 | ((mux & 0x7F) as u8) << 1,
+        ]
+    }
+
+    // MPEG-1 audio packet with a PTS (90 kHz ticks).
+    pub(super) fn audio_packet(pts: Option<u64>, payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        match pts {
+            Some(t) => body.extend_from_slice(&[
+                0x21 | (((t >> 30) & 7) as u8) << 1,
+                (t >> 22) as u8,
+                0x01 | (((t >> 15) & 0x7F) as u8) << 1,
+                (t >> 7) as u8,
+                0x01 | ((t & 0x7F) as u8) << 1,
+            ]),
+            None => body.push(0x0F),
+        }
+        body.extend_from_slice(payload);
+        let mut p = vec![0, 0, 1, 0xC0];
+        p.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        p.extend_from_slice(&body);
+        p
+    }
+
+    #[test]
+    fn decode_one_equals_the_loop() {
+        let mut stream = VecDeque::new();
+        for _ in 0..3 {
+            stream.extend(silent_frame());
+        }
+        let mut a = Mp2Decoder::default();
+        let mut b = Mp2Decoder::default();
+        let mut sa = stream.clone();
+        let mut sb = stream;
+        assert_eq!(a.decode_available(&mut sa), 3);
+        let mut n = 0;
+        while let Some(f) = b.decode_one(&mut sb) {
+            assert_eq!((f.samples, f.rate), (1152, 44_100));
+            n += 1;
+        }
+        assert_eq!(n, 3);
+        assert_eq!(a.pcm, b.pcm);
+        assert!(sa.is_empty() && sb.is_empty());
+    }
+
+    #[test]
+    fn frame_interval_in_decode_units() {
+        let mut s = VecDeque::new();
+        s.extend(silent_frame());
+        assert_eq!(Mp2Decoder::peek_interval(&s), Some((1152, 44_100)));
+        assert_eq!(Mp2Decoder::interval_units(1152, 44_100), 588);
+        assert_eq!(Mp2Decoder::interval_units(384, 44_100), 196);
+    }
+
+    #[test]
+    fn clock_follows_scr_and_bytes_whatever_the_chunking() {
+        let mut data = pack(90_000, 3528);
+        data.extend(audio_packet(Some(90_000 + 9_000), &silent_frame()));
+        let mut whole = MpegSystemDemux::default();
+        whole.feed(&data);
+        let mut bytewise = MpegSystemDemux::default();
+        for b in &data {
+            bytewise.feed(&[*b]);
+        }
+        assert_eq!(whole.scr_base, Some(22_500));
+        assert_eq!(whole.mux_rate, 3528);
+        assert_eq!(whole.pack_bytes, 4 + (6 + 5 + 626) as u64);
+        assert_eq!((whole.scr_base, whole.mux_rate, whole.pack_bytes), (bytewise.scr_base, bytewise.mux_rate, bytewise.pack_bytes));
+        assert_eq!(whole.clock(), bytewise.clock());
+        assert_eq!(whole.clock(), Some(22_500 + 642 * 450 / 3528));
+    }
+
+    #[test]
+    fn tick_clock_waits_for_three_ticks_without_a_pack() {
+        let mut d = MpegSystemDemux::default();
+        d.feed(&pack(0, 3528));
+        assert_eq!(d.tick_clock(), None);
+        assert_eq!(d.tick_clock(), None);
+        assert_eq!(d.tick_clock(), Some(3 * 2304 * 450 / 3528));
+        d.feed(&pack(900, 3528));
+        assert_eq!(d.tick_bytes, 0);
     }
 }
