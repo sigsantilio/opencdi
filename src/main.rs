@@ -211,9 +211,17 @@ fn screenshots_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("screenshots"))
 }
 
+// ASCII letters, digits, '-' and '_' only: spaces become '_', brackets are dropped
 fn file_stem(game: &str) -> String {
-    let name: String = game.chars().map(|c| if c.is_alphanumeric() || " ()-_.,'&!".contains(c) { c } else { '_' }).collect();
-    if name.is_empty() { "opencdi".to_string() } else { name }
+    let mut name = String::new();
+    for c in game.chars().filter(|c| !"()[]{}".contains(*c)) {
+        let c = if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' };
+        if c != '_' || !name.ends_with('_') {
+            name.push(c);
+        }
+    }
+    let name = name.trim_matches('_');
+    if name.is_empty() { "opencdi".to_string() } else { name.to_string() }
 }
 
 // <game>_<frame>.png in dir, created on demand
@@ -1651,11 +1659,19 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_names_are_plain_ascii() {
+        assert_eq!(file_stem("Hotel Mario (Europe)"), "Hotel_Mario_Europe");
+        assert_eq!(file_stem("Zelda - The Wand [USA] & co.!"), "Zelda_-_The_Wand_USA_co");
+        assert_eq!(file_stem("Caf\u{e9}/x"), "Caf_x");
+        assert_eq!(file_stem("()"), "opencdi");
+    }
+
+    #[test]
     fn screenshot_is_a_png_in_the_given_folder() {
         let dir = std::env::temp_dir().join(format!("opencdi-shot-test-{}", std::process::id())).join("nested");
         let fb = vec![0x00FF8040u32; SCREEN_WIDTH * SCREEN_HEIGHT];
-        save_screenshot(&dir, "Hotel/Mario", 7, &fb);
-        let data = std::fs::read(dir.join("Hotel_Mario_7.png")).unwrap();
+        save_screenshot(&dir, "Hotel Mario (Europe)", 7, &fb);
+        let data = std::fs::read(dir.join("Hotel_Mario_Europe_7.png")).unwrap();
         assert_eq!(&data[..8], b"\x89PNG\r\n\x1a\n");
         let mut rd = png::Decoder::new(std::io::Cursor::new(&data)).read_info().unwrap();
         let mut buf = vec![0; rd.output_buffer_size().unwrap()];
