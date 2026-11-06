@@ -261,7 +261,7 @@ fn save_screenshot_ppm(frame_count: u64, framebuffer: &[u32]) {
 }
 
 // Flags that take a value, so the value is never mistaken for the disc
-const VALUE_FLAGS: &[&str] = &["--rom", "--frames", "--dvc", "--nvram"];
+const VALUE_FLAGS: &[&str] = &["--rom", "--frames", "--dvc", "--nvram", "--mouse-speed"];
 
 // Disc = first positional argument, skipping flag values; --recent takes a value only when it is a number
 fn first_positional(args: &[String]) -> Option<String> {
@@ -1663,5 +1663,7 @@ mod tests {
         assert_eq!(v(&["--recent", "2", "--mouse"]), None);
         assert_eq!(v(&["--recent", "disc.cue"]), Some("disc.cue".into()));
         assert_eq!(v(&["--mouse", "--bios"]), None);
+        assert_eq!(v(&["--mouse-speed", "0.5", "disc.cue"]), Some("disc.cue".into()));
+        assert_eq!(v(&["--mouse", "--mouse-speed", "0.5", "disc.cue", "--mouse-speed", "2"]), Some("disc.cue".into()));
     }
 }
