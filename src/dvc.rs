@@ -28,6 +28,9 @@ pub const FMV_SCRPOS_Y: usize = 0x74;
 pub const FB_MAX_W: usize = 768;
 pub const FB_MAX_H: usize = 576;
 
+// VMPEG DSP attenuation targets (four bytes, 1 dB steps, bit 7 mute), kept in the register file.
+const FMA_ATT: usize = 0x90;
+
 // FMA Register Byte Offsets (within 0xE03000..0xE030FF)
 pub const FMA_CMD: usize = 0x00;
 pub const FMA_MODE: usize = 0x04;
@@ -451,6 +454,8 @@ pub struct Dvc {
     pub audio_out: VecDeque<(f32, f32)>,
     // Set by an FMA stop or stream reset; the bus clears the unplayed output audio in the same line.
     pub audio_stopped: bool,
+    // VMPEG DSP attenuation upload in progress: bytes taken so far (None when idle).
+    dsp_att: Option<(usize, [u8; 4])>,
 
     pub video_decoder: Option<Video>,
     pub video_width: usize,
@@ -528,6 +533,7 @@ impl Dvc {
             audio_sample_rate: 44_100,
             audio_out: VecDeque::with_capacity(16 * 1024),
             audio_stopped: false,
+            dsp_att: None,
 
             video_decoder: None,
             video_width: 352,
@@ -612,6 +618,8 @@ impl Dvc {
         self.set_fma_word(0x06, 0x0900);
         self.set_fma_word(0x0E, 0x0042);
         self.set_fma_word(0x24, 0x0004); // HF2 DSP flag ready
+        self.fma_regs[FMA_ATT..FMA_ATT + 4].fill(0x80); // the cartridge powers up muted
+        self.dsp_att = None;
 
         // FMV defaults
         self.set_fmv_word(FMV_TIMER, 55);
@@ -926,6 +934,36 @@ impl Dvc {
         self.write_word(addr, data);
     }
 
+    // Player-style gains (left-left, left-right, right-right, right-left) of the cartridge's own attenuator; None while it passes stereo straight through.
+    // Bytes in register order: left-left, left-right, right-left, right-right (inferred from the straight pair 0, mute, mute, 0 both drivers write at Play).
+    pub fn audio_gains(&self) -> Option<[f32; 4]> {
+        let r = &self.fma_regs[FMA_ATT..FMA_ATT + 4];
+        // 1 dB steps, bit 7 mute.
+        let g: Vec<f32> = r.iter().map(|&b| if b & 0x80 != 0 { 0.0 } else { 10f32.powf(-(b as f32) / 20.0) }).collect();
+        if g[0] == 1.0 && g[1] == 0.0 && g[2] == 0.0 && g[3] == 1.0 {
+            return None;
+        }
+        Some([g[0], g[1], g[3], g[2]])
+    }
+
+    // DSP host write: index 1 with a target in 0x90..0x93 starts an attenuation upload, then four index 7 bytes follow.
+    fn dsp_write(&mut self, index: u16, data: u16) {
+        match (index, self.dsp_att) {
+            (1, _) if (0x90..=0x93).contains(&(data & 0xFF)) => self.dsp_att = Some((0, [0; 4])),
+            (7, Some((n, mut b))) => {
+                b[n] = data as u8;
+                if n == 3 {
+                    self.fma_regs[FMA_ATT..FMA_ATT + 4].copy_from_slice(&b);
+                    self.dsp_att = None;
+                } else {
+                    self.dsp_att = Some((n + 1, b));
+                }
+            }
+            (2, _) => {}
+            _ => self.dsp_att = None,
+        }
+    }
+
     pub fn handle_fma_write(&mut self, offset: usize) {
         let value = self.get_fma_word(offset);
         match offset {
@@ -967,6 +1005,7 @@ impl Dvc {
             FMA_ISR => {
                 self.acknowledge_fma_isr();
             }
+            0x24 => self.dsp_write(self.get_fma_word(0x22), value),
             _ => {}
         }
     }
