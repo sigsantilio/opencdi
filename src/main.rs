@@ -259,6 +259,26 @@ fn save_screenshot_ppm(frame_count: u64, framebuffer: &[u32]) {
     }
 }
 
+// Flags that take a value, so the value is never mistaken for the disc
+const VALUE_FLAGS: &[&str] = &["--rom", "--frames", "--dvc", "--nvram"];
+
+// Disc = first positional argument, skipping flag values; --recent takes a value only when it is a number
+fn first_positional(args: &[String]) -> Option<String> {
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        if VALUE_FLAGS.contains(&a.as_str()) {
+            it.next();
+        } else if a == "--recent" {
+            if it.peek().is_some_and(|n| n.parse::<usize>().is_ok()) {
+                it.next();
+            }
+        } else if !a.starts_with("--") {
+            return Some(a.clone());
+        }
+    }
+    None
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has_flag = |f: &str| args.iter().any(|a| a == f);
@@ -358,6 +378,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Load NVRAM if present
     let nvram_arg = args.iter().position(|a| a == "--nvram").and_then(|i| args.get(i + 1)).map(PathBuf::from);
     let resolved_nvram_path = nvram_arg.unwrap_or_else(default_nvram_save_path);
+    m.bus.nvram.save_path = resolved_nvram_path.clone();
     if resolved_nvram_path.is_file() {
         if let Err(e) = m.bus.nvram.load_from_file(&resolved_nvram_path) {
             log::warn!("Impossibile caricare NVRAM da {:?}: {:?}", resolved_nvram_path, e);
@@ -385,16 +406,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut current_game_name = "No disc inserted (Standalone BIOS)".to_string();
     // Disc = first positional argument (skipping flag values); --bios / --standalone force no disc
     let standalone = has_flag("--bios") || has_flag("--standalone");
-    let mut disc_arg = None;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == "--rom" || a == "--frames" || a == "--dvc" || (a == "--recent" && recent_pick.is_some()) {
-            it.next();
-        } else if !a.starts_with("--") {
-            disc_arg = Some(a.clone());
-            break;
-        }
-    }
+    let mut disc_arg = first_positional(&args);
     if let Some(n) = recent_pick {
         disc_arg = opencdi::frontend::recent_images().get(n.wrapping_sub(1)).map(|p| p.to_string_lossy().to_string());
         if disc_arg.is_none() {
@@ -1638,5 +1650,16 @@ mod tests {
         assert_eq!(cursor_to_cdi(PhysicalPosition::new(100.0, 200.0), image_rect(768, 560)), (100, 200));
         assert_eq!(cursor_to_cdi(PhysicalPosition::new(219.0 + 1481.0, 1080.0), image_rect(1920, 1080)), (767, 559));
         assert_eq!(cursor_to_cdi(PhysicalPosition::new(0.0, 0.0), image_rect(1920, 1080)), (0, 0));
+    }
+
+    #[test]
+    fn disc_is_the_first_positional_after_flag_values() {
+        let v = |a: &[&str]| first_positional(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(v(&["--nvram", "/tmp/n.bin", "disc.cue"]), Some("disc.cue".into()));
+        assert_eq!(v(&["--rom", "b.rom", "--frames", "10", "--dvc", "d.rom", "disc.cue"]), Some("disc.cue".into()));
+        assert_eq!(v(&["disc.cue", "--nvram", "/tmp/n.bin"]), Some("disc.cue".into()));
+        assert_eq!(v(&["--recent", "2", "--mouse"]), None);
+        assert_eq!(v(&["--recent", "disc.cue"]), Some("disc.cue".into()));
+        assert_eq!(v(&["--mouse", "--bios"]), None);
     }
 }
