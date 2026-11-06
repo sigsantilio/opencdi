@@ -80,6 +80,7 @@ Usage: opencdi [options] [disc image (cue, chd, iso, bin)]
 
   --rom <path>        System BIOS (default: search bios/, the current and the program directory)
   --frames <n>        Quit after n emulated frames
+  --screenshot-dir <path>  Folder for F8/F12 PNG screenshots (default: screenshots/ next to the program)
   --mouse             Start in mouse mode (host mouse drives the CD-i pointer)
   --recent [n]        List the recent disc images, or boot recent image number n
   --no-host-input     Ignore host keyboard, mouse and gamepads; never grab the cursor
@@ -203,58 +204,38 @@ fn find_nvram_file() -> Option<PathBuf> {
     None
 }
 
-fn save_screenshot(frame_count: u64, framebuffer: &[u32]) {
-    let _ = std::fs::create_dir_all("screenshots_hotel_mario");
-    let filename = format!("screenshots_hotel_mario/screenshot_frame_{}.bmp", frame_count);
-    let width = SCREEN_WIDTH as i32;
-    let height = SCREEN_HEIGHT as i32;
-    let file_size = 54 + (width * height * 4) as u32;
-    let mut bmp = Vec::with_capacity(file_size as usize);
-    bmp.extend_from_slice(b"BM");
-    bmp.extend_from_slice(&file_size.to_le_bytes());
-    bmp.extend_from_slice(&[0, 0, 0, 0]);
-    bmp.extend_from_slice(&54u32.to_le_bytes());
-    bmp.extend_from_slice(&40u32.to_le_bytes());
-    bmp.extend_from_slice(&width.to_le_bytes());
-    bmp.extend_from_slice(&(-height).to_le_bytes());
-    bmp.extend_from_slice(&1u16.to_le_bytes());
-    bmp.extend_from_slice(&32u16.to_le_bytes());
-    bmp.extend_from_slice(&0u32.to_le_bytes());
-    bmp.extend_from_slice(&((width * height * 4) as u32).to_le_bytes());
-    bmp.extend_from_slice(&2835u32.to_le_bytes());
-    bmp.extend_from_slice(&2835u32.to_le_bytes());
-    bmp.extend_from_slice(&0u32.to_le_bytes());
-    bmp.extend_from_slice(&0u32.to_le_bytes());
-    for &pixel in framebuffer {
-        bmp.push((pixel & 0xFF) as u8);
-        bmp.push(((pixel >> 8) & 0xFF) as u8);
-        bmp.push(((pixel >> 16) & 0xFF) as u8);
-        bmp.push(0xFF);
-    }
-    if let Ok(_) = std::fs::write(&filename, &bmp) {
-        info!("Screenshot salvato in {}", filename);
-    }
-}
-
-// F8: binary PPM (no image crate needed) into screenshots/ next to the binary
-fn save_screenshot_ppm(frame_count: u64, framebuffer: &[u32]) {
-    let dir = std::env::current_exe()
+fn screenshots_dir() -> PathBuf {
+    std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("screenshots")))
-        .unwrap_or_else(|| PathBuf::from("screenshots"));
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+        .unwrap_or_else(|| PathBuf::from("screenshots"))
+}
+
+fn file_stem(game: &str) -> String {
+    let name: String = game.chars().map(|c| if c.is_alphanumeric() || " ()-_.,'&!".contains(c) { c } else { '_' }).collect();
+    if name.is_empty() { "opencdi".to_string() } else { name }
+}
+
+// <game>_<frame>.png in dir, created on demand
+fn save_screenshot(dir: &Path, game: &str, frame_count: u64, framebuffer: &[u32]) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
         error!("Cannot create screenshot directory {:?}: {}", dir, e);
         return;
     }
-    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let path = dir.join(format!("opencdi_{}_frame{}.ppm", stamp, frame_count));
-    let mut ppm = format!("P6\n{} {}\n255\n", SCREEN_WIDTH, SCREEN_HEIGHT).into_bytes();
-    ppm.reserve(SCREEN_WIDTH * SCREEN_HEIGHT * 3);
+    let path = dir.join(format!("{}_{}.png", file_stem(game), frame_count));
+    let mut rgb = Vec::with_capacity(SCREEN_WIDTH * SCREEN_HEIGHT * 3);
     for &pixel in &framebuffer[..SCREEN_WIDTH * SCREEN_HEIGHT] {
-        ppm.extend_from_slice(&[(pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8]);
+        rgb.extend_from_slice(&[(pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8]);
     }
-    match std::fs::write(&path, &ppm) {
-        Ok(_) => info!("Screenshot saved to {:?}", path),
+    let write = || -> Result<(), Box<dyn std::error::Error>> {
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(&path)?), SCREEN_WIDTH as u32, SCREEN_HEIGHT as u32);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header()?.write_image_data(&rgb)?;
+        Ok(())
+    };
+    match write() {
+        Ok(()) => info!("Screenshot saved to {:?}", path),
         Err(e) => error!("Cannot write screenshot {:?}: {}", path, e),
     }
 }
@@ -315,6 +296,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flag_value = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
     let rom_arg = flag_value("--rom").map(PathBuf::from);
     let max_frames: Option<u64> = flag_value("--frames").and_then(|s| s.parse().ok());
+    let screenshot_dir = flag_value("--screenshot-dir").map(PathBuf::from).unwrap_or_else(screenshots_dir);
 
     let mut m = Machine::new();
     m.bus.slave.debug_log = has_flag("--slave-debug");
@@ -498,6 +480,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mouse_middle: false,
         prev_middle: false,
         mouse_captured: true,
+        screenshot_dir,
         host_input: !has_flag("--no-host-input"),
         run_in_menu: has_flag("--run-in-menu"),
         in_modal_pump: false,
@@ -530,7 +513,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         measured_cd_rate: 0.0,
     };
 
-    info!("Emulation loop started. Shortcuts: [F11]/[Alt+Enter] Fullscreen, [F5]/[H] Reset, [P] Pause, [Space] hold Fast-forward, [F8] Screenshot (PPM), [F12] Screenshot (BMP), [M] Mute, [+]/[-] Volume, [Ctrl+I] Insert Disc, [Ctrl+O] Open & Reset, [Middle Click] Capture/Release Mouse, [Esc] Quit");
+    info!("Emulation loop started. Shortcuts: [F11]/[Alt+Enter] Fullscreen, [F5]/[H] Reset, [P] Pause, [Space] hold Fast-forward, [F8]/[F12] Screenshot (PNG), [M] Mute, [+]/[-] Volume, [Ctrl+I] Insert Disc, [Ctrl+O] Open & Reset, [Middle Click] Capture/Release Mouse, [Esc] Quit");
 
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut app)?;
@@ -638,6 +621,7 @@ struct App {
     mouse_middle: bool,
     prev_middle: bool,
     mouse_captured: bool,
+    screenshot_dir: PathBuf,
     host_input: bool,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     run_in_menu: bool,
@@ -687,6 +671,10 @@ impl App {
                 _ => None,
             })
             .unwrap_or(std::ptr::null_mut())
+    }
+
+    fn take_screenshot(&self) {
+        save_screenshot(&self.screenshot_dir, &self.current_game_name, self.frame_count, &self.m.bus.mcd212.framebuffer[..]);
     }
 
     fn toggle_fullscreen(&mut self) {
@@ -801,8 +789,7 @@ impl App {
             }
             Key::F11 => self.toggle_fullscreen(),
             Key::Enter | Key::NumpadEnter if alt => self.toggle_fullscreen(),
-            Key::F8 => save_screenshot_ppm(self.frame_count, &self.m.bus.mcd212.framebuffer[..]),
-            Key::F12 => save_screenshot(self.frame_count, &self.m.bus.mcd212.framebuffer[..]),
+            Key::F8 | Key::F12 => self.take_screenshot(),
             Key::KeyM if !self.bound(code) => {
                 self.m.bus.cdic.audio.muted = !self.m.bus.cdic.audio.muted;
                 info!("Audio: {}", if self.m.bus.cdic.audio.muted { "MUTED" } else { "UNMUTED" });
@@ -938,7 +925,7 @@ impl App {
                     self.toggle_fullscreen();
                 }
                 GuiAction::TakeScreenshot => {
-                    save_screenshot(self.frame_count, &self.m.bus.mcd212.framebuffer[..]);
+                    self.take_screenshot();
                 }
                 GuiAction::SetVideoMode(mode) => {
                     self.m.bus.set_video_mode(mode);
@@ -1661,5 +1648,20 @@ mod tests {
         assert_eq!(v(&["--recent", "2", "--mouse"]), None);
         assert_eq!(v(&["--recent", "disc.cue"]), Some("disc.cue".into()));
         assert_eq!(v(&["--mouse", "--bios"]), None);
+    }
+
+    #[test]
+    fn screenshot_is_a_png_in_the_given_folder() {
+        let dir = std::env::temp_dir().join(format!("opencdi-shot-test-{}", std::process::id())).join("nested");
+        let fb = vec![0x00FF8040u32; SCREEN_WIDTH * SCREEN_HEIGHT];
+        save_screenshot(&dir, "Hotel/Mario", 7, &fb);
+        let data = std::fs::read(dir.join("Hotel_Mario_7.png")).unwrap();
+        assert_eq!(&data[..8], b"\x89PNG\r\n\x1a\n");
+        let mut rd = png::Decoder::new(std::io::Cursor::new(&data)).read_info().unwrap();
+        let mut buf = vec![0; rd.output_buffer_size().unwrap()];
+        let info = rd.next_frame(&mut buf).unwrap();
+        assert_eq!((info.width, info.height), (SCREEN_WIDTH as u32, SCREEN_HEIGHT as u32));
+        assert_eq!(&buf[..3], &[0xFF, 0x80, 0x40]);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 }
