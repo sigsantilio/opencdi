@@ -188,6 +188,9 @@ pub struct CpuCore {
     /// debugger field below, this is cleared before every opcode fetch.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) instruction_exception_vector: Option<u32>,
+    /// Register count of the MOVEM that just decoded, read by the SCC68070 timing.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) movem_count: u32,
     /// True when the bit-field instruction currently being timed spanned a
     /// five-byte memory window (MC68020UM 8.2.14 bills those one operand
     /// cycle higher than fields within four bytes). Set by the memory-form
@@ -554,6 +557,7 @@ impl CpuCore {
             run_mode: 0,
             exception_processing: false,
             instruction_exception_vector: None,
+            movem_count: 0,
             bitfield_mem_wide_span: false,
             last_exception_vector: None,
             has_pmmu: false,
