@@ -81,7 +81,7 @@ Usage: opencdi [options] [disc image (cue, chd, iso, bin)]
   --rom <path>        System BIOS (default: search bios/, the current and the program directory)
   --frames <n>        Quit after n emulated frames
   --mouse             Start in mouse mode (host mouse drives the CD-i pointer; click in the window to capture it)
-  --mouse-speed <f>   Scale captured mouse motion (default 1.0)
+  --mouse-speed <f>   Scale captured mouse motion (default 0.5)
   --recent [n]        List the recent disc images, or boot recent image number n
   --no-host-input     Ignore host keyboard, mouse and gamepads; never grab the cursor
   --bios, --standalone  Boot the BIOS shell without a disc
@@ -316,7 +316,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flag_value = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
     let rom_arg = flag_value("--rom").map(PathBuf::from);
     let max_frames: Option<u64> = flag_value("--frames").and_then(|s| s.parse().ok());
-    let mouse_speed: f64 = flag_value("--mouse-speed").and_then(|s| s.parse().ok()).filter(|v: &f64| v.is_finite() && *v > 0.0).unwrap_or(1.0);
+    let mouse_speed: f64 = flag_value("--mouse-speed").and_then(|s| s.parse().ok()).filter(|v: &f64| v.is_finite() && *v > 0.0).unwrap_or(0.5);
 
     let mut m = Machine::new();
     m.bus.slave.debug_log = has_flag("--slave-debug");
