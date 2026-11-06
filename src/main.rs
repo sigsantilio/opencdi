@@ -496,6 +496,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cursor: None,
         rel_pointer: None,
         mouse_left: false,
+        swallow_left: false,
         mouse_right: false,
         mouse_middle: false,
         prev_middle: false,
@@ -637,6 +638,7 @@ struct App {
     cursor: Option<PhysicalPosition<f64>>,
     rel_pointer: Option<(f64, f64)>,
     mouse_left: bool,
+    swallow_left: bool,
     mouse_right: bool,
     mouse_middle: bool,
     prev_middle: bool,
@@ -1096,6 +1098,7 @@ impl App {
         // Left click inside window re-captures mouse if released
         if is_active && !self.mouse_captured && self.mouse_left && self.cursor.is_some() {
             self.mouse_captured = true;
+            self.swallow_left = true;
             info!("Controllo mouse: CATTURATO (focus console, puntatore host nascosto)");
         }
         self.apply_grab();
@@ -1209,7 +1212,9 @@ impl App {
                 (mouse_x, mouse_y) = cursor_to_cdi(pos, self.image_rect);
             }
             if self.rel_pointer.is_some() || self.cursor.is_some() {
-                if self.mouse_left { mouse_btn |= 1; }
+                // The click that captured the pointer never reaches the console
+                self.swallow_left &= self.mouse_left;
+                if self.mouse_left && !self.swallow_left { mouse_btn |= 1; }
                 if self.mouse_right { mouse_btn |= 2; }
             }
         }
