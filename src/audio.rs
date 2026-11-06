@@ -240,8 +240,6 @@ pub struct CdiAudio {
     pub resampler: Resampler,
     pub map_resampler: Resampler,
     pub attenuation: [u8; 4],
-    /// Gains left-to-left, left-to-right, right-to-right, right-to-left; None passes the stereo pair unchanged.
-    pub matrix: Option<[f32; 4]>,
     pub total_sectors_decoded: u64,
     // ADPCM disc or CPU-fed, audio map or TACS, DVC MPEG audio.
     pub main: Stream,
@@ -269,7 +267,6 @@ impl CdiAudio {
             resampler: Resampler::new(),
             map_resampler: Resampler::new(),
             attenuation: [0xFF, 0, 0xFF, 0],
-            matrix: None,
             total_sectors_decoded: 0,
             main: Stream::default(),
             sfx: Stream::default(),
@@ -292,14 +289,28 @@ impl CdiAudio {
         self.attenuation = [0xFF, 0, 0xFF, 0];
     }
 
-    // Mixes the output frames that fall in `cycles` of board time.
-    pub fn advance(&mut self, cycles: u32, sector_cycles: u32) {
+    // Player attenuation matrix of the Mono-I slave (left-to-left, left-to-right, right-to-right, right-to-left); None while it passes stereo straight through.
+    pub fn slave_gains(&self) -> Option<[f32; 4]> {
+        if self.attenuation == [0xFF, 0, 0xFF, 0] {
+            return None;
+        }
+        let g = self.attenuation.map(|a| a as f32 / 255.0);
+        Some(g)
+    }
+
+    // Mixes the output frames that fall in `cycles` of board time; `gains` is the player attenuation as it stands now, applied to the ADPCM streams only.
+    pub fn advance(&mut self, cycles: u32, sector_cycles: u32, gains: Option<[f32; 4]>) {
         let n = self.clock.advance(cycles as u64, sector_cycles);
         let start = self.out.len();
         self.out.resize(start + n, (0.0, 0.0));
         let frames = &mut self.out[start..];
         self.main.mix_into(frames);
         self.sfx.mix_into(frames);
+        if let Some([ll, lr, rr, rl]) = gains {
+            for (l, r) in frames.iter_mut() {
+                (*l, *r) = (*l * ll + *r * rl, *r * rr + *l * lr);
+            }
+        }
         self.mpeg.mix_into(frames);
     }
 
@@ -337,15 +348,10 @@ impl CdiAudio {
         payload: &[u8],
         is_stereo: bool,
         is_8bit: bool,
-        attenuation: [u8; 4],
         left_state: &mut ChannelState,
         right_state: &mut ChannelState,
     ) -> Vec<(f32, f32)> {
         let mut samples = Vec::with_capacity(18 * 224);
-        let scale_ll = attenuation[0] as f32 / 255.0;
-        let scale_lr = attenuation[1] as f32 / 255.0;
-        let scale_rr = attenuation[2] as f32 / 255.0;
-        let scale_rl = attenuation[3] as f32 / 255.0;
 
         for g in 0..18 {
             let group = &payload[g * 128..(g + 1) * 128];
@@ -372,9 +378,7 @@ impl CdiAudio {
                     for s in 0..56 {
                         let sl = group_samples[0][s] as f32 / 32768.0;
                         let sr = group_samples[1][s] as f32 / 32768.0;
-                        let out_l = sl * scale_ll + sr * scale_rl;
-                        let out_r = sl * scale_lr + sr * scale_rr;
-                        samples.push((out_l, out_r));
+                        samples.push((sl, sr));
                     }
                 } else {
                     let mut mono_samples = [0i16; 112];
@@ -390,9 +394,7 @@ impl CdiAudio {
                     }
                     for s in 0..112 {
                         let sm = mono_samples[s] as f32 / 32768.0;
-                        let out_l = sm * (scale_ll + scale_rl);
-                        let out_r = sm * (scale_rr + scale_lr);
-                        samples.push((out_l, out_r));
+                        samples.push((sm, sm));
                     }
                 }
             } else {
@@ -420,9 +422,7 @@ impl CdiAudio {
                     for s in 0..112 {
                         let sl = group_samples[0][s] as f32 / 32768.0;
                         let sr = group_samples[1][s] as f32 / 32768.0;
-                        let out_l = sl * scale_ll + sr * scale_rl;
-                        let out_r = sl * scale_lr + sr * scale_rr;
-                        samples.push((out_l, out_r));
+                        samples.push((sl, sr));
                     }
                 } else {
                     let mut mono_samples = [0i16; 224];
@@ -440,20 +440,9 @@ impl CdiAudio {
                     }
                     for s in 0..224 {
                         let sm = mono_samples[s] as f32 / 32768.0;
-                        let out_l = sm * (scale_ll + scale_rl);
-                        let out_r = sm * (scale_rr + scale_lr);
-                        samples.push((out_l, out_r));
+                        samples.push((sm, sm));
                     }
                 }
-            }
-        }
-        samples
-    }
-
-    fn apply_matrix(&self, mut samples: Vec<(f32, f32)>) -> Vec<(f32, f32)> {
-        if let Some([ll, lr, rr, rl]) = self.matrix {
-            for (l, r) in samples.iter_mut() {
-                (*l, *r) = (*l * ll + *r * rl, *r * rr + *l * lr);
             }
         }
         samples
@@ -478,12 +467,10 @@ impl CdiAudio {
             payload,
             is_stereo,
             is_8bit,
-            self.attenuation,
             &mut self.left_state,
             &mut self.right_state,
         );
         let final_samples = Self::resample(&mut self.resampler, &samples, sample_rate);
-        let final_samples = self.apply_matrix(final_samples);
 
         let k = SectorKind { frames: final_samples.len(), is_8bit, is_stereo, rate: sample_rate };
         self.main.push(&final_samples, ADPCM_LATENCY, k.bound(), &|| format!("main {}", k.level()));
@@ -500,12 +487,10 @@ impl CdiAudio {
             payload,
             is_stereo,
             is_8bit,
-            self.attenuation,
             &mut self.map_left_state,
             &mut self.map_right_state,
         );
         let final_samples = Self::resample(&mut self.map_resampler, &samples, sample_rate);
-        let final_samples = self.apply_matrix(final_samples);
 
         let k = SectorKind { frames: final_samples.len(), is_8bit, is_stereo, rate: sample_rate };
         self.sfx.push(&final_samples, ADPCM_LATENCY, k.bound(), &|| format!("sfx {}", k.level()));
@@ -689,7 +674,7 @@ opencdi::impl_state!(Stream { fifo, primed } skip { warned, restarts, warnings, 
 
 impl opencdi::savestate::State for CdiAudio {
     fn save(&self, w: &mut Vec<u8>) {
-        let Self { left_state, right_state, map_left_state, map_right_state, resampler, map_resampler, attenuation, matrix: _, total_sectors_decoded, main, sfx, mpeg, rate_warned: _, clock, out, scratch: _ } = self;
+        let Self { left_state, right_state, map_left_state, map_right_state, resampler, map_resampler, attenuation, total_sectors_decoded, main, sfx, mpeg, rate_warned: _, clock, out, scratch: _ } = self;
         for s in [left_state, right_state, map_left_state, map_right_state] {
             s.save(w);
         }
@@ -705,7 +690,7 @@ impl opencdi::savestate::State for CdiAudio {
     }
 
     fn load(&mut self, r: &mut opencdi::savestate::Reader) -> Result<(), opencdi::savestate::StateError> {
-        let Self { left_state, right_state, map_left_state, map_right_state, resampler, map_resampler, attenuation, matrix: _, total_sectors_decoded, main, sfx, mpeg, rate_warned: _, clock, out, scratch: _ } = self;
+        let Self { left_state, right_state, map_left_state, map_right_state, resampler, map_resampler, attenuation, total_sectors_decoded, main, sfx, mpeg, rate_warned: _, clock, out, scratch: _ } = self;
         for s in [left_state, right_state, map_left_state, map_right_state] {
             s.load(r)?;
         }
@@ -727,14 +712,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn output_matrix_mixes_and_mutes_the_stereo_pair() {
+    fn player_attenuation_acts_on_adpcm_at_the_mix_and_not_on_mpeg() {
         let mut a = CdiAudio::new();
-        let input = vec![(0.5f32, 0.25f32)];
-        assert_eq!(a.apply_matrix(input.clone()), input);
-        a.matrix = Some([1.0, 1.0, 1.0, 1.0]);
-        assert_eq!(a.apply_matrix(input.clone()), vec![(0.75, 0.75)]);
-        a.matrix = Some([0.0, 0.0, 1.0, 0.0]);
-        assert_eq!(a.apply_matrix(input), vec![(0.0, 0.25)]);
+        a.main.push(&[(0.5, 0.25); 4000], 0, usize::MAX, &String::new);
+        a.push_mpeg(&mut VecDeque::from(vec![(0.1, 0.1); 4000]), 44_100);
+        let sector = VideoMode::Pal.cycles_per_sector();
+        let mut out = Vec::new();
+        a.advance(960, sector, None);
+        a.advance(960, sector, Some([1.0, 1.0, 1.0, 1.0]));
+        a.advance(960, sector, Some([0.0, 0.0, 1.0, 0.0]));
+        a.drain(&mut out);
+        let n = out.len() / 3;
+        assert_eq!(out[0], (0.6, 0.35));
+        assert_eq!(out[n + 1], (0.85, 0.85));
+        assert_eq!(out[2 * n + 1], (0.1, 0.35));
+    }
+
+    #[test]
+    fn slave_gains_follow_the_attenuation_registers() {
+        let mut a = CdiAudio::new();
+        assert_eq!(a.slave_gains(), None);
+        a.set_attenuation([255, 255, 0, 0]);
+        assert_eq!(a.slave_gains(), Some([1.0, 1.0, 0.0, 0.0]));
     }
 
     #[test]
@@ -746,7 +745,7 @@ mod tests {
             g[16..].fill(0x01);
         }
         let (mut l, mut r) = (ChannelState::default(), ChannelState::default());
-        let out = CdiAudio::decode_xa_payload(&payload, false, true, [255, 0, 255, 0], &mut l, &mut r);
+        let out = CdiAudio::decode_xa_payload(&payload, false, true, &mut l, &mut r);
         assert_eq!(out[0].0, 256.0 / 32768.0);
     }
 
@@ -833,7 +832,7 @@ mod tests {
     fn mpeg_plays_without_start_latency() {
         let mut a = CdiAudio::new();
         a.push_mpeg(&mut VecDeque::from(vec![(0.25, 0.25); 1152]), 44_100);
-        a.advance(960, VideoMode::Pal.cycles_per_sector());
+        a.advance(960, VideoMode::Pal.cycles_per_sector(), None);
         let mut out = Vec::new();
         a.drain(&mut out);
         assert_eq!((out[0], out[1]), ((0.25, 0.25), (0.25, 0.25)));
@@ -847,7 +846,7 @@ mod tests {
             a.main.push(&[(v, -v); 700], ADPCM_LATENCY, usize::MAX, &String::new);
             a.push_mpeg(&mut VecDeque::from(vec![(0.2, 0.3); 1152]), 44_100);
             for _ in 0..262 {
-                a.advance(960, sector);
+                a.advance(960, sector, None);
             }
         };
         let mut a = CdiAudio::new();

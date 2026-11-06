@@ -390,7 +390,7 @@ impl Ciap {
     }
 
     /// Output gains from the attenuation registers (left-to-left, left-to-right, right-to-right, right-to-left); None while they pass stereo straight through.
-    fn attenuation(&self) -> Option<[f32; 4]> {
+    pub fn attenuation(&self) -> Option<[f32; 4]> {
         let (a, b) = (self.reg(REG_ATT_LEFT), self.reg(REG_ATT_RIGHT));
         if (a & 0x3F3F, b & 0x3F3F) == (ATT_STRAIGHT, ATT_STRAIGHT) {
             return None;
@@ -426,7 +426,6 @@ impl Ciap {
         if self.tacs_selected(submode, channel) {
             let coding = raw[23];
             // Own decoder state and queue, so a CPU-fed stream at the same time is not disturbed.
-            audio.matrix = self.attenuation();
             audio.decode_audio_map_sector(&raw[24..24 + AUDIO_LEN], coding & 0x03 == 0x01, coding & 0x30 == 0x10, if coding & 0x0C == 0x04 { 18900 } else { 37800 });
             self.audio_sectors += 1;
             if self.audio_playing {
@@ -529,7 +528,6 @@ impl Ciap {
             return;
         };
         let (at, coding) = (AUDIO_BUFS[i], self.audio_coding[i]);
-        audio.matrix = self.attenuation();
         audio.decode_sector(&self.ram[at..at + AUDIO_LEN], coding & 0x03 == 0x01, coding & 0x30 == 0x10, if coding & 0x0C == 0x04 { 18900 } else { 37800 });
         self.set(REG_BMAN, bman & !(1 << i));
         self.set(REG_ISR, self.reg(REG_ISR) | ISR_AUDIO_DONE);

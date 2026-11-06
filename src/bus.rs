@@ -352,7 +352,11 @@ impl CdiBus {
         if std::mem::take(&mut self.dvc.audio_stopped) {
             self.cdic.audio.stop_mpeg();
         }
-        self.cdic.audio.advance(cycles, self.mcd212.video_mode.cycles_per_sector());
+        let gains = match self.board {
+            BoardKind::Mono1 => self.cdic.audio.slave_gains(),
+            BoardKind::Mono4 => self.mono4.as_deref().and_then(|m| m.ciap.attenuation()),
+        };
+        self.cdic.audio.advance(cycles, self.mcd212.video_mode.cycles_per_sector(), gains);
     }
 
     /// Highest external interrupt level the board peripherals request (0 for none).
