@@ -358,6 +358,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Load NVRAM if present
     let nvram_arg = args.iter().position(|a| a == "--nvram").and_then(|i| args.get(i + 1)).map(PathBuf::from);
     let resolved_nvram_path = nvram_arg.unwrap_or_else(default_nvram_save_path);
+    m.bus.nvram.save_path = resolved_nvram_path.clone();
     if resolved_nvram_path.is_file() {
         if let Err(e) = m.bus.nvram.load_from_file(&resolved_nvram_path) {
             log::warn!("Impossibile caricare NVRAM da {:?}: {:?}", resolved_nvram_path, e);
