@@ -199,15 +199,6 @@ impl Mp2Decoder {
         if rate == 0 { 0 } else { (u64::from(samples) * 22_500 + u64::from(rate) - 1) / u64::from(rate) }
     }
 
-    // A trailing partial frame cannot be decoded, so it does not keep the decoder fed.
-    pub fn has_frame(input: &VecDeque<u8>) -> bool {
-        if input.len() < 4 {
-            return false;
-        }
-        let head = [input[0], input[1], input[2], input[3]];
-        oxideav_mp2::header::FrameHeader::parse(&head).map_or(false, |h| input.len() >= h.frame_size_bytes())
-    }
-
     fn append_native(output: &mut VecDeque<(f32, f32)>, channels: &[Vec<f64>]) {
         let Some(left) = channels.first() else { return; };
         let right = channels.get(1).unwrap_or(left);
