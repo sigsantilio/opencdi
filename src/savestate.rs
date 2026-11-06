@@ -494,7 +494,6 @@ pub fn save_state_to_file<P: AsRef<Path>>(
     w.write_usize(bus.dvc.frames_presented_count);
     w.write_usize(bus.dvc.vsync_counter);
     w.write_u32(bus.dvc.underflow_count);
-    w.write_u32(bus.dvc.fma_underflow_count);
     w.write_bool(bus.dvc.has_valid_frame);
 
     // Video Decoder
@@ -872,7 +871,6 @@ pub fn load_state_from_file<P: AsRef<Path>>(
     bus.dvc.frames_presented_count = r.read_usize()?;
     bus.dvc.vsync_counter = r.read_usize()?;
     bus.dvc.underflow_count = r.read_u32()?;
-    bus.dvc.fma_underflow_count = r.read_u32()?;
     bus.dvc.has_valid_frame = r.read_bool()?;
 
     if r.read_bool()? {
