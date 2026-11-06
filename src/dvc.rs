@@ -320,9 +320,9 @@ impl MpegSystemDemux {
         self.clock_at(self.pack_bytes)
     }
 
-    /// Clock extrapolated by the 1/75 s tick (2,304 bytes each) once more than 4,703 bytes passed without a pack header.
+    /// Clock extrapolated by the 1/75 s tick (2,352 bytes each) once more than 4,703 bytes passed without a pack header.
     pub fn tick_clock(&mut self) -> Option<u64> {
-        self.tick_bytes += 2304;
+        self.tick_bytes += 2352;
         if self.tick_bytes > 4703 { self.clock_at(self.tick_bytes) } else { None }
     }
 
