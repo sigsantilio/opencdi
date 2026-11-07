@@ -12,6 +12,7 @@ use crate::mcd212::Mcd212;
 use crate::nvram::Timekeeper;
 use crate::scc_timer::SccTimer;
 use crate::slave::SlaveHle;
+use crate::tap::{self, Counters, Taps};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SharedIn4Owner {
@@ -49,6 +50,8 @@ pub struct CdiBus {
     pub watch_enabled: bool,
     pub trace_fmv: bool,
     pub current_frame: u64,
+    pub taps: Taps,
+    pub counters: Counters,
 }
 
 impl CdiBus {
@@ -81,6 +84,8 @@ impl CdiBus {
             watch_enabled: false,
             trace_fmv: false,
             current_frame: 0,
+            taps: Taps::from_env(),
+            counters: Counters::default(),
         }
     }
 
@@ -405,8 +410,8 @@ impl CdiBus {
     }
 }
 
-impl AddressBus for CdiBus {
-    fn read_byte(&mut self, address: u32) -> u8 {
+impl CdiBus {
+    fn rd8(&mut self, address: u32) -> u8 {
         // SCC68070 On-Chip Registers (0x80000000..0x8000FFFF or 0x0080XXXX)
         if (address & 0xFFFF_0000) == 0x8000_0000 || (address & 0x00FF_0000) == 0x0080_0000 {
             let reg = address & 0xFFFF;
@@ -537,12 +542,13 @@ impl AddressBus for CdiBus {
 
             _ => {
                 trace!("Unmapped read_byte at 0x{:06X}", addr);
+                self.counters.unmapped += 1;
                 0xFF
             }
         }
     }
 
-    fn read_word(&mut self, address: u32) -> u16 {
+    fn rd16(&mut self, address: u32) -> u16 {
         // SCC68070 On-Chip Registers (0x80000000..0x8000FFFF or 0x0080XXXX)
         if (address & 0xFFFF_0000) == 0x8000_0000 || (address & 0x00FF_0000) == 0x0080_0000 {
             let reg = address & 0xFFFF;
@@ -553,8 +559,8 @@ impl AddressBus for CdiBus {
                 let offset = (reg - 0x4000) & !1;
                 return self.dma.read_reg(offset);
             }
-            let hi = self.read_byte(address) as u16;
-            let lo = self.read_byte(address.wrapping_add(1)) as u16;
+            let hi = self.rd8(address) as u16;
+            let lo = self.rd8(address.wrapping_add(1)) as u16;
             return (hi << 8) | lo;
         }
 
@@ -639,20 +645,14 @@ impl AddressBus for CdiBus {
                 }
             }
             _ => {
-                let hi = self.read_byte(address) as u16;
-                let lo = self.read_byte(address.wrapping_add(1)) as u16;
+                let hi = self.rd8(address) as u16;
+                let lo = self.rd8(address.wrapping_add(1)) as u16;
                 (hi << 8) | lo
             }
         }
     }
 
-    fn read_long(&mut self, address: u32) -> u32 {
-        let hi = self.read_word(address) as u32;
-        let lo = self.read_word(address.wrapping_add(2)) as u32;
-        (hi << 16) | lo
-    }
-
-    fn write_byte(&mut self, address: u32, value: u8) {
+    fn wr8(&mut self, address: u32, value: u8) {
         // SCC68070 On-Chip Registers
         if (address & 0xFFFF_0000) == 0x8000_0000 || (address & 0x00FF_0000) == 0x0080_0000 {
             let reg = address & 0xFFFF;
@@ -805,11 +805,12 @@ impl AddressBus for CdiBus {
 
             _ => {
                 trace!("Unmapped write_byte at 0x{:06X}: 0x{:02X}", addr, value);
+                self.counters.unmapped += 1;
             }
         }
     }
 
-    fn write_word(&mut self, address: u32, value: u16) {
+    fn wr16(&mut self, address: u32, value: u16) {
         // SCC68070 On-Chip Registers (0x80000000..0x8000FFFF or 0x0080XXXX)
         if (address & 0xFFFF_0000) == 0x8000_0000 || (address & 0x00FF_0000) == 0x0080_0000 {
             let reg = address & 0xFFFF;
@@ -826,8 +827,8 @@ impl AddressBus for CdiBus {
                 }
                 return;
             }
-            self.write_byte(address, (value >> 8) as u8);
-            self.write_byte(address.wrapping_add(1), value as u8);
+            self.wr8(address, (value >> 8) as u8);
+            self.wr8(address.wrapping_add(1), value as u8);
             return;
         }
 
@@ -916,16 +917,11 @@ impl AddressBus for CdiBus {
             }
             _ => {}
         }
-        self.write_byte(address, (value >> 8) as u8);
-        self.write_byte(address.wrapping_add(1), value as u8);
+        self.wr8(address, (value >> 8) as u8);
+        self.wr8(address.wrapping_add(1), value as u8);
     }
 
-    fn write_long(&mut self, address: u32, value: u32) {
-        self.write_word(address, (value >> 16) as u16);
-        self.write_word(address.wrapping_add(2), value as u16);
-    }
-
-    fn interrupt_acknowledge(&mut self, level: u8) -> u32 {
+    fn iack(&mut self, level: u8) -> u32 {
         let vec = (|| {
             let int1_lvl = self.scc_timer.int1_level();
             if int1_lvl != 0 && level == int1_lvl {
@@ -976,6 +972,64 @@ impl AddressBus for CdiBus {
 
             0x18 + level as u32
         })();
+        vec
+    }
+
+    #[cold]
+    fn tap_mmio(&self, kind: &str, address: u32, value: u32) {
+        eprintln!("MMIO F{} {} {:06X} = {:0w$X} pc~{:06X}", self.current_frame, kind, address & 0xFF_FFFF, value, self.current_pc, w = if kind.ends_with('8') { 2 } else { 4 });
+    }
+}
+
+impl AddressBus for CdiBus {
+    fn read_byte(&mut self, address: u32) -> u8 {
+        let v = self.rd8(address);
+        if self.taps.mmio && tap::in_mmio_window(address) {
+            self.tap_mmio("R8", address, v as u32);
+        }
+        v
+    }
+
+    fn read_word(&mut self, address: u32) -> u16 {
+        let v = self.rd16(address);
+        if self.taps.mmio && tap::in_mmio_window(address) {
+            self.tap_mmio("R16", address, v as u32);
+        }
+        v
+    }
+
+    fn read_long(&mut self, address: u32) -> u32 {
+        let hi = self.read_word(address) as u32;
+        let lo = self.read_word(address.wrapping_add(2)) as u32;
+        (hi << 16) | lo
+    }
+
+    fn write_byte(&mut self, address: u32, value: u8) {
+        if self.taps.mmio && tap::in_mmio_window(address) {
+            self.tap_mmio("W8", address, value as u32);
+        }
+        self.wr8(address, value)
+    }
+
+    fn write_word(&mut self, address: u32, value: u16) {
+        if self.taps.mmio && tap::in_mmio_window(address) {
+            self.tap_mmio("W16", address, value as u32);
+        }
+        self.wr16(address, value)
+    }
+
+    fn write_long(&mut self, address: u32, value: u32) {
+        self.write_word(address, (value >> 16) as u16);
+        self.write_word(address.wrapping_add(2), value as u16);
+    }
+
+    fn interrupt_acknowledge(&mut self, level: u8) -> u32 {
+        let vec = self.iack(level);
+        self.counters.iack[(level & 7) as usize] += 1;
+        self.counters.iack_this_frame += 1;
+        if self.taps.iack {
+            eprintln!("IACK F{} level={} vector={:02X} pc~{:06X}", self.current_frame, level, vec, self.current_pc);
+        }
         vec
     }
 }

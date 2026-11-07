@@ -116,6 +116,10 @@ impl Machine {
             bus.tick_dvc(cyc_per_line);
             bus.tick_audio(cyc_per_line);
         }
+        bus.counters.end_frame();
+        if bus.taps.pc && bus.counters.frames % 10 == 0 {
+            eprintln!("PC F{} {:06X}", bus.current_frame, cpu.pc);
+        }
     }
 }
 
