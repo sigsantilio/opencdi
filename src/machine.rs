@@ -1,4 +1,4 @@
-use crate::bus::CdiBus;
+use crate::bus::{BoardKind, CdiBus};
 use crate::mcd212::VideoMode;
 use m68k::{CpuCore, CpuType};
 use std::path::Path;
@@ -19,7 +19,9 @@ impl Machine {
     }
 
     pub fn load_dvc_rom<P: AsRef<Path>>(&mut self, path: P) -> std::io::Result<()> {
-        self.bus.load_dvc_rom(path)
+        self.bus.load_dvc_rom(path)?;
+        self.bus.dvc.impeg = self.bus.board == BoardKind::Mono4;
+        Ok(())
     }
 
     pub fn load_disc<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Box<dyn std::error::Error>> {
