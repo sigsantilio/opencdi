@@ -91,7 +91,7 @@ Usage: opencdi [options] [disc image (cue, chd, iso, bin)]
   --dvc <path>        Digital Video Cartridge ROM (default: search dvc/, bios/, the current and the program directory)
   --no-dvc, --nodvc   Boot without the Digital Video Cartridge
   --slave-debug       Log slave (mouse channel) bytes
-  --nvram <path>      Console NVRAM save file (default: bios/nvram_mk48t08.bin or nvram_mk48t08.bin)
+  --nvram <path>      Console NVRAM save file (default: bios/nvram_mk48t08.bin or nvram_mk48t08.bin; 490: nvram_cdi490a.bin)
   --run-in-menu       Windows: keep emulating while a menu or dialog is open, or the window is moved (default: paused)
   --console           Windows: show the log in the parent console or a new console window
   --help, -h          Show this text
@@ -107,6 +107,21 @@ fn savestate_path_for(game_name: &str, slot: usize) -> PathBuf {
     let base = if trimmed.is_empty() { "cdi_bios" } else { trimmed };
     let _ = std::fs::create_dir_all("savestates");
     PathBuf::from("savestates").join(format!("{}_slot{}.st", base, slot))
+}
+
+fn default_nvram490_save_path() -> PathBuf {
+    if Path::new("bios").is_dir() {
+        return PathBuf::from("bios/nvram_cdi490a.bin");
+    }
+    PathBuf::from("nvram_cdi490a.bin")
+}
+
+// Write whichever board NVRAM changed to its file
+fn flush_nvram(bus: &mut opencdi::bus::CdiBus) {
+    bus.nvram.flush_if_dirty();
+    if let Some(m4) = bus.mono4.as_deref_mut() {
+        m4.nvram.flush_if_dirty();
+    }
 }
 
 fn default_nvram_save_path() -> PathBuf {
@@ -378,9 +393,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Load NVRAM if present
     let nvram_arg = args.iter().position(|a| a == "--nvram").and_then(|i| args.get(i + 1)).map(PathBuf::from);
-    let resolved_nvram_path = nvram_arg.unwrap_or_else(default_nvram_save_path);
-    if m.bus.mono4.is_some() {
-        info!("Mono-IV board: the 32 KB NVRAM starts empty and is not saved to a file");
+    let mono4_nvram = m.bus.mono4.is_some();
+    let resolved_nvram_path = nvram_arg.unwrap_or_else(if mono4_nvram { default_nvram490_save_path } else { default_nvram_save_path });
+    if let Some(m4) = m.bus.mono4.as_deref_mut() {
+        match m4.nvram.attach_file(&resolved_nvram_path) {
+            Ok(true) => info!("Mono-IV NVRAM loaded from {:?}", resolved_nvram_path),
+            Ok(false) => info!("Mono-IV NVRAM starts empty, saved to {:?}", resolved_nvram_path),
+            Err(e) => log::warn!("Cannot load Mono-IV NVRAM from {:?}: {}", resolved_nvram_path, e),
+        }
     } else if resolved_nvram_path.is_file() {
         if let Err(e) = m.bus.nvram.load_from_file(&resolved_nvram_path) {
             log::warn!("Impossibile caricare NVRAM da {:?}: {:?}", resolved_nvram_path, e);
@@ -553,7 +573,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         timeEndPeriod(1);
     }
 
-    app.m.bus.nvram.flush_if_dirty();
+    flush_nvram(&mut app.m.bus);
     info!("Emulation stopped. Final PC: 0x{:08X}", app.m.cpu.pc);
     Ok(())
 }
@@ -1044,9 +1064,13 @@ impl App {
                     }
                 }
                 GuiAction::ClearNvram => {
-                    let _ = self.m.bus.nvram.clear();
-                    if let Some(ref path) = self.nvram_path {
-                        let _ = std::fs::remove_file(path);
+                    if let Some(m4) = self.m.bus.mono4.as_deref_mut() {
+                        m4.nvram.clear();
+                    } else {
+                        let _ = self.m.bus.nvram.clear();
+                        if let Some(ref path) = self.nvram_path {
+                            let _ = std::fs::remove_file(path);
+                        }
                     }
                     self.m.bus.reset_system();
                     self.m.cpu.reset(&mut self.m.bus);
@@ -1420,7 +1444,7 @@ impl App {
         self.autoplay();
         self.m.run_frame();
         if self.frame_count % 300 == 0 {
-            self.m.bus.nvram.flush_if_dirty();
+            flush_nvram(&mut self.m.bus);
         }
 
         let curr_vsr = (self.m.bus.mcd212.get_vsr::<0>(), self.m.bus.mcd212.get_vsr::<1>());
