@@ -272,6 +272,7 @@ fn is_ntsc_name(path: &Path, machine: &Machine) -> bool {
 
 fn boot(spec: &LoadSpec) -> Result<Machine, String> {
     let mut m = Machine::new();
+    m.bus.nvram.persist = false;
     m.load_bios(&spec.bios).map_err(|e| format!("cannot load BIOS {}: {}", spec.bios.display(), e))?;
     if let Some(p) = &spec.dvc {
         let (_, img) = Machine::read_dvc(p).map_err(|e| format!("cannot load DVC ROM {}: {}", p.display(), e))?;
@@ -468,7 +469,10 @@ pub extern "C" fn retro_reset() {
         let mut core = lock(&CORE);
         let Some(spec) = core.spec.clone() else { return };
         match boot(&spec) {
-            Ok(m) => {
+            Ok(mut m) => {
+                if let Some(old) = core.machine.as_ref() {
+                    m.bus.nvram.ram = old.bus.nvram.ram; // reset keeps the battery-backed RAM the frontend saves
+                }
                 core.machine = Some(m);
                 core.input.reset();
             }
@@ -720,12 +724,13 @@ pub extern "C" fn retro_get_region() -> c_uint {
     guard("retro_get_region", RETRO_REGION_PAL, true, || region_of(current_mode()))
 }
 
-// SYSTEM_RAM is plane A (CPU 0x000000-0x07FFFF, big-endian bytes); plane B is not exposed yet.
+// SAVE_RAM is the NVRAM, kept by the frontend as a .srm per game; SYSTEM_RAM is plane A (CPU 0x000000-0x07FFFF, big-endian bytes).
 #[unsafe(no_mangle)]
 pub extern "C" fn retro_get_memory_data(id: c_uint) -> *mut c_void {
     guard("retro_get_memory_data", std::ptr::null_mut(), true, || {
         let mut core = lock(&CORE);
         match (id, core.machine.as_mut()) {
+            (RETRO_MEMORY_SAVE_RAM, Some(m)) => m.bus.nvram.ram.as_mut_ptr() as *mut c_void,
             (RETRO_MEMORY_SYSTEM_RAM, Some(m)) => m.bus.mcd212.plane_a.as_mut_ptr() as *mut c_void,
             _ => std::ptr::null_mut(),
         }
@@ -737,6 +742,7 @@ pub extern "C" fn retro_get_memory_size(id: c_uint) -> usize {
     guard("retro_get_memory_size", 0, true, || {
         let core = lock(&CORE);
         match (id, core.machine.as_ref()) {
+            (RETRO_MEMORY_SAVE_RAM, Some(m)) => m.bus.nvram.ram.len(),
             (RETRO_MEMORY_SYSTEM_RAM, Some(m)) => m.bus.mcd212.plane_a.len(),
             _ => 0,
         }
