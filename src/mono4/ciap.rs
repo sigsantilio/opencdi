@@ -1,5 +1,6 @@
 // CIAP disc and audio interface at 0x300000: RAM and program memory around a block of word registers at 0x2580.
 use super::Loud;
+use crate::cdrom::{CdRom, CD_SECTOR_RAW_SIZE};
 
 /// Size of the CIAP window: RAM 0x0000-0x257F, registers 0x2580-0x25FF, program memory 0x2600-0x3FFF.
 pub const WINDOW_SIZE: usize = 0x4000;
@@ -21,27 +22,60 @@ pub const CHIP_ID: u16 = 0xCD02;
 // Registers that are stored and read back as written.
 const STORED: &[u32] = &[0x08, 0x0A, 0x0C, 0x0E, 0x10, 0x12, 0x1A, 0x20, 0x22, 0x24, 0x28, 0x34, 0x7E];
 
+pub const ISR_DATA: u16 = 0x0001;
+pub const ISR_AUDIO: u16 = 0x0002;
 pub const ISR_AUDIO_EVENT: u16 = 0x0008;
+pub const ISR_TRIGGER: u16 = 0x0200;
+pub const ISR_EOF: u16 = 0x0400;
+const REG_TACS: u32 = 0x08;
+
+// Buffers in CIAP RAM and their buffer-manager bits: audio 0/1, data 2/3.
+const AUDIO_BUFS: [(u16, usize); 2] = [(0x01, 0x0000), (0x02, 0x0900)];
+const DATA_BUFS: [(u16, usize); 2] = [(0x04, 0x1200), (0x08, 0x1BC2)];
+const DATA_LEN: usize = 2340;
+const AUDIO_LEN: usize = 2304;
 
 pub struct Ciap {
     pub ram: Vec<u8>,
     pub regs: [u16; 64],
     pub running: bool,
     pub q_mode: bool,
+    pub lba: u32,
+    pub drive_active: bool,
+    pub cycles: u32,
+    pub dma_request: Option<u16>,
+    pub seeks: u64,
+    pub sectors: u64,
+    pub skipped: u64,
+    pub dmas: u64,
     pub loud: Loud,
     pub trace: bool,
 }
 
 impl Default for Ciap {
     fn default() -> Self {
-        Self { ram: vec![0; WINDOW_SIZE], regs: [0; 64], running: false, q_mode: false, loud: Loud::default(), trace: false }
+        Self { ram: vec![0; WINDOW_SIZE], regs: [0; 64], running: false, q_mode: false, lba: 0, drive_active: false, cycles: 0, dma_request: None, seeks: 0, sectors: 0, skipped: 0, dmas: 0, loud: Loud::default(), trace: false }
     }
 }
 
 impl Ciap {
     pub fn reset(&mut self) {
         self.regs = [0; 64];
-        (self.running, self.q_mode) = (false, false);
+        (self.running, self.q_mode, self.lba, self.drive_active) = (false, false, 0, false);
+    }
+
+    /// Drive request from IKAT port D: a seek positions the next sector and starts the drive, a stop halts delivery.
+    pub fn drive(&mut self, ev: super::ikat::DriveEvent) {
+        match ev {
+            super::ikat::DriveEvent::Seek(lba) => {
+                (self.lba, self.drive_active) = (lba, true);
+                self.seeks += 1;
+            }
+            super::ikat::DriveEvent::Stop => self.drive_active = false,
+        }
+        if self.trace {
+            eprintln!("CIAP DRIVE {:?}", ev);
+        }
     }
 
     /// True when a window offset falls on the register block.
@@ -125,10 +159,11 @@ impl Ciap {
                     self.set(REG_ASTAT, self.reg(REG_ASTAT) | 0x80);
                 }
             }
+            // Bit 14 starts a one-shot copy through CPU DMA channel 0; the board runs it.
             REG_DMACTL => {
                 self.set(REG_DMACTL, value);
-                if value & 0x4000 != 0 && self.loud.first(0x200 | reg) {
-                    eprintln!("CIAP unmodelled DMA start {:04X} pc~{:06X}", value, pc);
+                if value & 0x4000 != 0 {
+                    self.dma_request = Some(value);
                 }
             }
             r if STORED.contains(&r) => self.set(r, value),
@@ -138,6 +173,70 @@ impl Ciap {
                 }
                 self.set(reg, value);
             }
+        }
+    }
+
+    /// Advances the sector clock; one sector every `CYCLES_PER_SECTOR` while delivery runs and the drive is active.
+    pub fn tick(&mut self, cycles: u32, sector_cycles: u32, cdrom: &mut Option<CdRom>) {
+        self.cycles += cycles;
+        while self.cycles >= sector_cycles {
+            self.cycles -= sector_cycles;
+            if self.running && self.drive_active {
+                if let Some(cd) = cdrom.as_mut() {
+                    self.sector(cd);
+                }
+            }
+        }
+    }
+
+    // Lowest buffer whose manager bit is clear.
+    fn free_buffer(&self, bufs: &[(u16, usize); 2]) -> Option<(u16, usize)> {
+        let bman = self.reg(REG_BMAN);
+        bufs.iter().copied().find(|&(bit, _)| bman & bit == 0)
+    }
+
+    fn fill(&mut self, buf: (u16, usize), src: &[u8], isr: u16) {
+        self.ram[buf.1..buf.1 + src.len()].copy_from_slice(src);
+        self.set(REG_BMAN, self.reg(REG_BMAN) | buf.0);
+        self.set(REG_ISR, self.reg(REG_ISR) | isr);
+    }
+
+    // Delivers the sector at the drive position, then advances it; the drive keeps moving when buffers are full.
+    fn sector(&mut self, cd: &mut CdRom) {
+        let lba = self.lba;
+        self.lba += 1;
+        let mut raw = [0u8; CD_SECTOR_RAW_SIZE];
+        if !cd.read_sector(lba, &mut raw) {
+            if self.loud.first(0x2_0000) {
+                eprintln!("CIAP sector {} unreadable", lba);
+            }
+            return;
+        }
+        let (file, channel, submode) = (raw[16], raw[17], raw[18]);
+        let audio = submode & 0x04 != 0;
+        let taken = if !audio {
+            self.free_buffer(&DATA_BUFS).map(|b| self.fill(b, &raw[12..12 + DATA_LEN], ISR_DATA))
+        } else if submode & 0x20 != 0 && self.reg(REG_TACS) & (1 << (channel & 15)) != 0 {
+            self.free_buffer(&AUDIO_BUFS).map(|b| self.fill(b, &raw[24..24 + AUDIO_LEN], ISR_AUDIO))
+        } else {
+            None
+        };
+        let mut flags = 0;
+        if submode & 0x10 != 0 {
+            flags |= ISR_TRIGGER;
+        }
+        if submode & 0x80 != 0 {
+            flags |= ISR_EOF;
+        }
+        self.set(REG_ISR, self.reg(REG_ISR) | flags);
+        if taken.is_some() {
+            self.sectors += 1;
+        } else {
+            self.skipped += 1;
+        }
+        if self.trace {
+            let what = if taken.is_some() { "taken" } else { "skipped" };
+            eprintln!("CIAP SECTOR {} file {} channel {} submode {:02X} {} bman {:04X}", lba, file, channel, submode, what, self.reg(REG_BMAN));
         }
     }
 

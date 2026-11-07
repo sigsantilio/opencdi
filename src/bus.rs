@@ -118,6 +118,7 @@ impl CdiBus {
     pub fn reset_system(&mut self) {
         if let Some(m) = self.mono4.as_deref_mut() {
             m.reset();
+            m.ikat.set_disc_present(self.cdrom.is_some());
         }
         self.mcd212.reset();
         self.mcd212.plane_a[0..8].copy_from_slice(&self.rom[0..8]);
@@ -239,6 +240,9 @@ impl CdiBus {
         let cd = CdRom::open(path)?;
         self.cdrom = Some(cd);
         self.slave.set_disc_inserted(true);
+        if let Some(m) = self.mono4.as_deref_mut() {
+            m.ikat.set_disc_present(true);
+        }
         Ok(())
     }
 
@@ -249,6 +253,10 @@ impl CdiBus {
         self.cdic.command = 0;
         self.cdic.disc_command = 0;
         self.slave.notify_disc_swapped();
+        if let Some(m) = self.mono4.as_deref_mut() {
+            m.ikat.set_disc_present(true);
+            m.ciap.drive_active = false;
+        }
         Ok(())
     }
 
@@ -324,7 +332,11 @@ impl CdiBus {
                 self.tick_cdic(cycles);
                 self.tick_dvc(cycles);
             }
-            BoardKind::Mono4 => {}
+            BoardKind::Mono4 => {
+                if let Some(m) = self.mono4.as_deref_mut() {
+                    m.ciap.tick(cycles, self.mcd212.video_mode.cycles_per_sector(), &mut self.cdrom);
+                }
+            }
         }
     }
 
@@ -444,6 +456,40 @@ impl CdiBus {
         } else {
             let cmd = self.dvc.get_fmv_word(crate::dvc::FMV_SYSCMD) & !0x8000;
             self.dvc.set_fmv_word(crate::dvc::FMV_SYSCMD, cmd);
+        }
+    }
+
+    /// One-shot CIAP copy on DMA channel 0: the low 13 bits of `control` are the CIAP word address, the channel gives memory address, word count and direction.
+    pub fn perform_ciap_dma(&mut self, control: u16) {
+        let ch = self.dma.channels[0].clone();
+        let (start, count) = (ch.memory_address_counter, ch.transfer_counter as u32);
+        let to_mem = (ch.operation_control & 0x80) != 0;
+        let mut dev = (control as usize & 0x1FFF) * 2;
+        if self.taps.ciap {
+            eprintln!("CIAP DMA control {:04X} memory {:06X} words {} {}", control, start, count, if to_mem { "to memory" } else { "from memory" });
+        }
+        for i in 0..count {
+            let mem = start.wrapping_add(i * 2);
+            for k in 0..2 {
+                let d = (dev + k) % ciap::WINDOW_SIZE;
+                if to_mem {
+                    let b = self.mono4.as_deref().map_or(0xFF, |m| m.ciap.ram[d]);
+                    self.write_byte(mem + k as u32, b);
+                } else {
+                    let b = self.read_byte(mem + k as u32);
+                    if let Some(m) = self.mono4.as_deref_mut() {
+                        m.ciap.ram[d] = b;
+                    }
+                }
+            }
+            dev = (dev + 2) % ciap::WINDOW_SIZE;
+        }
+        let ch = &mut self.dma.channels[0];
+        ch.memory_address_counter = start.wrapping_add(count * 2);
+        ch.transfer_counter = 0;
+        ch.channel_status |= 0x80;
+        if let Some(m) = self.mono4.as_deref_mut() {
+            m.ciap.dmas += 1;
         }
     }
 
@@ -1091,6 +1137,9 @@ impl CdiBus {
                     let cur = m.ciap.peek_reg(reg);
                     let v = if (addr & 1) == 0 { (cur & 0x00FF) | ((value as u16) << 8) } else { (cur & 0xFF00) | value as u16 };
                     m.ciap.write_reg(reg, v, pc);
+                    if let Some(c) = m.ciap.dma_request.take() {
+                        self.perform_ciap_dma(c);
+                    }
                 } else {
                     m.ciap.ram[off as usize] = value;
                 }
@@ -1098,7 +1147,11 @@ impl CdiBus {
             }
             0x310000..=0x31FFFF if (addr & 1) == 1 => {
                 m.ikat.pal = self.mcd212.video_mode == crate::mcd212::VideoMode::Pal;
-                return m.ikat.write(addr - 0x310000, value, pc);
+                m.ikat.write(addr - 0x310000, value, pc);
+                if let Some(ev) = m.ikat.drive_event.take() {
+                    m.ciap.drive(ev);
+                }
+                return;
             }
             0x320000..=0x32FFFF => {
                 if let Some(i) = crate::mono4::nvram::Nvram32::index(addr - 0x320000) {
@@ -1116,6 +1169,9 @@ impl CdiBus {
             let off = addr - 0x300000;
             if ciap::Ciap::is_reg(off) {
                 m.ciap.write_reg(off - ciap::REG_BASE, value, self.current_pc);
+                if let Some(c) = m.ciap.dma_request.take() {
+                    self.perform_ciap_dma(c);
+                }
                 return;
             }
         }
