@@ -337,8 +337,10 @@ impl CdiBus {
                 ext4.max(ext2)
             }
             BoardKind::Mono4 => {
-                let m = self.mono4.as_deref();
-                if m.is_some_and(|m| m.ikat.irq()) { 2 } else { 0 }
+                let Some(m) = self.mono4.as_deref() else { return 0 };
+                let ext2 = if m.ikat.irq() { 2 } else { 0 };
+                let ciap = if m.ciap.irq() { m.ciap.level() } else { 0 };
+                ciap.max(ext2)
             }
         }
     }
@@ -1131,10 +1133,11 @@ impl CdiBus {
 
     // External level 4 (CIAP) and level 2 (IKAT) acknowledges on the Mono-IV board.
     fn mono4_iack(&mut self, level: u8) -> Option<u32> {
-        match level {
-            2 => Some(0x1A),
-            _ => None,
+        let m = self.mono4.as_deref()?;
+        if m.ciap.irq() && level == m.ciap.level() {
+            return Some(m.ciap.vector());
         }
+        (level == 2).then_some(0x1A)
     }
 
     fn iack(&mut self, level: u8) -> u32 {
