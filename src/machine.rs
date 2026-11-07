@@ -42,6 +42,7 @@ impl Machine {
     }
 
     pub fn load_bios_image(&mut self, img: &BiosImage) {
+        self.bus.set_board(if img.report.board == Some(bios::Board::Mono4) { BoardKind::Mono4 } else { BoardKind::Mono1 });
         let rom = &mut self.bus.rom;
         let len = img.data.len().min(rom.len());
         rom[..len].copy_from_slice(&img.data[..len]);
@@ -69,11 +70,20 @@ impl Machine {
     /// Fits a checked cartridge ROM.
     pub fn load_dvc_image(&mut self, img: &BiosImage) {
         self.bus.dvc.load_rom_bytes(&img.data);
+        self.bus.dvc.impeg = self.bus.board == BoardKind::Mono4;
     }
 
-    /// Checks and fits a cartridge ROM; refuses images whose check failed (an unknown image loads with a warning).
+    /// Reads a cartridge ROM checked for a board: IMPEG on Mono-IV, VMPEG (or an unknown image) on Mono-I.
+    pub fn read_dvc_for<P: AsRef<Path>>(path: P, board: BoardKind) -> std::io::Result<(Option<String>, BiosImage)> {
+        match board {
+            BoardKind::Mono1 => Self::read_dvc(path),
+            BoardKind::Mono4 => Ok((None, bios::inspect_impeg(std::fs::read(path)?))),
+        }
+    }
+
+    /// Checks and fits a cartridge ROM for the current board; refuses images whose check failed (an unknown image loads with a warning on Mono-I).
     pub fn load_dvc<P: AsRef<Path>>(&mut self, path: P) -> std::io::Result<bios::Report> {
-        let (entry, img) = Self::read_dvc(path)?;
+        let (entry, img) = Self::read_dvc_for(path, self.bus.board)?;
         let mut report = img.report.clone();
         if let Some(e) = entry {
             report.message = format!("{}: {}", e, report.message);
@@ -266,4 +276,28 @@ fn highest_ipl(bus: &mut CdiBus) -> u8 {
     let int1_lvl = bus.scc_timer.int1_level();
     let timer_lvl = if bus.scc_timer.timer_irq { bus.scc_timer.picr1 & 7 } else { 0 };
     int1_lvl.max(timer_lvl).max(bus.board_ipl())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cartridge_check_depends_on_the_board() {
+        let dir = std::env::temp_dir().join(format!("opencdi-dvc-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("cart.rom");
+        let mut data = vec![0u8; bios::DVC_ROM_SIZE];
+        data[..2].copy_from_slice(&[0x4A, 0xFC]);
+        data[100] = 1;
+        std::fs::write(&p, &data).unwrap();
+        let (_, mono1) = Machine::read_dvc_for(&p, BoardKind::Mono1).unwrap();
+        let (_, mono4) = Machine::read_dvc_for(&p, BoardKind::Mono4).unwrap();
+        assert!(!mono1.report.message.contains("IMPEG"));
+        assert_eq!(mono4.report.status, bios::Status::Error);
+        assert!(mono4.report.message.contains("differs from the known dump"));
+        let short = bios::inspect_impeg(vec![1, 2, 3]);
+        assert!(short.report.status == bios::Status::Error && short.report.message.contains("only the known IMPEG dump"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
