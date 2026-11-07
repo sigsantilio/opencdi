@@ -33,6 +33,23 @@ pub const BMAN_RESET: u16 = 0x0054;
 const DATA_BUFS: [(u16, usize); 2] = [(0x04, 0x1200), (0x08, 0x1BC2)];
 const DATA_LEN: usize = 2340;
 
+// Sync field of a data sector as a byte-swapped image stores it.
+const SWAPPED_SYNC: [u8; 12] = [0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFF];
+
+// Header check: BCD time of the sector plus 150, mode 1 or 2, and for mode 2 two equal subheader copies.
+fn header_valid(lba: u32, raw: &[u8; CD_SECTOR_RAW_SIZE]) -> bool {
+    let bcd = |v: u32| (((v / 10) << 4) | (v % 10)) as u8;
+    let f = lba + 150;
+    raw[12..15] == [bcd(f / 4500), bcd(f / 75 % 60), bcd(f % 75)]
+        && (raw[15] == 1 || (raw[15] == 2 && raw[16..20] == raw[20..24]))
+}
+
+// Yellow Book scrambler pattern, generated once.
+fn scramble_table() -> &'static [u8; 2448] {
+    static TABLE: std::sync::OnceLock<[u8; 2448]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(crate::cdic::generate_sector_scramble)
+}
+
 pub struct Ciap {
     pub ram: Vec<u8>,
     pub regs: [u16; 64],
@@ -40,21 +57,26 @@ pub struct Ciap {
     pub q_mode: bool,
     pub lba: u32,
     pub drive_active: bool,
+    pub toc: bool, // table of contents read: Q reports carry lead-in entries
+    pub toc_index: usize,
     pub start_delay: u8, // sector periods after a seek before the first sector
-    pub drive_stopped: bool, // the drive stopped because delivery was off; the board reports it
+    pub drive_stopped: bool, // the drive stopped because delivery was off; the board reports it (cleared within the same tick)
     pub cycles: u32,
     pub dma_request: Option<u16>,
     pub seeks: u64,
     pub sectors: u64,
     pub skipped: u64,
     pub dmas: u64,
+    pub byteswap: bool,
+    pub descrambled: u64,
+    pub q_reports: u64,
     pub loud: Loud,
     pub trace: bool,
 }
 
 impl Default for Ciap {
     fn default() -> Self {
-        Self { ram: vec![0; WINDOW_SIZE], regs: power_on_regs(), running: false, q_mode: false, lba: 0, drive_active: false, start_delay: 0, drive_stopped: false, cycles: 0, dma_request: None, seeks: 0, sectors: 0, skipped: 0, dmas: 0, loud: Loud::default(), trace: false }
+        Self { ram: vec![0; WINDOW_SIZE], regs: power_on_regs(), running: false, q_mode: false, lba: 0, drive_active: false, toc: false, toc_index: 0, start_delay: 0, drive_stopped: false, cycles: 0, dma_request: None, seeks: 0, sectors: 0, skipped: 0, dmas: 0, byteswap: false, descrambled: 0, q_reports: 0, loud: Loud::default(), trace: false }
     }
 }
 
@@ -68,17 +90,23 @@ impl Ciap {
     pub fn reset(&mut self) {
         self.regs = power_on_regs();
         (self.running, self.q_mode, self.lba, self.drive_active) = (false, false, 0, false);
-        (self.start_delay, self.drive_stopped) = (0, false);
+        (self.start_delay, self.drive_stopped, self.toc, self.toc_index) = (0, false, false, 0);
+        (self.dma_request, self.cycles) = (None, 0);
     }
 
     /// Drive request from IKAT port D: a seek positions the next sector and starts the drive, a stop halts delivery.
     pub fn drive(&mut self, ev: super::ikat::DriveEvent) {
         match ev {
             super::ikat::DriveEvent::Seek(lba) => {
-                (self.lba, self.drive_active, self.start_delay) = (lba, true, 1);
+                (self.lba, self.drive_active, self.start_delay, self.toc) = (lba, true, 1, false);
                 self.seeks += 1;
             }
-            super::ikat::DriveEvent::Stop => self.drive_active = false,
+            super::ikat::DriveEvent::Stop => (self.drive_active, self.toc) = (false, false),
+            // A table of contents read ends any running data read.
+            super::ikat::DriveEvent::Toc => {
+                (self.toc, self.toc_index, self.drive_active) = (true, 0, false);
+                (self.start_delay, self.drive_stopped) = (0, false);
+            }
         }
         if self.trace {
             eprintln!("CIAP DRIVE {:?}", ev);
@@ -234,6 +262,12 @@ impl Ciap {
         self.cycles += cycles;
         while self.cycles >= sector_cycles {
             self.cycles -= sector_cycles;
+            if self.toc && self.running && self.q_mode {
+                if let Some(cd) = cdrom.as_ref() {
+                    self.toc_entry(cd);
+                }
+                continue;
+            }
             if !self.drive_active {
                 continue;
             }
@@ -256,6 +290,28 @@ impl Ciap {
         DATA_BUFS.iter().find(|&&(bit, _)| bman & bit != 0).map(|&(_, at)| at)
     }
 
+    // A data sector whose sync field reads byte-swapped marks the image swapped; failing headers are descrambled if that fixes them.
+    fn repair(&mut self, lba: u32, raw: &mut [u8; CD_SECTOR_RAW_SIZE]) {
+        if !self.byteswap && raw[..12] == SWAPPED_SYNC {
+            self.byteswap = true;
+            if self.loud.first(0x6_0000) {
+                eprintln!("CIAP disc image is byte-swapped (sector {}); swapping every sector", lba);
+            }
+        }
+        if self.byteswap {
+            raw.chunks_exact_mut(2).for_each(|p| p.swap(0, 1));
+        }
+        if !header_valid(lba, raw) {
+            let table = scramble_table();
+            let mut copy = *raw;
+            copy[12..].iter_mut().zip(&table[12..]).for_each(|(b, t)| *b ^= t);
+            if header_valid(lba, &copy) {
+                *raw = copy;
+                self.descrambled += 1;
+            }
+        }
+    }
+
     // Delivers the sector at the drive position into the current data buffer, then advances it; the buffer manager is left to the CPU.
     fn sector(&mut self, cd: &mut CdRom) {
         let lba = self.lba;
@@ -267,7 +323,12 @@ impl Ciap {
             }
             return;
         }
+        self.repair(lba, &mut raw);
+        if self.q_mode {
+            self.q_locator(cd, lba);
+        }
         let (file, channel, submode) = (raw[16], raw[17], raw[18]);
+        // Every sector, audio included, goes to the data buffer; the CPU copies audio out itself (no chip-side audio path).
         let taken = self.data_buffer().map(|at| self.ram[at..at + DATA_LEN].copy_from_slice(&raw[12..12 + DATA_LEN]));
         let mut flags = if taken.is_some() { ISR_DATA } else { 0 };
         if submode & 0x10 != 0 {
@@ -285,6 +346,45 @@ impl Ciap {
         if self.trace {
             let what = if taken.is_some() { "taken" } else { "skipped" };
             eprintln!("CIAP SECTOR {} file {} channel {} submode {:02X} {} bman {:04X}", lba, file, channel, submode, what, self.reg(REG_BMAN));
+        }
+    }
+
+    // Q locator of a delivered sector in the Q-reporting modes: control/ADR, track, index 1, track-relative time, 0, absolute time (LBA plus 150), all BCD; current Q buffer, ISR bit 2.
+    fn q_locator(&mut self, cd: &CdRom, lba: u32) {
+        let bcd = |v: u32| (((v / 10) << 4) | (v % 10)) as u8;
+        let msf = |f: u32| [bcd(f / 4500), bcd(f / 75 % 60), bcd(f % 75)];
+        let t = cd.tracks.iter().rev().find(|t| t.start_lba <= lba);
+        let (ctrl, num, start) = t.map_or((0x41, 1, 0), |t| ((t.control & 0xF0) | 0x01, t.number as u32, t.start_lba));
+        let (r, a) = (msf(lba - start), msf(lba + 150));
+        let at = if self.reg(REG_BMAN) & 0x10 != 0 { 0x1B24 } else { 0x24E6 };
+        self.ram[at..at + 10].copy_from_slice(&[ctrl, bcd(num), 0x01, r[0], r[1], r[2], 0x00, a[0], a[1], a[2]]);
+        self.set(REG_ISR, self.reg(REG_ISR) | 0x0004);
+        self.q_reports += 1;
+    }
+
+    // One lead-in Q entry per sector period into the current Q buffer: A0, A1, A2, then each track start, repeating.
+    fn toc_entry(&mut self, cd: &CdRom) {
+        let bcd = |v: u32| (((v / 10) << 4) | (v % 10)) as u8;
+        let msf = |lba: u32| { let f = lba + 150; [bcd(f / 4500), bcd(f / 75 % 60), bcd(f % 75)] };
+        let tracks = &cd.tracks;
+        let (first, last) = (tracks.first().map_or(1, |t| t.number), tracks.last().map_or(1, |t| t.number));
+        let ctrl = |c: u8| (c & 0xF0) | 0x01;
+        let i = self.toc_index % (3 + tracks.len());
+        self.toc_index += 1;
+        let (c, point, p) = match i {
+            0 => (ctrl(tracks.first().map_or(0x41, |t| t.control)), 0xA0, [bcd(first as u32), cd.disc_type, 0]),
+            1 => (ctrl(tracks.last().map_or(0x41, |t| t.control)), 0xA1, [bcd(last as u32), 0, 0]),
+            2 => (0x41, 0xA2, msf(cd.total_sectors)),
+            n => {
+                let t = &tracks[n - 3];
+                (ctrl(t.control), bcd(t.number as u32), msf(t.start_lba))
+            }
+        };
+        let at = if self.reg(REG_BMAN) & 0x10 != 0 { 0x1B24 } else { 0x24E6 };
+        self.ram[at..at + 10].copy_from_slice(&[c, 0x00, point, 0, 0, 0, 0, p[0], p[1], p[2]]);
+        self.set(REG_ISR, self.reg(REG_ISR) | 0x0004);
+        if self.trace {
+            eprintln!("CIAP TOC point {:02X} {:02X} {:02X} {:02X} at {:04X}", point, p[0], p[1], p[2], at);
         }
     }
 
@@ -381,6 +481,34 @@ mod tests {
         assert_eq!(c.dma_request.take(), Some(0x6906));
         c.dma_done(0x6906, 1024);
         assert_eq!((c.peek_reg(REG_DMACTL), c.dmas), (0x6D06, 1));
+    }
+
+    #[test]
+    fn repair_unswaps_and_descrambles() {
+        let mut good = [0u8; CD_SECTOR_RAW_SIZE];
+        good[1..11].fill(0xFF);
+        good[12..20].copy_from_slice(&[0x00, 0x02, 0x16, 0x02, 0x00, 0x00, 0x09, 0x00]);
+        good[20..24].copy_from_slice(&[0x00, 0x00, 0x09, 0x00]);
+        assert!(header_valid(16, &good));
+        let mut scrambled = good;
+        scrambled[12..].iter_mut().zip(&scramble_table()[12..]).for_each(|(b, t)| *b ^= t);
+        let mut c = Ciap::default();
+        c.repair(16, &mut scrambled);
+        assert_eq!((scrambled, c.descrambled), (good, 1));
+        let mut swapped = good;
+        swapped.chunks_exact_mut(2).for_each(|p| p.swap(0, 1));
+        c.repair(16, &mut swapped);
+        assert!(c.byteswap && swapped == good);
+    }
+
+    #[test]
+    fn toc_request_ends_a_data_read_and_reset_clears_it() {
+        let mut c = Ciap::default();
+        c.drive(super::super::ikat::DriveEvent::Seek(13));
+        c.drive(super::super::ikat::DriveEvent::Toc);
+        assert!(c.toc && !c.drive_active);
+        c.reset();
+        assert!(!c.toc && c.toc_index == 0);
     }
 
     #[test]

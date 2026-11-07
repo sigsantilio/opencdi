@@ -5,7 +5,7 @@ use crate::audio::CdiAudio;
 pub const CDIC_RAM_SIZE: usize = 0x3C00; // 15360 bytes
 
 // Generate Yellow Book scrambler table (2448 bytes)
-fn generate_sector_scramble() -> [u8; 2448] {
+pub fn generate_sector_scramble() -> [u8; 2448] {
     let mut table = [0u8; 2448];
     let mut reg: u16 = 0x0001;
 

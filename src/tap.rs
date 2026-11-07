@@ -33,6 +33,7 @@ pub struct Counters {
     pub unmapped: u64,
     pub bus_errors: u64,
     pub frames: u64,
+    pub halted: bool,
 }
 
 impl Counters {

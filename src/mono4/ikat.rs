@@ -22,6 +22,7 @@ pub struct Port {
 pub enum DriveEvent {
     Seek(u32),
     Stop,
+    Toc,
 }
 
 pub struct Ikat {
@@ -31,9 +32,10 @@ pub struct Ikat {
     pub keyboard_enabled: bool, // port C 80: key events on port C (not modelled yet)
     pub pal: bool, // video standard reported by the identification reply; set by the bus before each write
     pub disc_present: bool,
-    pub status_polls: u8, // drive status polls answered since the disc appeared
     pub drive_busy: bool, // drive seeking or reading; set by the bus before each write
     pub drive_event: Option<DriveEvent>,
+    pub reset_request: bool,
+    pub toc_reply: bool, // a C0 is waiting for its transition-end status reply
     pub pointer: (i32, i32, u8), // host pointer: x 0..767, y 0..559, buttons (1, 2, 4 = third button)
     pub loud: Loud,
     pub trace: bool,
@@ -48,9 +50,10 @@ impl Default for Ikat {
             keyboard_enabled: false,
             pal: true,
             disc_present: false,
-            status_polls: 0,
             drive_busy: false,
             drive_event: None,
+            reset_request: false,
+            toc_reply: false,
             pointer: (384, 280, 0),
             loud: Loud::default(),
             trace: false,
@@ -75,18 +78,19 @@ impl Ikat {
         *self = Self { pal, trace, disc_present, pointer, loud, ..Self::default() };
     }
 
-    /// Disc inserted or removed; the status replies restart their spin-up sequence.
+    /// Disc inserted or removed.
     pub fn set_disc_present(&mut self, present: bool) {
         self.disc_present = present;
-        self.status_polls = 0;
     }
 
-    /// Drive status reply: all zero without a disc, 0x215 with one.
+    /// Drive status reply: 0 without a disc, else 0x210, or 0x20E right after a TOC request.
     pub fn drive_report(&mut self) {
-        let st: [u8; 2] = if self.disc_present { [0x02, 0x15] } else { [0x00, 0x00] };
-        if self.disc_present {
-            self.status_polls = self.status_polls.saturating_add(1);
-        }
+        // After a table of contents request the reply carries the transition-end code 0x0E.
+        let st: [u8; 2] = match self.disc_present {
+            false => [0x00, 0x00],
+            true if std::mem::take(&mut self.toc_reply) => [0x02, 0x0E],
+            true => [0x02, 0x10],
+        };
         self.respond(3, &[0xB0, 0x00, st[0], st[1]]);
     }
 
@@ -267,15 +271,19 @@ impl Ikat {
             0xF3 => self.respond(2, &[0xA5, 0xF3, 0x4B, 0x4D]),
             0xF6 => self.respond(2, &[0xA5, 0xF6, if self.pal { 0x02 } else { 0x01 }, 0xFF]),
             0xF7 => self.respond(2, &[0xA5, 0xF7, 0x00, 0xFF]),
-            // No reply: the F9 query times out in the BIOS after 100 ticks and reads as "no I2C device".
-            0xF9 | 0xFA => {}
+            // Video encoder query: version 1 gives the same state as no reply without the 100-tick wait.
+            0xF9 => self.respond(2, &[0xA5, 0xF9, 0x01]),
+            // Known command without a reply.
+            0xFA => {}
             0x80 => self.keyboard_enabled = true,
             // Set-up commands without a reply.
             0x84..=0x86 | 0x8F => {}
             0x8C..=0x8E => self.arm_b(c),
+            // System reset request: the board resets the player as after power-on, RAM kept.
             0x88 => {
-                if self.loud.first(0x2_0000 | c as u32) {
-                    eprintln!("IKAT system reset request (port C 88), not modelled pc~{:06X}", pc);
+                self.reset_request = true;
+                if self.trace || self.loud.first(0x2_0000 | c as u32) {
+                    eprintln!("IKAT system reset request (port C 88) pc~{:06X}", pc);
                 }
             }
             _ => {
@@ -289,13 +297,14 @@ impl Ikat {
     // Port D: drive commands, four bytes, command byte first with bit 7 set.
     fn execute_d(&mut self, cmd: &[u8], pc: u32) {
         match cmd[0] {
-            // Status: no reply while the drive seeks or reads.
-            0xB0 | 0xA1 if self.drive_busy => {
-                if self.trace {
+            // Status: no reply while the drive seeks or reads; the start-up status is not answered.
+            0xA1 => {}
+            0xB0 if self.drive_busy => {
+                if self.trace || self.loud.first(0x5_0000) {
                     eprintln!("IKAT PORT D status request {} dropped, drive busy pc~{:06X}", hex(cmd), pc);
                 }
             }
-            0xB0 | 0xA1 => self.drive_report(),
+            0xB0 => self.drive_report(),
             0xB1 => self.respond(3, &[0xB1, 0x00, 0x02, 0x00]),
             0xB2 => self.respond(3, if self.disc_present { &[0xB2, 0x20, 0x00, 0x01] } else { &[0xB2, 0x00, 0x00, 0x00] }),
             // Seek to a BCD time; the next sector delivered is that time minus 150 frames. No reply.
@@ -305,6 +314,11 @@ impl Ikat {
                 self.drive_event = Some(DriveEvent::Seek(frames.saturating_sub(150)));
             }
             0xC2 | 0xC3 => self.drive_event = Some(DriveEvent::Stop),
+            // Table of contents read: the next status reply ends the transition, then the CIAP reports the entries.
+            0xC0 if self.disc_present => {
+                self.toc_reply = true;
+                self.drive_event = Some(DriveEvent::Toc);
+            }
             // Accepted without reply or effect; logged once so a run shows they arrived.
             0xA2 | 0xA6 | 0xA7 | 0xC0 | 0xC1 | 0xC4 | 0xC5 => {
                 if self.loud.first(0x3_0000 | cmd[0] as u32) {
@@ -339,7 +353,10 @@ mod tests {
         k.write(0x05, 0xF0, 0);
         let r: Vec<u8> = (0..3).map(|_| k.read(0x0D, 0)).collect();
         assert_eq!(r, [0xA5, 0xF0, 0x72]);
-        for c in [0xF8, 0xF9, 0x84, 0x85, 0x86, 0x88, 0x8F, 0x91] {
+        k.write(0x05, 0xF9, 0);
+        let r: Vec<u8> = (0..3).map(|_| k.read(0x0D, 0)).collect();
+        assert_eq!(r, [0xA5, 0xF9, 0x01]);
+        for c in [0xF8, 0xFA, 0x84, 0x85, 0x86, 0x88, 0x8F, 0x91] {
             k.write(0x05, c, 0);
             assert_eq!(k.pending(), 0);
         }
@@ -408,8 +425,8 @@ mod tests {
             }
             (0..4).map(|_| k.read(0x0F, 0)).collect::<Vec<u8>>()
         };
-        assert_eq!(status(), [0xB0, 0x00, 0x02, 0x15]);
-        assert_eq!(status(), [0xB0, 0x00, 0x02, 0x15]);
+        assert_eq!(status(), [0xB0, 0x00, 0x02, 0x10]);
+        assert_eq!(status(), [0xB0, 0x00, 0x02, 0x10]);
         for b in [0xE1, 0x00, 0x02, 0x13] {
             k.write(0x07, b, 0);
         }

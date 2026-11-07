@@ -96,6 +96,11 @@ impl Nvram32 {
         if offset & 1 == 0 { Some((offset as usize >> 1) % NVRAM32_SIZE) } else { None }
     }
 
+    /// Side-effect-free read of the RAM byte for traces; never goes through the clock.
+    pub fn peek(&self, i: usize) -> u8 {
+        self.ram[i]
+    }
+
     /// CPU read of chip byte `i`; the clock sees every cycle of the chip.
     pub fn read(&mut self, i: usize) -> u8 {
         self.clock.read().unwrap_or(self.ram[i])

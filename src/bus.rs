@@ -34,7 +34,8 @@ pub enum BoardKind {
 pub struct CdiBus {
     pub board: BoardKind,
     pub mono4: Option<Box<Mono4>>, // Some exactly when `board` is Mono4
-    pub mono4_bus_errors: bool, // Mono-IV: unmapped data accesses raise a bus error (default); CDI_MONO4_BUSERR=0 reads 0xFF instead
+    pub onchip_loud: crate::mono4::Loud, // unmodelled on-chip registers, reported once
+    pub mono4_bus_errors: bool, // Mono-IV: unmapped data accesses raise a bus error; debug switch CDI_MONO4_BUSERR=0 reads 0xFF instead
     pub rom: Box<[u8; 512 * 1024]>,
     pub sys_ram: Box<[u8; 512 * 1024]>,
     pub dvc: Dvc,
@@ -72,6 +73,7 @@ impl CdiBus {
         Self {
             board: BoardKind::Mono1,
             mono4: None,
+            onchip_loud: crate::mono4::Loud::default(),
             mono4_bus_errors: std::env::var_os("CDI_MONO4_BUSERR").is_none_or(|v| v != "0"),
             rom: vec![0u8; 512 * 1024].into_boxed_slice().try_into().unwrap(),
             sys_ram: vec![0u8; 512 * 1024].into_boxed_slice().try_into().unwrap(),
@@ -144,6 +146,8 @@ impl CdiBus {
 
     /// Player reset from the slave: every device as at power-on, but RAM keeps its contents.
     pub fn player_reset(&mut self) {
+        // The system reset line resets the main board; the IKAT runs on its own reset and keeps its state.
+        let ikat = self.mono4.as_deref_mut().map(|m| std::mem::take(&mut m.ikat));
         let planes = (self.mcd212.plane_a.clone(), self.mcd212.plane_b.clone());
         let (cdic_ram, sys_ram) = (self.cdic.ram.clone(), self.sys_ram.clone());
         let dvc_ram = (self.dvc.ram1.clone(), self.dvc.ram2.clone());
@@ -152,6 +156,12 @@ impl CdiBus {
         (self.cdic.ram, self.sys_ram) = (cdic_ram, sys_ram);
         (self.dvc.ram1, self.dvc.ram2) = dvc_ram;
         self.mcd212.plane_a[0..8].copy_from_slice(&self.rom[0..8]);
+        // Pending replies and drive requests belong to the reset board state and are dropped.
+        if let (Some(mut k), Some(m)) = (ikat, self.mono4.as_deref_mut()) {
+            (k.reset_request, k.drive_event, k.toc_reply) = (false, None, false);
+            k.ports.iter_mut().for_each(|p| (p.cmd, p.reply, p.len) = (Vec::new(), Default::default(), 0));
+            m.ikat = k;
+        }
     }
 
     #[inline(always)]
@@ -258,7 +268,7 @@ impl CdiBus {
         self.slave.notify_disc_swapped();
         if let Some(m) = self.mono4.as_deref_mut() {
             m.ikat.set_disc_present(true);
-            m.ciap.drive_active = false;
+            (m.ciap.drive_active, m.ciap.byteswap) = (false, false);
         }
         Ok(())
     }
@@ -368,7 +378,7 @@ impl CdiBus {
     pub fn board_reset_request(&self) -> bool {
         match self.board {
             BoardKind::Mono1 => self.slave.reset_request,
-            BoardKind::Mono4 => false,
+            BoardKind::Mono4 => self.mono4.as_deref().is_some_and(|m| m.ikat.reset_request),
         }
     }
 
@@ -421,6 +431,9 @@ impl CdiBus {
 
         let count = self.dma.channels[1].transfer_counter as u32;
         if count == 0 {
+            // Nothing to move: the channel completes at once.
+            let ch = &mut self.dma.channels[1];
+            ch.channel_status = (ch.channel_status & !0x08) | 0x80;
             return;
         }
 
@@ -456,13 +469,24 @@ impl CdiBus {
             self.dvc.demux.video.len(), self.dvc.demux.audio.len(), self.dvc.fma_demux.audio.len(), self.dvc.video_decoder.is_some(), self.dvc.frames_decoded_count);
         self.dma.channels[1].memory_address_counter = start.wrapping_add(count * 2);
         self.dma.channels[1].transfer_counter = 0;
-        self.dma.channels[1].channel_status |= 0x80;
+        self.dma.channels[1].channel_status = (self.dma.channels[1].channel_status & !0x08) | 0x80;
         if self.dvc.transfer_for_fma {
             let cmd = self.dvc.get_fma_word(crate::dvc::FMA_CMD) & !0x8000;
             self.dvc.set_fma_word(crate::dvc::FMA_CMD, cmd);
         } else {
             let cmd = self.dvc.get_fmv_word(crate::dvc::FMV_SYSCMD) & !0x8000;
             self.dvc.set_fmv_word(crate::dvc::FMV_SYSCMD, cmd);
+        }
+    }
+
+    // Mono-IV: a channel 0 start marks the channel active and the CIAP copy sets the complete bit; a restart while active is reported once.
+    fn mono4_dma_start(&mut self, offset: u32, value: u16, was_active: bool) {
+        if self.board == BoardKind::Mono4 && offset == 0x06 && value & 0x80 != 0 && was_active {
+            if let Some(m) = self.mono4.as_deref_mut() {
+                if m.ciap.loud.first(0x7_0000) {
+                    eprintln!("DMA channel 0 started again while still active (no CIAP copy) pc~{:06X}", self.current_pc);
+                }
+            }
         }
     }
 
@@ -501,7 +525,7 @@ impl CdiBus {
         let ch = &mut self.dma.channels[0];
         ch.memory_address_counter = start.wrapping_add(count * 2);
         ch.transfer_counter = 0;
-        ch.channel_status |= 0x80;
+        ch.channel_status = (ch.channel_status & !0x08) | 0x80;
         if let Some(m) = self.mono4.as_deref_mut() {
             m.ciap.dma_done(control, words);
         }
@@ -540,7 +564,7 @@ impl CdiBus {
 
         self.dma.channels[0].memory_address_counter = (start + count * 2) as u32;
         self.dma.channels[0].transfer_counter = 0;
-        self.dma.channels[0].channel_status |= 0x80; // COC (Channel Operation Complete)
+        self.dma.channels[0].channel_status = (self.dma.channels[0].channel_status & !0x08) | 0x80; // COC set, CA cleared
         self.cdic.dma_triggered = false;
     }
 }
@@ -571,6 +595,14 @@ impl CdiBus {
 
                 // MMU Status/Control
                 0x8000..=0x80FF => 0x00,
+
+                // I2C controller: not modelled, reads 0 (reported once).
+                0x2001..=0x2009 => {
+                    if self.onchip_loud.first(reg) {
+                        eprintln!("SCC68070 I2C register {:04X} read, not modelled (0x00) pc~{:06X}", reg, self.current_pc);
+                    }
+                    0x00
+                }
 
                 _ => 0x00,
             };
@@ -850,7 +882,9 @@ impl CdiBus {
                         (cur & 0xFF00) | (value as u16)
                     };
                     trace!("DMA BYTE WRITE: reg=0x{:04X}, offset=0x{:02X}, new_val=0x{:04X} at PC=0x{:06X}", reg, offset, new_val, self.current_pc);
+                    let was_active = self.dma.channels[0].channel_status & 0x08 != 0;
                     self.dma.write_reg(offset, new_val);
+                    self.mono4_dma_start(offset, new_val, was_active);
                     if offset >= 0x40 && self.dvc_dma_requested() {
                         self.perform_dvc_dma();
                     }
@@ -983,7 +1017,9 @@ impl CdiBus {
             if (0x4000..=0x406F).contains(&reg) {
                 let offset = (reg - 0x4000) & !1;
                 trace!("DMA REG WRITE: offset 0x{:02X} = 0x{:04X} at PC=0x{:06X}", offset, value, self.current_pc);
+                let was_active = self.dma.channels[0].channel_status & 0x08 != 0;
                 self.dma.write_reg(offset, value);
+                self.mono4_dma_start(offset, value, was_active);
                 if offset >= 0x40 && self.dvc_dma_requested() {
                     self.perform_dvc_dma();
                 }
@@ -1092,7 +1128,7 @@ impl CdiBus {
         self.wr8(address.wrapping_add(1), value as u8);
     }
 
-    /// Mono-IV address with no device behind it (the unconnected lanes of IKAT and NVRAM are mapped); the on-chip block is only at 0x80000000, its 24-bit alias at 0x800000 counts as unmapped.
+    /// Mono-IV address with no device; the on-chip block is only at 0x80000000, not at its 0x800000 alias.
     fn mono4_unmapped_address(address: u32) -> bool {
         if (address & 0xFFFF_0000) == 0x8000_0000 {
             return false;
@@ -1226,6 +1262,7 @@ impl CdiBus {
         let m = self.mono4.as_deref()?;
         match addr {
             0x300000..=0x303FFF if !ciap::Ciap::is_reg(addr - 0x300000) => Some(m.ciap.ram[(addr - 0x300000) as usize]),
+            0x320000..=0x32FFFF => crate::mono4::nvram::Nvram32::index(addr - 0x320000).map(|i| m.nvram.peek(i)),
             _ => None,
         }
     }
@@ -1439,6 +1476,20 @@ mod tests {
         assert!(bus.try_read_word(0x500000).is_err() && bus.try_read_word(0x800000).is_err());
         assert!(bus.try_read_word(0x320011).is_ok() && bus.try_read_byte(0x8000_2011).is_ok());
         assert_eq!(bus.counters.bus_errors, 2);
+    }
+
+    #[test]
+    fn mono4_dma_start_reports_only_a_restart_while_active() {
+        let mut bus = CdiBus::new();
+        bus.set_board(BoardKind::Mono4);
+        bus.write_word(0x8000_400A, 4);
+        bus.write_word(0x8000_4006, 0x0080);
+        let count = |b: &CdiBus| b.mono4.as_deref().unwrap().ciap.loud.count;
+        assert_eq!((bus.dma.channels[0].channel_status & 0x88, count(&bus)), (0x08, 0));
+        bus.write_word(0x8000_4006, 0x0080);
+        assert_eq!(count(&bus), 1);
+        bus.write_word(0x3025C2, 0x6906);
+        assert_eq!(bus.dma.channels[0].channel_status & 0x88, 0x80);
     }
 }
 
