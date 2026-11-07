@@ -21,7 +21,15 @@ pub enum SharedIn4Owner {
     Vmpeg,
 }
 
+/// Board whose memory map, external interrupts and peripherals the bus models; picked from the system ROM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BoardKind {
+    #[default]
+    Mono1,
+}
+
 pub struct CdiBus {
+    pub board: BoardKind,
     pub rom: Box<[u8; 512 * 1024]>,
     pub sys_ram: Box<[u8; 512 * 1024]>,
     pub dvc: Dvc,
@@ -57,6 +65,7 @@ pub struct CdiBus {
 impl CdiBus {
     pub fn new() -> Self {
         Self {
+            board: BoardKind::Mono1,
             rom: vec![0u8; 512 * 1024].into_boxed_slice().try_into().unwrap(),
             sys_ram: vec![0u8; 512 * 1024].into_boxed_slice().try_into().unwrap(),
             dvc: Dvc::new(),
@@ -155,8 +164,16 @@ impl CdiBus {
         match addr {
             0x000000..=0x07FFFF => Some(self.mcd212.plane_a[addr as usize]),
             0x200000..=0x27FFFF => Some(self.mcd212.plane_b[(addr - 0x200000) as usize]),
-            0x300000..=0x303BFF => Some(self.cdic.ram[(addr - 0x300000) as usize]),
             0x400000..=0x47FFFF => Some(self.rom[(addr - 0x400000) as usize]),
+            _ => match self.board {
+                BoardKind::Mono1 => self.mono1_peek(addr),
+            },
+        }
+    }
+
+    fn mono1_peek(&self, addr: u32) -> Option<u8> {
+        match addr {
+            0x300000..=0x303BFF => Some(self.cdic.ram[(addr - 0x300000) as usize]),
             0x500000..=0x57FFFF => Some(self.sys_ram[(addr - 0x500000) as usize]),
             0xD00000..=0xDFFFFF if self.dvc.is_fitted() => Some(self.dvc.read_ram1((addr - 0xD00000) as usize)),
             0xE40000..=0xE7FFFF => self.dvc.rom.as_ref().map(|r| r[(addr - 0xE40000) as usize % r.len()]),
@@ -276,6 +293,35 @@ impl CdiBus {
 
     pub fn tick_slave(&mut self, cycles: u32) {
         self.slave.tick(cycles);
+    }
+
+    /// Per-scanline tick of the board peripherals.
+    pub fn tick_board(&mut self, cycles: u32) {
+        match self.board {
+            BoardKind::Mono1 => {
+                self.tick_slave(cycles);
+                self.tick_cdic(cycles);
+                self.tick_dvc(cycles);
+            }
+        }
+    }
+
+    /// Highest external interrupt level the board peripherals request (0 for none).
+    pub fn board_ipl(&mut self) -> u8 {
+        match self.board {
+            BoardKind::Mono1 => {
+                let in4 = if self.in4_pending() { 4 } else { 0 };
+                let in2 = if self.slave.irq_pending { 2 } else { 0 };
+                in4.max(in2)
+            }
+        }
+    }
+
+    /// A board peripheral asked for a player reset.
+    pub fn board_reset_request(&self) -> bool {
+        match self.board {
+            BoardKind::Mono1 => self.slave.reset_request,
+        }
     }
 
     pub fn set_video_mode(&mut self, mode: crate::mcd212::VideoMode) {
@@ -456,6 +502,33 @@ impl CdiBus {
                 self.mcd212.plane_b[(addr - 0x200000) as usize]
             }
 
+            // System ROM (CD-RTOS, 512 KB)
+            0x400000..=0x47FFFF => {
+                self.add_rom_wait();
+                if addr == 0x405E48 {
+                    self.trace_setup = true;
+                }
+                self.rom[(addr - 0x400000) as usize]
+            }
+
+            // MCD212 Display Controller Registers
+            0x4FFFE0..=0x4FFFFF => {
+                let offset = addr - 0x4FFFE0;
+                let reg_base = offset & !1;
+                let word = self.mcd212.read_reg(reg_base);
+                let mcd_int = (self.mcd212.csrr[1] & (crate::mcd212::CSR2R_IT1 | crate::mcd212::CSR2R_IT2)) != 0;
+                self.scc_timer.int1_w(mcd_int);
+                if (addr & 1) == 0 { (word >> 8) as u8 } else { word as u8 }
+            }
+            _ => match self.board {
+                BoardKind::Mono1 => self.mono1_rd8(addr),
+            },
+        }
+    }
+
+    fn mono1_rd8(&mut self, addr: u32) -> u8 {
+        match addr {
+
             // CDIC RAM Buffer (15 KB)
             0x300000..=0x303BFF => self.cdic.ram[(addr - 0x300000) as usize],
 
@@ -480,25 +553,6 @@ impl CdiBus {
                 } else {
                     0xFF
                 }
-            }
-
-            // System ROM (CD-RTOS, 512 KB)
-            0x400000..=0x47FFFF => {
-                self.add_rom_wait();
-                if addr == 0x405E48 {
-                    self.trace_setup = true;
-                }
-                self.rom[(addr - 0x400000) as usize]
-            }
-
-            // MCD212 Display Controller Registers
-            0x4FFFE0..=0x4FFFFF => {
-                let offset = addr - 0x4FFFE0;
-                let reg_base = offset & !1;
-                let word = self.mcd212.read_reg(reg_base);
-                let mcd_int = self.mcd212.int_line();
-                self.scc_timer.int1_w(mcd_int);
-                if (addr & 1) == 0 { (word >> 8) as u8 } else { word as u8 }
             }
 
             // System RAM (512 KB)
@@ -582,6 +636,21 @@ impl CdiBus {
                 let idx = (addr - 0x400000) as usize;
                 ((self.rom[idx] as u16) << 8) | (self.rom[idx + 1] as u16)
             }
+            0x4FFFE0..=0x4FFFFF => {
+                let offset = (addr - 0x4FFFE0) & !1;
+                let word = self.mcd212.read_reg(offset);
+                let mcd_int = (self.mcd212.csrr[1] & (crate::mcd212::CSR2R_IT1 | crate::mcd212::CSR2R_IT2)) != 0;
+                self.scc_timer.int1_w(mcd_int);
+                word
+            }
+            _ => match self.board {
+                BoardKind::Mono1 => self.mono1_rd16(address, addr),
+            },
+        }
+    }
+
+    fn mono1_rd16(&mut self, address: u32, addr: u32) -> u16 {
+        match addr {
             0x500000..=0x57FFFE => {
                 let idx = (addr - 0x500000) as usize;
                 ((self.sys_ram[idx] as u16) << 8) | (self.sys_ram[idx + 1] as u16)
@@ -600,13 +669,6 @@ impl CdiBus {
             }
             0x310000..=0x317FFF => {
                 self.slave.read(addr - 0x310000)
-            }
-            0x4FFFE0..=0x4FFFFF => {
-                let offset = (addr - 0x4FFFE0) & !1;
-                let word = self.mcd212.read_reg(offset);
-                let mcd_int = self.mcd212.int_line();
-                self.scc_timer.int1_w(mcd_int);
-                word
             }
             0xD00000..=0xDFFFFE => {
                 if self.dvc.is_fitted() {
@@ -726,6 +788,32 @@ impl CdiBus {
                 self.mcd212.plane_b[(addr - 0x200000) as usize] = value;
             }
 
+            // MCD212 Display Registers
+            0x4FFFE0..=0x4FFFFF => {
+                let offset = addr - 0x4FFFE0;
+                let reg_base = offset & !1;
+                let cur = match reg_base & 0x1E {
+                    0x00 => self.mcd212.csrw[1],
+                    0x10 => self.mcd212.csrw[0],
+                    _ => self.mcd212.read_reg(reg_base),
+                };
+                let new_val = if (addr & 1) == 0 {
+                    (cur & 0x00FF) | ((value as u16) << 8)
+                } else {
+                    (cur & 0xFF00) | (value as u16)
+                };
+                self.mcd212.write_reg(reg_base, new_val);
+                self.slave.video_mode = self.mcd212.video_mode;
+            }
+            _ => match self.board {
+                BoardKind::Mono1 => self.mono1_wr8(addr, value),
+            },
+        }
+    }
+
+    fn mono1_wr8(&mut self, addr: u32, value: u8) {
+        match addr {
+
             // CDIC RAM
             0x300000..=0x303BFF => self.cdic.ram[(addr - 0x300000) as usize] = value,
 
@@ -756,24 +844,6 @@ impl CdiBus {
                     let offset = (addr - 0x320000) >> 1;
                     self.nvram.write(offset, value);
                 }
-            }
-
-            // MCD212 Display Registers
-            0x4FFFE0..=0x4FFFFF => {
-                let offset = addr - 0x4FFFE0;
-                let reg_base = offset & !1;
-                let cur = match reg_base & 0x1E {
-                    0x00 => self.mcd212.csrw[1],
-                    0x10 => self.mcd212.csrw[0],
-                    _ => self.mcd212.read_reg(reg_base),
-                };
-                let new_val = if (addr & 1) == 0 {
-                    (cur & 0x00FF) | ((value as u16) << 8)
-                } else {
-                    (cur & 0xFF00) | (value as u16)
-                };
-                self.mcd212.write_reg(reg_base, new_val);
-                self.slave.video_mode = self.mcd212.video_mode;
             }
 
             // System RAM (512 KB)
@@ -851,6 +921,20 @@ impl CdiBus {
                 self.mcd212.plane_b[idx + 1] = value as u8;
                 return;
             }
+            0x4FFFE0..=0x4FFFFF => {
+                let offset = (addr - 0x4FFFE0) & !1;
+                self.mcd212.write_reg(offset, value);
+                self.slave.video_mode = self.mcd212.video_mode;
+                return;
+            }
+            _ => match self.board {
+                BoardKind::Mono1 => self.mono1_wr16(address, addr, value),
+            },
+        }
+    }
+
+    fn mono1_wr16(&mut self, address: u32, addr: u32, value: u16) {
+        match addr {
             0x500000..=0x57FFFE => {
                 let idx = (addr - 0x500000) as usize;
                 self.sys_ram[idx] = (value >> 8) as u8;
@@ -877,12 +961,6 @@ impl CdiBus {
             0x310000..=0x317FFF => {
                 self.slave.write(addr - 0x310000, value);
                 self.cdic.audio.set_attenuation(self.slave.attenuation);
-                return;
-            }
-            0x4FFFE0..=0x4FFFFF => {
-                let offset = (addr - 0x4FFFE0) & !1;
-                self.mcd212.write_reg(offset, value);
-                self.slave.video_mode = self.mcd212.video_mode;
                 return;
             }
             0xD00000..=0xDFFFFE => {
@@ -948,31 +1026,43 @@ impl CdiBus {
                 return 0x38 + level as u32;
             }
 
+            if let Some(v) = match self.board {
+                BoardKind::Mono1 => self.mono1_iack(level),
+            } {
+                return v;
+            }
+
+            0x18 + level as u32
+        })();
+        vec
+    }
+
+    // External level 4 (CDIC or DVC) and level 2 (slave) acknowledges on the Mono-I board.
+    fn mono1_iack(&mut self, level: u8) -> Option<u32> {
+        {
             if level == 4 {
                 self.arbitrate_shared_in4();
                 match self.shared_in4_owner {
                     SharedIn4Owner::Vmpeg => {
                         let vec = self.dvc.intack_vector() as u32;
-                        return if vec != 0 { vec } else { 0x1C };
+                        return Some(if vec != 0 { vec } else { 0x1C });
                     }
                     SharedIn4Owner::Cdic => {
                         let vec = (self.cdic.interrupt_vector & 0xFF) as u32;
-                        return if vec != 0 { vec } else { 0x1C };
+                        return Some(if vec != 0 { vec } else { 0x1C });
                     }
                     SharedIn4Owner::Idle => {
-                        return 0x1C;
+                        return Some(0x1C);
                     }
                 }
             }
 
             if level == 2 {
                 self.slave.irq_pending = false;
-                return 0x1A; // Autovector 2 (Vector 26) - used by OS-9 cdapdriv & pointer drivers!
+                return Some(0x1A); // Autovector 2 (Vector 26) - used by OS-9 cdapdriv & pointer drivers!
             }
-
-            0x18 + level as u32
-        })();
-        vec
+        }
+        None
     }
 
     #[cold]
