@@ -550,8 +550,9 @@ impl Cdic {
             return false;
         }
 
-        let chan = (buf[21] & 0x0F) as usize;
-        (self.audio_channel & (1 << chan)) != 0
+        // Channel numbers run 0-31 but the mask has 16 bits, so channels 16-31 are never selected
+        let chan = (buf[21] & 0x1F) as usize;
+        chan < 16 && (self.audio_channel & (1 << chan)) != 0
     }
 
     pub fn is_valid_sector(&self, buffer: &[u8]) -> bool {
@@ -816,5 +817,23 @@ impl Cdic {
         if self.disc_command == 0 || self.command == 0x23 || self.command == 0x24 {
             self.cancel_disc_read();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_channels_above_15_are_never_selected() {
+        let mut c = Cdic::new();
+        c.audio_channel = 0x0002;
+        let mut buf = vec![0u8; 2352];
+        buf[22] = 0x24;
+        buf[23] = 0x05;
+        buf[21] = 1;
+        assert!(c.is_mode2_audio_selected(&buf));
+        buf[21] = 17;
+        assert!(!c.is_mode2_audio_selected(&buf));
     }
 }
