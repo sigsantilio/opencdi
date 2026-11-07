@@ -18,6 +18,7 @@ use opencdi::audio::{self, Frame, HostAudioOutput};
 use opencdi::frontend::{pop_action, push_action, GuiAction, InputDeviceMode, KeyBindings};
 #[cfg(target_os = "windows")]
 use opencdi::gui;
+use opencdi::bus::BoardKind;
 use opencdi::machine::Machine;
 use opencdi::mcd212::{SCREEN_WIDTH, SCREEN_HEIGHT, VideoMode};
 
@@ -86,6 +87,7 @@ Usage: opencdi [options] [disc image (cue, chd, iso, bin)]
   --recent [n]        List the recent disc images, or boot recent image number n
   --no-host-input     Ignore host keyboard, mouse and gamepads; never grab the cursor
   --bios, --standalone  Boot the BIOS shell without a disc
+  --board mono1|mono4 Console board (default mono1; mono4 is the CD-i 490, give --rom its BIOS)
   --dvc <path>        Digital Video Cartridge ROM (default: search dvc/, bios/, the current and the program directory)
   --no-dvc, --nodvc   Boot without the Digital Video Cartridge
   --slave-debug       Log slave (mouse channel) bytes
@@ -115,6 +117,14 @@ fn default_nvram_save_path() -> PathBuf {
         return PathBuf::from("bios/nvram_mk48t08.bin");
     }
     PathBuf::from("nvram_mk48t08.bin")
+}
+
+// Pointer and buttons go to the IKAT on the Mono-IV board, to the slave otherwise
+fn send_pointer(bus: &mut opencdi::bus::CdiBus, x: i32, y: i32, buttons: u8) {
+    match bus.mono4.as_deref_mut() {
+        Some(m4) => m4.ikat.update_pointer(x, y, buttons),
+        None => bus.slave.update_mouse(x, y, buttons),
+    }
 }
 
 fn find_file(relative_subpath: &str) -> Option<PathBuf> {
@@ -298,6 +308,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rom_arg = flag_value("--rom").map(PathBuf::from);
     let max_frames: Option<u64> = flag_value("--frames").and_then(|s| s.parse().ok());
 
+    let board = flag_value("--board").map(|v| BoardKind::parse(&v).unwrap_or_else(|| {
+        eprintln!("--board takes mono1 or mono4");
+        std::process::exit(2);
+    }));
+
     let mut m = Machine::new();
     m.bus.slave.debug_log = has_flag("--slave-debug");
     if m.bus.slave.debug_log {
@@ -357,10 +372,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if let Some(b) = board {
+        m.bus.set_board(b);
+    }
+
     // 2. Load NVRAM if present
     let nvram_arg = args.iter().position(|a| a == "--nvram").and_then(|i| args.get(i + 1)).map(PathBuf::from);
     let resolved_nvram_path = nvram_arg.unwrap_or_else(default_nvram_save_path);
-    if resolved_nvram_path.is_file() {
+    if m.bus.mono4.is_some() {
+        info!("Mono-IV board: the 32 KB NVRAM starts empty and is not saved to a file");
+    } else if resolved_nvram_path.is_file() {
         if let Err(e) = m.bus.nvram.load_from_file(&resolved_nvram_path) {
             log::warn!("Impossibile caricare NVRAM da {:?}: {:?}", resolved_nvram_path, e);
         } else {
@@ -390,7 +411,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut disc_arg = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if a == "--rom" || a == "--frames" || a == "--dvc" || (a == "--recent" && recent_pick.is_some()) {
+        if a == "--rom" || a == "--frames" || a == "--dvc" || a == "--board" || (a == "--recent" && recent_pick.is_some()) {
             it.next();
         } else if !a.starts_with("--") {
             disc_arg = Some(a.clone());
@@ -424,7 +445,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     info!("Detected NTSC disc (USA/Japan): auto-configured NTSC 60 Hz video mode");
                     m.bus.set_video_mode(VideoMode::Ntsc);
                 } else {
-                    info!("Console booted in standard PAL 50 Hz mode (CD-i 220 BIOS)");
+                    info!("Console booted in standard PAL 50 Hz mode");
                     m.bus.set_video_mode(VideoMode::Pal);
                 }
             }
@@ -484,6 +505,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         focused: false,
         cursor: None,
         rel_pointer: None,
+        rel_over: (0.0, 0.0),
         mouse_left: false,
         mouse_right: false,
         mouse_middle: false,
@@ -629,6 +651,7 @@ struct App {
     focused: bool,
     cursor: Option<PhysicalPosition<f64>>,
     rel_pointer: Option<(f64, f64)>,
+    rel_over: (f64, f64), // raw mouse motion past the screen edge since the last frame, in CD-i pixels
     mouse_left: bool,
     mouse_right: bool,
     mouse_middle: bool,
@@ -1056,15 +1079,16 @@ impl App {
                 (0x0000C000u32, m.bus.peek_long(0x0000C000u32.wrapping_add(0xFFFF9172)).unwrap_or(0))
             };
 
-            if shell_state >= 2 {
+            // The shell click targets the Mono-I shell; on the 490 the user clicks Play
+            if shell_state >= 2 && m.bus.mono4.is_none() {
                 self.shell_ready_count += 1;
                 if self.shell_ready_count == 1 || self.shell_ready_count == 150 {
-                    m.bus.slave.update_mouse(575, 335, 0);
+                    send_pointer(&mut m.bus, 575, 335, 0);
                 } else if self.shell_ready_count == 30 || self.shell_ready_count == 180 {
                     info!("Shell BIOS pronta (stato {}): avvio automatico disco CD-i (click PLAY CD-I)...", shell_state);
-                    m.bus.slave.update_mouse(575, 335, 1);
+                    send_pointer(&mut m.bus, 575, 335, 1);
                 } else if self.shell_ready_count == 50 || self.shell_ready_count == 200 {
-                    m.bus.slave.update_mouse(575, 335, 0);
+                    send_pointer(&mut m.bus, 575, 335, 0);
                 }
             }
             if ((m.cpu.pc >= 0x00010000 && m.cpu.pc < 0x00300000) || (m.cpu.pc >= 0x00D00000 && m.cpu.pc < 0x00E00000)) && self.frame_count > 250 {
@@ -1075,7 +1099,7 @@ impl App {
                 self.pad_y = 280;
                 self.pad_x_f = 384.0;
                 self.pad_y_f = 280.0;
-                m.bus.slave.update_mouse(384, 280, 0);
+                send_pointer(&mut m.bus, 384, 280, 0);
             }
         }
     }
@@ -1199,6 +1223,9 @@ impl App {
         let mut mouse_btn = 0;
         let mut mouse_x = self.pad_x;
         let mut mouse_y = self.pad_y;
+        // Whole pixels go out this frame, the fraction carries over so slow drags at the edge still count
+        let rel_over = (self.rel_over.0.round(), self.rel_over.1.round());
+        self.rel_over = (self.rel_over.0 - rel_over.0, self.rel_over.1 - rel_over.1);
 
         if is_active && self.mouse_captured {
             if let Some((x, y)) = self.rel_pointer {
@@ -1224,25 +1251,34 @@ impl App {
             }
         }
 
-        if !self.disc_launched && m.bus.cdrom.is_some() {
+        if !self.disc_launched && m.bus.cdrom.is_some() && m.bus.mono4.is_none() {
             // During automatic boot sequence, do not let host mouse drift override PLAY CD-I auto-click
         } else {
             match self.input_device_mode {
                 InputDeviceMode::Gamepad => {
                     const PAD_SPEED: f32 = 2.5;
                     let mut moved = false;
+                    let mut over = (0.0f32, 0.0f32);
                     if dir_x != 0 {
-                        self.pad_x_f = (self.pad_x_f + (dir_x.clamp(-1, 1) as f32) * PAD_SPEED).clamp(0.0, 767.0);
+                        let x = self.pad_x_f + (dir_x.clamp(-1, 1) as f32) * PAD_SPEED;
+                        self.pad_x_f = x.clamp(0.0, 767.0);
+                        over.0 = x - self.pad_x_f;
                         self.pad_x = self.pad_x_f.round() as i32;
                         moved = true;
                     }
                     if dir_y != 0 {
-                        self.pad_y_f = (self.pad_y_f + (dir_y.clamp(-1, 1) as f32) * PAD_SPEED).clamp(0.0, 559.0);
+                        let y = self.pad_y_f + (dir_y.clamp(-1, 1) as f32) * PAD_SPEED;
+                        self.pad_y_f = y.clamp(0.0, 559.0);
+                        over.1 = y - self.pad_y_f;
                         self.pad_y = self.pad_y_f.round() as i32;
                         moved = true;
                     }
                     if moved || key_btn != self.prev_key_btn {
-                        m.bus.slave.update_mouse(self.pad_x, self.pad_y, key_btn);
+                        send_pointer(&mut m.bus, self.pad_x, self.pad_y, key_btn);
+                    }
+                    // The 490 reports relative moves, so a direction held against the screen edge keeps moving
+                    if let Some(m4) = m.bus.mono4.as_deref_mut() {
+                        m4.ikat.push_pointer(over.0.round() as i32, over.1.round() as i32);
                     }
                     self.prev_key_btn = key_btn;
                 }
@@ -1251,7 +1287,10 @@ impl App {
                     self.pad_y = mouse_y;
                     self.pad_x_f = mouse_x as f32;
                     self.pad_y_f = mouse_y as f32;
-                    m.bus.slave.update_mouse(self.pad_x, self.pad_y, mouse_btn | key_btn);
+                    send_pointer(&mut m.bus, self.pad_x, self.pad_y, mouse_btn | key_btn);
+                    if let Some(m4) = m.bus.mono4.as_deref_mut() {
+                        m4.ikat.push_pointer(rel_over.0 as i32, rel_over.1 as i32);
+                    }
                 }
             }
         }
@@ -1588,8 +1627,10 @@ impl ApplicationHandler for App {
         if let (DeviceEvent::MouseMotion { delta: (dx, dy) }, Some((x, y))) = (event, self.rel_pointer) {
             let (_, _, w, h) = self.image_rect;
             if w > 0 && h > 0 {
-                let x = (x + dx * SCREEN_WIDTH as f64 / w as f64).clamp(0.0, (SCREEN_WIDTH - 1) as f64);
-                let y = (y + dy * SCREEN_HEIGHT as f64 / h as f64).clamp(0.0, (SCREEN_HEIGHT - 1) as f64);
+                let (nx, ny) = (x + dx * SCREEN_WIDTH as f64 / w as f64, y + dy * SCREEN_HEIGHT as f64 / h as f64);
+                let x = nx.clamp(0.0, (SCREEN_WIDTH - 1) as f64);
+                let y = ny.clamp(0.0, (SCREEN_HEIGHT - 1) as f64);
+                self.rel_over = (self.rel_over.0 + nx - x, self.rel_over.1 + ny - y);
                 self.rel_pointer = Some((x, y));
             }
         }
@@ -1642,6 +1683,13 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn board_flag_values() {
+        assert_eq!(BoardKind::parse("mono1"), Some(BoardKind::Mono1));
+        assert_eq!(BoardKind::parse("mono4"), Some(BoardKind::Mono4));
+        assert_eq!(BoardKind::parse("490"), None);
+    }
 
     #[test]
     fn letterbox_matches_aspect_stretch() {

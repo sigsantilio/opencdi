@@ -78,7 +78,7 @@ fn main() {
             "--counters" => counters = true,
             "--board" => {
                 i += 1;
-                board = Some(match a.get(i).map(String::as_str) { Some("mono1") => BoardKind::Mono1, Some("mono4") => BoardKind::Mono4, _ => usage() });
+                board = Some(a.get(i).and_then(|s| BoardKind::parse(s)).unwrap_or_else(|| usage()));
             }
             "--idle-pc" => { i += 1; idle_pc = Some(a.get(i).and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or_else(|| usage())); }
             "--autoplay" => autoplay = true,

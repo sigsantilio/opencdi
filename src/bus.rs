@@ -31,6 +31,16 @@ pub enum BoardKind {
     Mono4,
 }
 
+impl BoardKind {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "mono1" => Some(Self::Mono1),
+            "mono4" => Some(Self::Mono4),
+            _ => None,
+        }
+    }
+}
+
 pub struct CdiBus {
     pub board: BoardKind,
     pub mono4: Option<Box<Mono4>>, // Some exactly when `board` is Mono4
