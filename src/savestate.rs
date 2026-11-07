@@ -10,7 +10,7 @@ use crate::mcd212::VideoMode;
 use crate::dvc::mpeg::{Buffer, Frame, Plane, Video};
 use crate::dvc::mpeg::video::Motion;
 
-const SAVESTATE_MAGIC: &[u8; 8] = b"OCDIST01";
+const SAVESTATE_MAGIC: &[u8; 8] = b"OCDIST03";
 
 struct StateWriter {
     buf: Vec<u8>,
@@ -399,6 +399,7 @@ pub fn save_state_to_file<P: AsRef<Path>>(
     w.write_i16(bus.cdic.audio.map_right_state.s0);
     w.write_i16(bus.cdic.audio.map_right_state.s1);
     w.write_u64(bus.cdic.audio.total_sectors_decoded);
+    w.write_bytes(&bus.cdic.audio.save_state());
     w.write_u16(bus.cdic.command);
     w.write_u32(bus.cdic.time);
     w.write_u16(bus.cdic.file);
@@ -485,6 +486,16 @@ pub fn save_state_to_file<P: AsRef<Path>>(
         w.write_opt_u8(dm.selected_audio_stream);
         w.write_opt_u8(dm.selected_video_stream);
         w.write_u64(dm.program_ends);
+        w.write_opt_u64(dm.scr_base);
+        w.write_u64(dm.mux_rate);
+        w.write_u64(dm.pack_bytes);
+        w.write_u64(dm.tick_bytes);
+        w.write_u32(dm.due.len() as u32);
+        for &d in &dm.due {
+            w.write_u64(d);
+        }
+        w.write_opt_u64(dm.last_due);
+        w.write_u64(dm.interval);
     }
 
     w.write_u32(bus.dvc.audio_sample_rate);
@@ -494,6 +505,10 @@ pub fn save_state_to_file<P: AsRef<Path>>(
     w.write_usize(bus.dvc.frames_presented_count);
     w.write_usize(bus.dvc.vsync_counter);
     w.write_u32(bus.dvc.underflow_count);
+    w.write_bool(bus.dvc.fma_started);
+    w.write_u64(bus.dvc.fma_tick_accum);
+    w.write_u16(bus.dvc.fma_pending);
+    w.write_u32(bus.dvc.fma_last_header);
     w.write_bool(bus.dvc.has_valid_frame);
 
     // Video Decoder
@@ -775,6 +790,8 @@ pub fn load_state_from_file<P: AsRef<Path>>(
     bus.cdic.audio.map_right_state.s0 = r.read_i16()?;
     bus.cdic.audio.map_right_state.s1 = r.read_i16()?;
     bus.cdic.audio.total_sectors_decoded = r.read_u64()?;
+    let mixer = r.read_bytes()?;
+    bus.cdic.audio.load_state(&mixer).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad audio mixer state"))?;
     bus.cdic.command = r.read_u16()?;
     bus.cdic.time = r.read_u32()?;
     bus.cdic.file = r.read_u16()?;
@@ -860,6 +877,18 @@ pub fn load_state_from_file<P: AsRef<Path>>(
         dm.selected_audio_stream = r.read_opt_u8()?;
         dm.selected_video_stream = r.read_opt_u8()?;
         dm.program_ends = r.read_u64()?;
+        dm.scr_base = r.read_opt_u64()?;
+        dm.mux_rate = r.read_u64()?;
+        dm.pack_bytes = r.read_u64()?;
+        dm.tick_bytes = r.read_u64()?;
+        let n = r.read_u32()?;
+        dm.due.clear();
+        for _ in 0..n.min(64) {
+            dm.due.push_back(r.read_u64()?);
+        }
+        dm.last_due = r.read_opt_u64()?;
+        dm.interval = r.read_u64()?;
+        dm.events.clear();
     }
 
     bus.dvc.mp2.reset();
@@ -871,6 +900,10 @@ pub fn load_state_from_file<P: AsRef<Path>>(
     bus.dvc.frames_presented_count = r.read_usize()?;
     bus.dvc.vsync_counter = r.read_usize()?;
     bus.dvc.underflow_count = r.read_u32()?;
+    bus.dvc.fma_started = r.read_bool()?;
+    bus.dvc.fma_tick_accum = r.read_u64()?;
+    bus.dvc.fma_pending = r.read_u16()?;
+    bus.dvc.fma_last_header = r.read_u32()?;
     bus.dvc.has_valid_frame = r.read_bool()?;
 
     if r.read_bool()? {
