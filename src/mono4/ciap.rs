@@ -23,17 +23,15 @@ pub const CHIP_ID: u16 = 0xCD02;
 const STORED: &[u32] = &[0x08, 0x0A, 0x0C, 0x0E, 0x10, 0x12, 0x1A, 0x20, 0x22, 0x24, 0x28, 0x34, 0x7E];
 
 pub const ISR_DATA: u16 = 0x0001;
-pub const ISR_AUDIO: u16 = 0x0002;
 pub const ISR_AUDIO_EVENT: u16 = 0x0008;
 pub const ISR_TRIGGER: u16 = 0x0200;
 pub const ISR_EOF: u16 = 0x0400;
-const REG_TACS: u32 = 0x08;
+/// Buffer manager at power-on: data buffer 0, Q buffer 0 and subcode buffer 0 current, no audio buffer queued.
+pub const BMAN_RESET: u16 = 0x0054;
 
-// Buffers in CIAP RAM and their buffer-manager bits: audio 0/1, data 2/3.
-const AUDIO_BUFS: [(u16, usize); 2] = [(0x01, 0x0000), (0x02, 0x0900)];
+// Data buffers in CIAP RAM and their buffer-manager bits; the set bit names the buffer the chip fills.
 const DATA_BUFS: [(u16, usize); 2] = [(0x04, 0x1200), (0x08, 0x1BC2)];
 const DATA_LEN: usize = 2340;
-const AUDIO_LEN: usize = 2304;
 
 pub struct Ciap {
     pub ram: Vec<u8>,
@@ -42,6 +40,8 @@ pub struct Ciap {
     pub q_mode: bool,
     pub lba: u32,
     pub drive_active: bool,
+    pub start_delay: u8, // sector periods after a seek before the first sector
+    pub drive_stopped: bool, // the drive stopped because delivery was off; the board reports it
     pub cycles: u32,
     pub dma_request: Option<u16>,
     pub seeks: u64,
@@ -54,21 +54,28 @@ pub struct Ciap {
 
 impl Default for Ciap {
     fn default() -> Self {
-        Self { ram: vec![0; WINDOW_SIZE], regs: [0; 64], running: false, q_mode: false, lba: 0, drive_active: false, cycles: 0, dma_request: None, seeks: 0, sectors: 0, skipped: 0, dmas: 0, loud: Loud::default(), trace: false }
+        Self { ram: vec![0; WINDOW_SIZE], regs: power_on_regs(), running: false, q_mode: false, lba: 0, drive_active: false, start_delay: 0, drive_stopped: false, cycles: 0, dma_request: None, seeks: 0, sectors: 0, skipped: 0, dmas: 0, loud: Loud::default(), trace: false }
     }
+}
+
+fn power_on_regs() -> [u16; 64] {
+    let mut regs = [0; 64];
+    regs[(REG_BMAN >> 1) as usize] = BMAN_RESET;
+    regs
 }
 
 impl Ciap {
     pub fn reset(&mut self) {
-        self.regs = [0; 64];
+        self.regs = power_on_regs();
         (self.running, self.q_mode, self.lba, self.drive_active) = (false, false, 0, false);
+        (self.start_delay, self.drive_stopped) = (0, false);
     }
 
     /// Drive request from IKAT port D: a seek positions the next sector and starts the drive, a stop halts delivery.
     pub fn drive(&mut self, ev: super::ikat::DriveEvent) {
         match ev {
             super::ikat::DriveEvent::Seek(lba) => {
-                (self.lba, self.drive_active) = (lba, true);
+                (self.lba, self.drive_active, self.start_delay) = (lba, true, 1);
                 self.seeks += 1;
             }
             super::ikat::DriveEvent::Stop => self.drive_active = false,
@@ -99,14 +106,14 @@ impl Ciap {
         self.reg(REG_IER) & self.reg(REG_ISR) != 0
     }
 
-    /// Request level, the low three bits of the interrupt control register.
+    /// Request level: the board wires the CIAP request to level 4; the interrupt control register is only stored.
     pub fn level(&self) -> u8 {
-        (self.reg(REG_ICR) & 7) as u8
+        4
     }
 
-    /// Acknowledge vector, the interrupt control register shifted right by three.
+    /// Acknowledge vector: the on-chip vector of the request level.
     pub fn vector(&self) -> u32 {
-        ((self.reg(REG_ICR) >> 3) & 0xFF) as u32
+        0x38 + self.level() as u32
     }
 
     /// Side-effect-free register read for traces and byte merges.
@@ -146,8 +153,8 @@ impl Ciap {
         }
         match reg {
             REG_IER | REG_ICR | REG_TEST => self.set(reg, value),
-            // A written 1 hands the buffer back to the chip.
-            REG_BMAN => self.set(REG_BMAN, self.reg(REG_BMAN) & !value),
+            // A written 1 toggles the bit: swaps a data or Q pair, queues a CPU-filled audio buffer.
+            REG_BMAN => self.set(REG_BMAN, self.reg(REG_BMAN) ^ value),
             REG_CCR => {
                 self.set(REG_CCR, value);
                 self.command(value, pc);
@@ -167,41 +174,89 @@ impl Ciap {
                 }
             }
             r if STORED.contains(&r) => self.set(r, value),
+            REG_ISR | REG_ID | REG_ASTAT => {
+                if self.loud.first(0x100 | reg) {
+                    eprintln!("CIAP write to read-only reg {:02X} <- {:04X} ignored pc~{:06X}", reg, value, pc);
+                }
+            }
             _ => {
                 if self.loud.first(0x100 | reg) {
-                    eprintln!("CIAP unmodelled write reg {:02X} <- {:04X} pc~{:06X}", reg, value, pc);
+                    eprintln!("CIAP unmodelled write reg {:02X} <- {:04X} ignored pc~{:06X}", reg, value, pc);
                 }
-                self.set(reg, value);
             }
         }
     }
 
-    /// Advances the sector clock; one sector every `CYCLES_PER_SECTOR` while delivery runs and the drive is active.
+    /// Byte read of one register lane (`hi`: the even address); a status byte read clears only that byte.
+    pub fn read_reg_byte(&mut self, reg: u32, hi: bool, pc: u32) -> u8 {
+        let reg = reg & 0x7E;
+        let w = if reg == REG_ISR {
+            let w = self.reg(REG_ISR);
+            self.set(REG_ISR, w & if hi { 0x00FF } else { 0xFF00 });
+            if self.trace {
+                eprintln!("CIAP RD8 {:02X}{} = {:04X} pc~{:06X}", reg, if hi { "H" } else { "L" }, w, pc);
+            }
+            w
+        } else {
+            self.read_reg(reg, pc)
+        };
+        if hi { (w >> 8) as u8 } else { w as u8 }
+    }
+
+    /// Byte write of one register lane; buffer-manager bits act on that lane only, command registers are logged.
+    pub fn write_reg_byte(&mut self, reg: u32, hi: bool, value: u8, pc: u32) {
+        let reg = reg & 0x7E;
+        let (mask, v) = if hi { (0xFF00u16, (value as u16) << 8) } else { (0x00FF, value as u16) };
+        match reg {
+            REG_BMAN => self.write_reg(reg, v, pc),
+            REG_CCR | REG_APCR | REG_DMACTL => {
+                if self.loud.first(0x400 | reg) {
+                    eprintln!("CIAP byte write to command reg {:02X}{} <- {:02X} pc~{:06X}", reg, if hi { "H" } else { "L" }, value, pc);
+                }
+                let cur = self.reg(reg);
+                self.write_reg(reg, (cur & !mask) | v, pc);
+            }
+            _ => {
+                let cur = self.peek_reg(reg);
+                self.write_reg(reg, (cur & !mask) | v, pc);
+            }
+        }
+    }
+
+    /// A finished DMA: the word address in the control register has advanced past the words moved.
+    pub fn dma_done(&mut self, control: u16, words: u32) {
+        self.set(REG_DMACTL, (control & 0xE000) | (control.wrapping_add(words as u16) & 0x1FFF));
+        self.dmas += 1;
+    }
+
+    /// Advances the sector clock: one drive step every `CYCLES_PER_SECTOR`; the first sector comes on the second step after a seek, and a step with delivery off stops the drive.
     pub fn tick(&mut self, cycles: u32, sector_cycles: u32, cdrom: &mut Option<CdRom>) {
         self.cycles += cycles;
         while self.cycles >= sector_cycles {
             self.cycles -= sector_cycles;
-            if self.running && self.drive_active {
-                if let Some(cd) = cdrom.as_mut() {
-                    self.sector(cd);
+            if !self.drive_active {
+                continue;
+            }
+            if self.start_delay > 0 {
+                self.start_delay -= 1;
+            } else if !self.running {
+                (self.drive_active, self.drive_stopped) = (false, true);
+                if self.trace {
+                    eprintln!("CIAP DRIVE stopped, delivery off");
                 }
+            } else if let Some(cd) = cdrom.as_mut() {
+                self.sector(cd);
             }
         }
     }
 
-    // Lowest buffer whose manager bit is clear.
-    fn free_buffer(&self, bufs: &[(u16, usize); 2]) -> Option<(u16, usize)> {
+    // Current data buffer: buffer 0 when its bit is set, else buffer 1 when its bit is set.
+    fn data_buffer(&self) -> Option<usize> {
         let bman = self.reg(REG_BMAN);
-        bufs.iter().copied().find(|&(bit, _)| bman & bit == 0)
+        DATA_BUFS.iter().find(|&&(bit, _)| bman & bit != 0).map(|&(_, at)| at)
     }
 
-    fn fill(&mut self, buf: (u16, usize), src: &[u8], isr: u16) {
-        self.ram[buf.1..buf.1 + src.len()].copy_from_slice(src);
-        self.set(REG_BMAN, self.reg(REG_BMAN) | buf.0);
-        self.set(REG_ISR, self.reg(REG_ISR) | isr);
-    }
-
-    // Delivers the sector at the drive position, then advances it; the drive keeps moving when buffers are full.
+    // Delivers the sector at the drive position into the current data buffer, then advances it; the buffer manager is left to the CPU.
     fn sector(&mut self, cd: &mut CdRom) {
         let lba = self.lba;
         self.lba += 1;
@@ -213,15 +268,8 @@ impl Ciap {
             return;
         }
         let (file, channel, submode) = (raw[16], raw[17], raw[18]);
-        let audio = submode & 0x04 != 0;
-        let taken = if !audio {
-            self.free_buffer(&DATA_BUFS).map(|b| self.fill(b, &raw[12..12 + DATA_LEN], ISR_DATA))
-        } else if submode & 0x20 != 0 && self.reg(REG_TACS) & (1 << (channel & 15)) != 0 {
-            self.free_buffer(&AUDIO_BUFS).map(|b| self.fill(b, &raw[24..24 + AUDIO_LEN], ISR_AUDIO))
-        } else {
-            None
-        };
-        let mut flags = 0;
+        let taken = self.data_buffer().map(|at| self.ram[at..at + DATA_LEN].copy_from_slice(&raw[12..12 + DATA_LEN]));
+        let mut flags = if taken.is_some() { ISR_DATA } else { 0 };
         if submode & 0x10 != 0 {
             flags |= ISR_TRIGGER;
         }
@@ -240,14 +288,21 @@ impl Ciap {
         }
     }
 
-    // Commands: 0x94 and 0xC4 start delivery, 0x100 stops it; Q reporting with 0x10, 0x44 and 0x94, not with 0xC4.
+    // Commands: 0x94, 0xC4, 0x44 and 0x80 start delivery, 0x100 stops it; Q reporting with 0x10, 0x44 and 0x94, not with 0xC4.
     fn command(&mut self, v: u16, pc: u32) {
         match v {
             0x0094 => (self.running, self.q_mode) = (true, true),
             0x00C4 => (self.running, self.q_mode) = (true, false),
             0x0100 => (self.running, self.q_mode) = (false, false),
-            0x0010 | 0x0044 => self.q_mode = true,
-            0x0008 | 0x7000 | 0x3000 | 0x0080 | 0x0200 | 0x0040 => {}
+            0x0044 => (self.running, self.q_mode) = (true, true),
+            0x0080 => self.running = true,
+            0x0010 => self.q_mode = true,
+            // Accepted without a modelled effect; logged once so a run shows they arrived.
+            0x0008 | 0x7000 | 0x3000 | 0x0200 | 0x0040 => {
+                if self.loud.first(0x1_0000 | v as u32) {
+                    eprintln!("CIAP command {:04X} accepted, no effect modelled pc~{:06X}", v, pc);
+                }
+            }
             _ => {
                 if self.loud.first(0x1_0000 | v as u32) {
                     eprintln!("CIAP unmodelled command {:04X} pc~{:06X}", v, pc);
@@ -264,8 +319,10 @@ mod tests {
     #[test]
     fn vector_level_and_clear_on_read() {
         let mut c = Ciap::default();
-        c.write_reg(REG_ICR, 0x01E4, 0);
+        c.write_reg(REG_ICR, 0x0000, 0);
         assert_eq!((c.vector(), c.level()), (0x3C, 4));
+        c.write_reg(REG_ICR, 0x01E4, 0);
+        assert_eq!(c.peek_reg(REG_ICR), 0x01E4);
         c.write_reg(REG_IER, 0x060B, 0);
         c.write_reg(REG_APCR, 0x20, 0);
         assert!(c.irq());
@@ -276,5 +333,68 @@ mod tests {
         c.write_reg(REG_BMAN, 0x04, 0);
         assert_eq!(c.peek_reg(REG_BMAN), 0x08);
         assert_eq!(c.read_reg(REG_ID, 0), CHIP_ID);
+    }
+
+    #[test]
+    fn byte_lanes_and_read_only_registers() {
+        let mut c = Ciap::default();
+        c.regs[(REG_ISR >> 1) as usize] = 0x0405;
+        assert_eq!(c.read_reg_byte(REG_ISR, true, 0), 0x04);
+        assert_eq!(c.peek_reg(REG_ISR), 0x0005);
+        c.regs[(REG_BMAN >> 1) as usize] = 0x0C0C;
+        c.write_reg_byte(REG_BMAN, false, 0x04, 0);
+        assert_eq!(c.peek_reg(REG_BMAN) & 0xFF00, 0x0C00);
+        c.write_reg(REG_ID, 0x1234, 0);
+        c.write_reg(REG_ASTAT, 0x1234, 0);
+        c.write_reg(0x30, 0x1234, 0);
+        assert_eq!((c.peek_reg(REG_ID), c.peek_reg(REG_ASTAT), c.peek_reg(0x30)), (CHIP_ID, 0, 0));
+    }
+
+    #[test]
+    fn rearm_commands_restart_delivery() {
+        let mut c = Ciap::default();
+        for v in [0x0100, 0x0200, 0x7000, 0x0044, 0x0080] {
+            c.write_reg(REG_CCR, v, 0);
+        }
+        assert!(c.running && c.q_mode);
+        for v in [0x0100, 0x0200, 0x3000, 0x0010, 0x0080] {
+            c.write_reg(REG_CCR, v, 0);
+        }
+        assert!(c.running && c.q_mode);
+    }
+
+    #[test]
+    fn drive_starts_late_and_stops_with_delivery_off() {
+        let mut c = Ciap::default();
+        let period = crate::mcd212::VideoMode::Pal.cycles_per_sector();
+        c.drive(super::super::ikat::DriveEvent::Seek(13));
+        c.tick(period, period, &mut None);
+        assert!(c.drive_active && !c.drive_stopped);
+        c.tick(period, period, &mut None);
+        assert!(!c.drive_active && c.drive_stopped);
+    }
+
+    #[test]
+    fn dma_control_address_advances() {
+        let mut c = Ciap::default();
+        c.write_reg(REG_DMACTL, 0x6906, 0);
+        assert_eq!(c.dma_request.take(), Some(0x6906));
+        c.dma_done(0x6906, 1024);
+        assert_eq!((c.peek_reg(REG_DMACTL), c.dmas), (0x6D06, 1));
+    }
+
+    #[test]
+    fn buffer_manager_toggles_on_write() {
+        let mut c = Ciap::default();
+        assert_eq!(c.peek_reg(REG_BMAN), BMAN_RESET);
+        assert_eq!(c.data_buffer(), Some(0x1200));
+        c.write_reg(REG_BMAN, 0x0C, 0);
+        assert_eq!((c.peek_reg(REG_BMAN), c.data_buffer()), (0x0058, Some(0x1BC2)));
+        c.write_reg(REG_BMAN, 0x0C, 0);
+        assert_eq!(c.data_buffer(), Some(0x1200));
+        c.write_reg(REG_BMAN, 0x01, 0);
+        assert_eq!(c.peek_reg(REG_BMAN) & 0x03, 0x01);
+        c.reset();
+        assert_eq!(c.peek_reg(REG_BMAN), BMAN_RESET);
     }
 }

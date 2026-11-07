@@ -167,7 +167,10 @@ fn main() {
                     p.warp(slave.device_mouse_x, slave.device_mouse_y);
                 }
                 if let Some((x, y, b)) = p.step(frame) {
-                    slave.update_mouse(x, y, b);
+                    match m.bus.mono4.as_deref_mut() {
+                        Some(m4) => m4.ikat.update_pointer(x, y, b),
+                        None => slave.update_mouse(x, y, b),
+                    }
                 }
             }
 
