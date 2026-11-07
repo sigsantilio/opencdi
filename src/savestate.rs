@@ -883,7 +883,10 @@ pub fn load_state_from_file<P: AsRef<Path>>(
         dm.tick_bytes = r.read_u64()?;
         let n = r.read_u32()?;
         dm.due.clear();
-        for _ in 0..n.min(64) {
+        if n as usize > crate::dvc::DUE_RING {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "DVC audio schedule too long in save state"));
+        }
+        for _ in 0..n {
             dm.due.push_back(r.read_u64()?);
         }
         dm.last_due = r.read_opt_u64()?;

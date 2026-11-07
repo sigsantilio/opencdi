@@ -64,9 +64,6 @@ pub const FMA_IRQ_DEC: u16   = 1 << 2;  // 0x0004: Decoded data ready
 pub const FMA_IRQ_PLAY: u16  = 1 << 4;  // 0x0010: Playback active
 pub const FMA_IRQ_POLL: u16  = 1 << 8;  // 0x0100: Timer tick
 
-// The first frame decoded after a parser reset plays as silence (one switch).
-const FMA_SILENT_FIRST_FRAME: bool = true;
-
 // =========================================================================
 // MPEG Audio Layer-II Decoder (oxideav-mp2)
 // =========================================================================
@@ -251,7 +248,7 @@ pub struct AudioEvent {
     pub clock: Option<u64>,
 }
 
-const DUE_RING: usize = 32;
+pub const DUE_RING: usize = 32;
 // Decode times are 31 bits (a 33-bit timestamp in 22.5 kHz units) and wrap.
 const CLOCK_MASK: u64 = 0x7FFF_FFFF;
 
@@ -281,12 +278,14 @@ impl MpegSystemDemux {
         self.events.clear();
     }
 
-    fn save_due(&mut self, t: u64) {
+    fn save_due(&mut self, t: u64) -> bool {
         if self.due.len() < DUE_RING {
             self.due.push_back(t);
             self.last_due = Some(t);
+            true
         } else {
             log::warn!("DVC audio decode schedule full");
+            false
         }
     }
 
@@ -295,7 +294,9 @@ impl MpegSystemDemux {
         let (Some(last), true) = (self.last_due, self.interval != 0) else { return };
         let mut next = (last + self.interval) & CLOCK_MASK;
         while clock_before(next, until) {
-            self.save_due(next);
+            if !self.save_due(next) {
+                break;
+            }
             next = (next + self.interval) & CLOCK_MASK;
         }
     }
@@ -1064,8 +1065,7 @@ impl Dvc {
         self.write_word(addr, data);
     }
 
-    // Player-style gains (left-left, left-right, right-right, right-left) of the cartridge's own attenuator; None while it passes stereo straight through.
-    // Bytes in register order: left-left, left-right, right-left, right-right (inferred from the straight pair 0, mute, mute, 0 both drivers write at Play).
+    // Gains (LL, LR, RR, RL) of the cartridge's attenuator, bytes in register order LL, LR, RL, RR (inferred from the straight 0, mute, mute, 0 written at Play); None while straight through.
     pub fn audio_gains(&self) -> Option<[f32; 4]> {
         let r = &self.fma_regs[FMA_ATT..FMA_ATT + 4];
         // 1 dB steps, bit 7 mute.
@@ -1362,9 +1362,6 @@ impl Dvc {
 
     fn raise_fma_underflow(&mut self) {
         trace!(">>> [DVC FMA] AUDIO BUFFER UNDERFLOW (raising FMA_IRQ_UNF)");
-        if !self.fma_started && std::env::var_os("CDI_FMA_TRACE").is_some() {
-            log::warn!("DVC FMA underflow before the first decoded frame");
-        }
         self.fma_pending |= FMA_IRQ_UNF;
     }
 
@@ -1443,10 +1440,9 @@ impl Dvc {
             if !self.fma_started {
                 self.fma_started = true;
                 self.fma_pending |= FMA_IRQ_PLAY;
-                if FMA_SILENT_FIRST_FRAME {
-                    for s in self.mp2.pcm.iter_mut() {
-                        *s = (0.0, 0.0);
-                    }
+                // The first frame decoded after a parser reset plays as silence.
+                for s in self.mp2.pcm.iter_mut() {
+                    *s = (0.0, 0.0);
                 }
             }
             let header = u32::from_be_bytes(f.header) & !0x0300;

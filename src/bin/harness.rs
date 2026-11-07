@@ -189,7 +189,10 @@ fn main() {
         dump_ppm(m.framebuffer(), p);
     }
     if let Some((p, bytes)) = &audio_out {
-        std::fs::write(p, bytes).expect("write audio");
+        if let Err(e) = std::fs::write(p, bytes) {
+            eprintln!("cannot write audio {}: {}", p, e);
+            std::process::exit(1);
+        }
     }
     println!(
         "\nHARNESS frames={} pc={:08x} nonblack={} video_last={:016x} video_all={:016x} audio={:016x} audio_samples={} audio_nonzero={}",
