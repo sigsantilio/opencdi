@@ -7,9 +7,8 @@ pub mod mpeg;
 
 use self::mpeg::Video;
 
-/// DCLK runs at 45 kHz (15.5 MHz / ~344.44)
+/// DCLK runs at 45 kHz, counted against the CPU clock
 pub const DCLK_FREQ: u64 = 45_000;
-pub const MASTER_CLOCK: u64 = 15_500_000;
 
 // FMV Register Byte Offsets (within 0xE04000..0xE040FF)
 pub const FMV_IER: usize = 0x60;
@@ -28,6 +27,10 @@ pub const FMV_SCRPOS_Y: usize = 0x74;
 // Largest MPEG-1 picture the DVC framebuffer holds (constrained parameters).
 pub const FB_MAX_W: usize = 768;
 pub const FB_MAX_H: usize = 576;
+
+// VMPEG DSP attenuation targets (four bytes, 1 dB steps, bit 7 mute), kept in the register file; IMPEG keeps its two words at 0x20C/0x20E.
+const FMA_ATT: usize = 0x90;
+const IMPEG_ATT: usize = 0x100 + 0x0C;
 
 // FMA Register Byte Offsets (within 0xE03000..0xE030FF)
 pub const FMA_CMD: usize = 0x00;
@@ -61,11 +64,17 @@ pub const FMA_IRQ_UNF: u16   = 1 << 3;  // 0x0008: Underflow
 pub const FMA_IRQ_DEC: u16   = 1 << 2;  // 0x0004: Decoded data ready
 pub const FMA_IRQ_PLAY: u16  = 1 << 4;  // 0x0010: Playback active
 pub const FMA_IRQ_POLL: u16  = 1 << 8;  // 0x0100: Timer tick
-pub const FMA_MODE_DRAIN: u16 = 0x1F;  // madriv mode: 7 = play, 0x1F = drain at end of data or before a loop restart
 
 // =========================================================================
 // MPEG Audio Layer-II Decoder (oxideav-mp2)
 // =========================================================================
+
+/// One decoded frame: samples per channel, sample rate and the four header bytes.
+pub struct DecodedFrame {
+    pub samples: usize,
+    pub rate: u32,
+    pub header: [u8; 4],
+}
 
 pub struct Mp2Decoder {
     state: oxideav_mp2::frame::FrameDecodeState,
@@ -111,9 +120,22 @@ impl Mp2Decoder {
     pub fn decode_available(&mut self, input: &mut VecDeque<u8>) -> u64 {
         let mut decoded = 0;
         let mut scanned = 0u64;
+        while self.decode_frame(input, &mut scanned).is_some() {
+            decoded += 1;
+        }
+        decoded
+    }
+
+    /// Decodes the next whole frame into `pcm`; `None` when the input holds no whole frame.
+    pub fn decode_one(&mut self, input: &mut VecDeque<u8>) -> Option<DecodedFrame> {
+        let mut scanned = 0u64;
+        self.decode_frame(input, &mut scanned)
+    }
+
+    fn decode_frame(&mut self, input: &mut VecDeque<u8>, scanned: &mut u64) -> Option<DecodedFrame> {
         loop {
             if input.len() < 4 {
-                break;
+                return None;
             }
             let head = [input[0], input[1], input[2], input[3]];
             let header = match oxideav_mp2::header::FrameHeader::parse(&head) {
@@ -126,14 +148,14 @@ impl Mp2Decoder {
                         self.synchronized = false;
                     } else {
                         self.resync_bytes += 1;
-                        scanned += 1;
+                        *scanned += 1;
                     }
                     continue;
                 }
             };
             let frame_size = header.frame_size_bytes();
             if input.len() < frame_size {
-                break;
+                return None;
             }
             let contiguous = input.make_contiguous();
             match oxideav_mp2::frame::decode_frame_with(&contiguous[..frame_size], &mut self.state) {
@@ -141,9 +163,9 @@ impl Mp2Decoder {
                     if frame.header.sample_rate > 0 {
                         self.last_sample_rate = frame.header.sample_rate;
                     }
+                    let samples = frame.pcm.first().map_or(0, Vec::len);
                     if self.conceal_discontinuity_frame {
-                        if scanned != 0 {
-                            let samples = frame.pcm.first().map_or(0, Vec::len);
+                        if *scanned != 0 {
                             self.pcm.extend(std::iter::repeat((0.0f32, 0.0f32)).take(samples));
                             self.concealed_frames += 1;
                         }
@@ -153,8 +175,8 @@ impl Mp2Decoder {
                     self.last_frame.clear();
                     self.last_frame.extend_from_slice(&contiguous[..frame_size]);
                     input.drain(..frame_size);
-                    decoded += 1;
                     self.synchronized = true;
+                    return Some(DecodedFrame { samples, rate: self.last_sample_rate, header: head });
                 }
                 Err(_) => {
                     input.pop_front();
@@ -165,16 +187,21 @@ impl Mp2Decoder {
                 }
             }
         }
-        decoded
     }
 
-    // A trailing partial frame cannot be decoded, so it does not keep the decoder fed.
-    pub fn has_frame(input: &VecDeque<u8>) -> bool {
+    /// Samples per frame and sample rate of the frame at the head of the input, if its header parses.
+    pub fn peek_interval(input: &VecDeque<u8>) -> Option<(u32, u32)> {
         if input.len() < 4 {
-            return false;
+            return None;
         }
         let head = [input[0], input[1], input[2], input[3]];
-        oxideav_mp2::header::FrameHeader::parse(&head).map_or(false, |h| input.len() >= h.frame_size_bytes())
+        let h = oxideav_mp2::header::FrameHeader::parse(&head).ok()?;
+        Some((if h.lsf { 576 } else { 1152 }, h.sample_rate))
+    }
+
+    /// Decode-time spacing of a frame in 22.5 kHz units, rounded up.
+    pub fn interval_units(samples: u32, rate: u32) -> u64 {
+        if rate == 0 { 0 } else { (u64::from(samples) * 22_500 + u64::from(rate) - 1) / u64::from(rate) }
     }
 
     fn append_native(output: &mut VecDeque<(f32, f32)>, channels: &[Vec<f64>]) {
@@ -207,6 +234,34 @@ pub struct MpegSystemDemux {
     pub selected_audio_stream: Option<u8>,
     pub selected_video_stream: Option<u8>,
     pub program_ends: u64,
+    /// Decode clock: pack SCR in 22.5 kHz units and mux rate in 50 byte/s units, set at each pack header.
+    pub scr_base: Option<u64>,
+    pub mux_rate: u64,
+    /// Bytes fed since the last pack header (4 at the header itself); the tick path counts its own bytes.
+    pub pack_bytes: u64,
+    pub tick_bytes: u64,
+    /// Scheduled decode times (22.5 kHz units), one per audio frame, capped like a hardware ring of 32.
+    pub due: VecDeque<u64>,
+    pub last_due: Option<u64>,
+    /// Decode-time spacing of one frame in 22.5 kHz units; 0 until the first frame after a reset is decoded.
+    pub interval: u64,
+    /// Audio packets and pack headers parsed since the last drain, in stream order.
+    pub events: Vec<AudioEvent>,
+}
+
+/// A point at which the decode schedule is evaluated: the clock then, and the PTS (DTS if present) of an audio packet.
+pub struct AudioEvent {
+    pub packet: bool,
+    pub pts: Option<u64>,
+    pub clock: Option<u64>,
+}
+
+pub const DUE_RING: usize = 32;
+// Decode times are 31 bits (a 33-bit timestamp in 22.5 kHz units) and wrap.
+const CLOCK_MASK: u64 = 0x7FFF_FFFF;
+
+fn clock_before(a: u64, b: u64) -> bool {
+    a.wrapping_sub(b) & CLOCK_MASK >= 0x4000_0000
 }
 
 impl MpegSystemDemux {
@@ -221,6 +276,68 @@ impl MpegSystemDemux {
         self.first_audio_pts = None;
         self.last_audio_pts = None;
         self.program_ends = 0;
+        self.scr_base = None;
+        self.mux_rate = 0;
+        self.pack_bytes = 0;
+        self.tick_bytes = 0;
+        self.due.clear();
+        self.last_due = None;
+        self.interval = 0;
+        self.events.clear();
+    }
+
+    fn save_due(&mut self, t: u64) -> bool {
+        if self.due.len() < DUE_RING {
+            self.due.push_back(t);
+            self.last_due = Some(t);
+            true
+        } else {
+            log::warn!("DVC audio decode schedule full");
+            false
+        }
+    }
+
+    /// Schedules one decode per frame interval after the last scheduled time, up to but not including `until`.
+    pub fn backfill(&mut self, until: u64) {
+        let (Some(last), true) = (self.last_due, self.interval != 0) else { return };
+        let mut next = (last + self.interval) & CLOCK_MASK;
+        while clock_before(next, until) {
+            if !self.save_due(next) {
+                break;
+            }
+            next = (next + self.interval) & CLOCK_MASK;
+        }
+    }
+
+    /// Removes and counts the scheduled times before `clock`.
+    pub fn pop_due(&mut self, clock: u64) -> usize {
+        let mut n = 0;
+        while self.due.front().is_some_and(|&t| clock_before(t, clock)) {
+            self.due.pop_front();
+            n += 1;
+        }
+        n
+    }
+
+    fn clock_at(&self, bytes: u64) -> Option<u64> {
+        let base = self.scr_base?;
+        (self.mux_rate != 0).then(|| (base + bytes * 450 / self.mux_rate) & CLOCK_MASK)
+    }
+
+    /// Decode clock in 22.5 kHz units: the last pack's SCR plus the bytes fed since, at the mux rate.
+    pub fn clock(&self) -> Option<u64> {
+        self.clock_at(self.pack_bytes)
+    }
+
+    /// Clock extrapolated by the 1/75 s tick (2,352 bytes each) once more than 4,703 bytes passed without a pack header.
+    pub fn tick_clock(&mut self) -> Option<u64> {
+        self.tick_bytes += 2352;
+        if self.tick_bytes > 4703 { self.clock_at(self.tick_bytes) } else { None }
+    }
+
+    fn eat(&mut self, n: usize) {
+        self.pending.drain(..n);
+        self.pack_bytes += n as u64;
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
@@ -242,7 +359,7 @@ impl MpegSystemDemux {
                 return;
             };
             if prefix != 0 {
-                self.pending.drain(..prefix);
+                self.eat(prefix);
             }
             if self.pending.len() < 4 {
                 return;
@@ -255,8 +372,14 @@ impl MpegSystemDemux {
                         return;
                     }
                     if self.pending[4] & 0xF0 == 0x20 {
-                        self.last_scr = Some(Self::decode_mpeg1_scr(&self.pending[4..9]));
+                        let scr = Self::decode_mpeg1_scr(&self.pending[4..9]);
+                        self.last_scr = Some(scr);
+                        self.scr_base = Some(scr >> 2);
+                        self.mux_rate = Self::decode_mpeg1_mux(&self.pending[9..12]);
                         self.pending.drain(..12);
+                        self.pack_bytes = 4;
+                        self.tick_bytes = 0;
+                        self.events.push(AudioEvent { packet: false, pts: None, clock: self.clock() });
                     } else {
                         if self.pending.len() < 14 {
                             return;
@@ -265,11 +388,11 @@ impl MpegSystemDemux {
                         if self.pending.len() < size {
                             return;
                         }
-                        self.pending.drain(..size);
+                        self.eat(size);
                     }
                 }
                 0xB9 => { // ISO Program End
-                    self.pending.drain(..4);
+                    self.eat(4);
                     self.program_ends += 1;
                 }
                 _ => {
@@ -281,14 +404,15 @@ impl MpegSystemDemux {
                         let Some(next) = Self::find_prefix(&self.pending[4..]).map(|v| v + 4) else {
                             return;
                         };
-                        self.pending.drain(..next);
+                        self.eat(next);
                         continue;
                     }
                     let packet_len = 6 + payload_len;
                     if self.pending.len() < packet_len {
                         return;
                     }
-                    let packet: Vec<u8> = self.pending.drain(..packet_len).collect();
+                    let packet: Vec<u8> = self.pending[..packet_len].to_vec();
+                    self.eat(packet_len);
                     self.consume_packet(stream_id, &packet);
                 }
             }
@@ -321,6 +445,7 @@ impl MpegSystemDemux {
                 self.first_audio_pts.get_or_insert(pts);
                 self.last_audio_pts = Some(pts);
             }
+            self.events.push(AudioEvent { packet: true, pts: dts.or(pts).map(|t| t >> 2), clock: self.clock() });
         }
     }
 
@@ -330,6 +455,10 @@ impl MpegSystemDemux {
             | (u64::from(bytes[2] & 0xFE) << 14)
             | (u64::from(bytes[3]) << 7)
             | u64::from(bytes[4] >> 1)
+    }
+
+    fn decode_mpeg1_mux(bytes: &[u8]) -> u64 {
+        (u64::from(bytes[0] & 0x7F) << 15) | (u64::from(bytes[1]) << 7) | u64::from(bytes[2] >> 1)
     }
 
     fn pes_payload(packet: &[u8]) -> Option<(&[u8], Option<u64>, Option<u64>)> {
@@ -403,6 +532,12 @@ pub struct Dvc {
     // Register files (256 bytes each)
     pub fma_regs: Box<[u8; 256]>,
     pub fmv_regs: Box<[u8; 256]>,
+    pub impeg: bool, // IMPEG cartridge on the Mono-IV board: extra register windows below
+    pub impeg_regs: Box<[u8; 0x300]>, // 0xE04100-0xE043FF on IMPEG (data port and audio block); fixed size, so a state cannot load it short
+    pub impeg_fw: Vec<u8>, // 0xE04800-0xE07FFF on IMPEG: firmware windows, plain RAM, never run (not saved: nothing reads it back)
+    pub impeg_pio: bool, // IMPEG audio fed by programmed I/O
+    pub impeg_hi_valid: bool, // the high byte of the next data-port word has been written
+    pub impeg_ivec_zero_logged: bool,
 
     // Mirrored fields for easy access
     pub fma_cmd: u16,
@@ -438,6 +573,8 @@ pub struct Dvc {
     pub fps: f64,
     pub frame_accum: f64,
     pub vsync_hz: f64,
+    // CPU clock the cycle counts are measured in (set by the bus from the video standard).
+    pub cpu_hz: u64,
 
     // Stream & Demux
     pub dvc_stream_fifo: Vec<u8>,
@@ -455,6 +592,10 @@ pub struct Dvc {
     pub mp2: Mp2Decoder,
     pub audio_sample_rate: u32,
     pub audio_out: VecDeque<(f32, f32)>,
+    // Set by an FMA stop or stream reset; the bus clears the unplayed output audio in the same line.
+    pub audio_stopped: bool,
+    // VMPEG DSP attenuation upload in progress: bytes taken so far (None when idle).
+    dsp_att: Option<(usize, [u8; 4])>,
 
     pub video_decoder: Option<Video>,
     pub video_width: usize,
@@ -463,11 +604,14 @@ pub struct Dvc {
     pub frames_presented_count: usize,
     pub vsync_counter: usize,
     pub underflow_count: u32,
-    pub fma_underflow_count: u32,
-    /// Audio samples decoded since the last FMA play or stop.
-    pub fma_decoded_since_play: u64,
-    // Cycle (total_cycles) at which the decoded MPEG audio would have finished playing; 0 when none is pending.
-    pub fma_playout_end: u64,
+    // A frame has been decoded since the last parser reset (the next first frame is silent until then).
+    pub fma_started: bool,
+    // CPU cycles times 75 accumulated toward the next 1/75 s FMA tick.
+    pub fma_tick_accum: u64,
+    // Event bits (0x04 header change, 0x08 underflow, 0x10 first frame) the next tick delivers to the ISR.
+    pub fma_pending: u16,
+    // Header (padding and private bits cleared) of the last decoded frame; 0 after a reset.
+    pub fma_last_header: u32,
     pub has_valid_frame: bool,
 }
 
@@ -484,6 +628,12 @@ impl Dvc {
 
             fma_regs: vec![0u8; 256].into_boxed_slice().try_into().unwrap(),
             fmv_regs: vec![0u8; 256].into_boxed_slice().try_into().unwrap(),
+            impeg: false,
+            impeg_regs: Box::new([0; 0x300]),
+            impeg_fw: vec![0; 0x3800],
+            impeg_pio: false,
+            impeg_hi_valid: false,
+            impeg_ivec_zero_logged: false,
 
             fma_cmd: 0,
             fma_isr: 0,
@@ -515,6 +665,7 @@ impl Dvc {
             fps: 25.0,
             frame_accum: 0.0,
             vsync_hz: 50.0,
+            cpu_hz: 15_000_000,
 
             dvc_stream_fifo: Vec::with_capacity(128 * 1024),
             fma_stream_fifo: Vec::with_capacity(64 * 1024),
@@ -530,6 +681,8 @@ impl Dvc {
             mp2: Mp2Decoder::default(),
             audio_sample_rate: 44_100,
             audio_out: VecDeque::with_capacity(16 * 1024),
+            audio_stopped: false,
+            dsp_att: None,
 
             video_decoder: None,
             video_width: 352,
@@ -538,12 +691,14 @@ impl Dvc {
             frames_presented_count: 0,
             vsync_counter: 0,
             underflow_count: 0,
-            fma_underflow_count: 0,
-            fma_decoded_since_play: 0,
-            fma_playout_end: 0,
+            fma_started: false,
+            fma_tick_accum: 0,
+            fma_pending: 0,
+            fma_last_header: 0,
             has_valid_frame: false,
         };
         d.reset_regs();
+        d.mute_impeg_attenuation();
         d
     }
 
@@ -561,6 +716,10 @@ impl Dvc {
 
         self.reset_stream();
         self.reset_regs();
+        self.impeg_regs.fill(0);
+        self.mute_impeg_attenuation();
+        self.impeg_fw.fill(0);
+        (self.impeg_pio, self.impeg_hi_valid) = (false, false);
     }
 
     pub fn reset_stream(&mut self) {
@@ -574,7 +733,6 @@ impl Dvc {
         self.fmv_decoder_active = false;
         self.dma_requested = false;
         self.total_cycles = 0;
-        self.fma_playout_end = 0;
         self.dclk = 0;
         self.dclk_accum = 0;
         self.timer_accum = 0;
@@ -587,13 +745,13 @@ impl Dvc {
         self.fma_demux.clear();
         self.mp2.reset();
         self.audio_out.clear();
+        self.audio_stopped = true;
         self.video_decoder = None;
         self.frames_decoded_count = 0;
         self.frames_presented_count = 0;
         self.vsync_counter = 0;
         self.underflow_count = 0;
-        self.fma_underflow_count = 0;
-        self.fma_decoded_since_play = 0;
+        self.reset_fma_schedule();
         self.frame_accum = 0.0;
         self.display_timecode = 0;
         self.decoder_timecode = 0;
@@ -601,6 +759,13 @@ impl Dvc {
         self.decoder_frame_counter = 0;
         // NOTE: Real DVC hardware keeps the last decoded picture in DRAM.
         // Screen blanking and plane transitions are managed by MCD-212.
+    }
+
+    fn reset_fma_schedule(&mut self) {
+        self.fma_started = false;
+        self.fma_tick_accum = 0;
+        self.fma_pending = 0;
+        self.fma_last_header = 0;
     }
 
     pub fn reset_regs(&mut self) {
@@ -613,6 +778,8 @@ impl Dvc {
         self.set_fma_word(0x06, 0x0900);
         self.set_fma_word(0x0E, 0x0042);
         self.set_fma_word(0x24, 0x0004); // HF2 DSP flag ready
+        self.fma_regs[FMA_ATT..FMA_ATT + 4].fill(0x80); // the cartridge powers up muted
+        self.dsp_att = None;
 
         // FMV defaults
         self.set_fmv_word(FMV_TIMER, 55);
@@ -724,39 +891,43 @@ impl Dvc {
         let fma_isr = self.get_fma_word(FMA_ISR);
         let fma_ier = self.get_fma_word(FMA_IER);
         let fma_ivec = self.get_fma_word(FMA_IVEC);
-        if (fma_isr & fma_ier) != 0 {
+        if (fma_isr & fma_ier) != 0 && !self.impeg {
             let vec = (fma_ivec & 0x00FF) as u8;
             if vec != 0 { vec } else { 0x1C }
         } else {
             let vec = ((self.get_fmv_word(FMV_IVEC) >> 3) & 0xFF) as u8;
+            if vec == 0 && self.impeg && !std::mem::replace(&mut self.impeg_ivec_zero_logged, true) {
+                eprintln!("IMPEG interrupt acknowledged with vector 0 (IVEC not written); using the spurious vector");
+            }
             if vec != 0 { vec } else { 0x1C }
         }
+    }
+
+    /// IMPEG addresses that some register, RAM or ROM answers; the rest of the cartridge window is a hole.
+    pub fn impeg_mapped(&self, addr: u32) -> bool {
+        self.impeg && matches!(addr & 0x00FF_FFFF, 0xD00000..=0xDFFFFF | 0xE01000..=0xE01FFF | 0xE04000..=0xE043FF | 0xE04800..=0xE07FFF | 0xE40000..=0xEFFFFF)
     }
 
     pub fn tick(&mut self, cycles: u32) {
         self.total_cycles += cycles as u64;
 
-        // In drain mode (0x1F, end of data or loop) the driver waits for underflow, which comes when the decoded audio has been played.
-        if self.fma_playout_end != 0 && self.total_cycles >= self.fma_playout_end {
-            self.fma_playout_end = 0;
-            let draining = self.get_fma_word(FMA_MODE) == FMA_MODE_DRAIN;
-            if draining && (self.audio_enabled || self.audio_armed) && self.fma_underflow_count == 0 && self.fma_drained() {
-                self.raise_fma_underflow();
-                self.fma_underflow_count = 10;
-            }
+        self.fma_tick_accum += (cycles as u64) * 75;
+        while self.fma_tick_accum >= self.cpu_hz {
+            self.fma_tick_accum -= self.cpu_hz;
+            self.fma_tick();
         }
 
         // DCLK runs at 45 kHz
         self.dclk_accum += (cycles as u64) * DCLK_FREQ;
-        while self.dclk_accum >= MASTER_CLOCK {
-            self.dclk_accum -= MASTER_CLOCK;
+        while self.dclk_accum >= self.cpu_hz {
+            self.dclk_accum -= self.cpu_hz;
             self.dclk = self.dclk.wrapping_add(1);
         }
 
         // FMV Timer runs at 5,625 Hz (period set by TCNT)
         self.timer_accum += (cycles as u64) * 5_625;
-        while self.timer_accum >= MASTER_CLOCK {
-            self.timer_accum -= MASTER_CLOCK;
+        while self.timer_accum >= self.cpu_hz {
+            self.timer_accum -= self.cpu_hz;
             let compare = self.get_fmv_word(FMV_TIMER);
             if compare > 0 && self.timer_counter >= compare {
                 self.timer_counter = 0;
@@ -827,6 +998,100 @@ impl Dvc {
         self.set_fmv_word(FMV_ISR, 0);
     }
 
+    // IMPEG audio block offset (from 0xE04200) to the VMPEG audio register it stands for; attenuation has none.
+    fn impeg_audio_reg(off: usize) -> Option<usize> {
+        match off & !1 {
+            0x00 | 0x02 | 0x04 | 0x06 | 0x08 | 0x0A | 0x10 | 0x12 | 0x14 | 0x16 | 0x18 | 0x1A | 0x1C => Some(off & !1),
+            _ => None,
+        }
+    }
+
+    // IMPEG audio interrupt bits from the VMPEG layout: timer 0x100 to 0x800, end 0x08 to 0x100, error 0x20 to 0x400, trigger 0x01 to 0x8000.
+    fn impeg_bits_from(v: u16) -> u16 {
+        let mut o = v & 0x0016;
+        for (from, to) in [(0x0100, 0x0800), (0x0008, 0x0100), (0x0020, 0x0400), (0x0001, 0x8000)] {
+            if v & from != 0 {
+                o |= to;
+            }
+        }
+        o
+    }
+
+    fn impeg_bits_to(v: u16) -> u16 {
+        let mut o = v & 0x0016;
+        for (to, from) in [(0x0100, 0x0800), (0x0008, 0x0100), (0x0020, 0x0400), (0x0001, 0x8000)] {
+            if v & from != 0 {
+                o |= to;
+            }
+        }
+        o
+    }
+
+    fn impeg_audio_read(&mut self, off: usize) -> u8 {
+        let Some(r) = Self::impeg_audio_reg(off) else { return self.impeg_regs[0x100 + off] };
+        self.refresh_fma_dynamic(r);
+        let mut w = self.get_fma_word(r);
+        if r == FMA_ISR {
+            w = Self::impeg_bits_from(w);
+        }
+        // IER reads back exactly as written; the translation keeps only the bits the model knows.
+        if r == FMA_IER {
+            w = u16::from_be_bytes([self.impeg_regs[0x100 + FMA_IER], self.impeg_regs[0x101 + FMA_IER]]);
+        }
+        // The status is acknowledged by reading it, as on VMPEG.
+        if r == FMA_ISR && off & 1 == 1 {
+            self.acknowledge_fma_isr();
+        }
+        if off & 1 == 0 { (w >> 8) as u8 } else { w as u8 }
+    }
+
+    fn impeg_audio_write(&mut self, off: usize, val: u8) {
+        self.impeg_regs[0x100 + off] = val;
+        let Some(r) = Self::impeg_audio_reg(off) else { return };
+        if off & 1 == 0 {
+            return;
+        }
+        let w = u16::from_be_bytes([self.impeg_regs[0x100 + (off & !1)], val]);
+        match r {
+            FMA_IER => self.set_fma_word(r, Self::impeg_bits_to(w)),
+            FMA_ISR => self.acknowledge_fma_isr(),
+            FMA_CMD => {
+                // 0x100 selects programmed I/O through 0x11E; leaving it feeds what came in.
+                let pio = w & 0x0100 != 0;
+                if self.impeg_pio && !pio {
+                    self.process_stream();
+                }
+                if pio != self.impeg_pio {
+                    self.impeg_hi_valid = false;
+                }
+                self.impeg_pio = pio;
+                self.set_fma_word(r, w & !0x0100);
+                self.handle_fma_write(r);
+            }
+            _ => {
+                self.set_fma_word(r, w);
+                self.handle_fma_write(r);
+            }
+        }
+        self.count_reg_write();
+    }
+
+    // Programmed I/O audio data: each word goes to the audio stream.
+    fn impeg_pio_write(&mut self, off: usize, val: u8) {
+        self.impeg_regs[0x1E + off] = val;
+        if !self.impeg_pio {
+            return;
+        }
+        // A word is complete only after its high byte came first.
+        if off == 0 {
+            self.impeg_hi_valid = true;
+        } else if std::mem::take(&mut self.impeg_hi_valid) {
+            let hi = self.impeg_regs[0x1E];
+            self.push_fma_stream_byte(hi);
+            self.push_fma_stream_byte(val);
+        }
+    }
+
     pub fn acknowledge_fma_isr(&mut self) {
         self.set_fma_word(FMA_ISR, 0);
     }
@@ -856,6 +1121,9 @@ impl Dvc {
                 }
                 val
             }
+            0xE04200..=0xE0421F if self.impeg => self.impeg_audio_read((a - 0xE04200) as usize),
+            0xE04100..=0xE043FF if self.impeg => self.impeg_regs[(a - 0xE04100) as usize],
+            0xE04800..=0xE07FFF if self.impeg => self.impeg_fw[(a - 0xE04800) as usize],
             0xE04000..=0xE040FF => {
                 let offset = (a - 0xE04000) as usize;
                 self.refresh_fmv_dynamic();
@@ -893,6 +1161,10 @@ impl Dvc {
                     self.count_reg_write();
                 }
             }
+            0xE04200..=0xE0421F if self.impeg => self.impeg_audio_write((a - 0xE04200) as usize, val),
+            0xE0411E..=0xE0411F if self.impeg => self.impeg_pio_write((a - 0xE0411E) as usize, val),
+            0xE04100..=0xE043FF if self.impeg => self.impeg_regs[(a - 0xE04100) as usize] = val,
+            0xE04800..=0xE07FFF if self.impeg => self.impeg_fw[(a - 0xE04800) as usize] = val,
             0xE04000..=0xE040FF => {
                 let offset = (a - 0xE04000) as usize;
                 self.fmv_regs[offset] = val;
@@ -931,6 +1203,45 @@ impl Dvc {
         self.write_word(addr, data);
     }
 
+    fn mute_impeg_attenuation(&mut self) {
+        self.impeg_regs[IMPEG_ATT..IMPEG_ATT + 4].fill(0x3F);
+    }
+
+    // Gains (LL, LR, RR, RL) of the cartridge's attenuator, bytes in register order LL, LR, RL, RR (inferred from the straight 0, mute, mute, 0 written at Play); None while straight through.
+    pub fn audio_gains(&self) -> Option<[f32; 4]> {
+        let g = if self.impeg {
+            let r = &self.impeg_regs[IMPEG_ATT..IMPEG_ATT + 4];
+            // IMPEG: 6-bit fields in 2 dB steps, 0x3F mute.
+            r.iter().map(|&b| if b & 0x3F == 0x3F { 0.0 } else { 10f32.powf(-((b & 0x3F) as f32) / 10.0) }).collect::<Vec<f32>>()
+        } else {
+            let r = &self.fma_regs[FMA_ATT..FMA_ATT + 4];
+            // VMPEG: 1 dB steps, bit 7 mute.
+            r.iter().map(|&b| if b & 0x80 != 0 { 0.0 } else { 10f32.powf(-(b as f32) / 20.0) }).collect::<Vec<f32>>()
+        };
+        if g[0] == 1.0 && g[1] == 0.0 && g[2] == 0.0 && g[3] == 1.0 {
+            return None;
+        }
+        Some([g[0], g[1], g[3], g[2]])
+    }
+
+    // DSP host write: index 1 with a target in 0x90..0x93 starts an attenuation upload, then four index 7 bytes follow.
+    fn dsp_write(&mut self, index: u16, data: u16) {
+        match (index, self.dsp_att) {
+            (1, _) if (0x90..=0x93).contains(&(data & 0xFF)) => self.dsp_att = Some((0, [0; 4])),
+            (7, Some((n, mut b))) => {
+                b[n] = data as u8;
+                if n == 3 {
+                    self.fma_regs[FMA_ATT..FMA_ATT + 4].copy_from_slice(&b);
+                    self.dsp_att = None;
+                } else {
+                    self.dsp_att = Some((n + 1, b));
+                }
+            }
+            (2, _) => {}
+            _ => self.dsp_att = None,
+        }
+    }
+
     pub fn handle_fma_write(&mut self, offset: usize) {
         let value = self.get_fma_word(offset);
         match offset {
@@ -941,15 +1252,13 @@ impl Dvc {
                     self.fma_stream_fifo.clear();
                     self.fma_demux.clear();
                     self.mp2.reset();
-                    self.fma_decoded_since_play = 0;
-                    self.fma_playout_end = 0;
+                    self.audio_out.clear();
+                    self.audio_stopped = true;
+                    self.reset_fma_schedule();
                     self.set_fma_word(0x02, 0x0200);
                     self.set_fma_word(FMA_ISR, 0);
                 }
                 if value & 0x0002 != 0 { // PLAY ARM
-                    if !self.audio_enabled {
-                        self.fma_decoded_since_play = 0;
-                    }
                     self.audio_armed = true;
                     self.audio_enabled = true;
                     self.or_fma_word(0x02, 0x0010);
@@ -970,6 +1279,7 @@ impl Dvc {
             FMA_ISR => {
                 self.acknowledge_fma_isr();
             }
+            0x24 if !self.impeg => self.dsp_write(self.get_fma_word(0x22), value),
             _ => {}
         }
     }
@@ -1103,41 +1413,7 @@ impl Dvc {
             self.fma_demux.feed(&bytes);
         }
 
-        // Process audio stream from fma_demux
-        if !self.fma_demux.audio.is_empty() {
-            let decoded = self.mp2.decode_available(&mut self.fma_demux.audio);
-            if decoded != 0 {
-                self.fma_underflow_count = 0;
-                self.audio_sample_rate = self.mp2.last_sample_rate;
-                self.or_fma_word(0x02, 0x0004);
-                self.or_fma_word(FMA_ISR, 0x0004);
-                self.fma_decoded_since_play += self.mp2.pcm.len() as u64;
-                self.extend_playout(self.mp2.pcm.len());
-                while let Some(sample) = self.mp2.pcm.pop_front() {
-                    if self.audio_out.len() < 32 * 1024 {
-                        self.audio_out.push_back(sample);
-                    }
-                }
-            }
-        }
-
-        // Process audio stream if demux has any audio (fallback)
-        if !self.demux.audio.is_empty() {
-            let decoded = self.mp2.decode_available(&mut self.demux.audio);
-            if decoded != 0 {
-                self.fma_underflow_count = 0;
-                self.audio_sample_rate = self.mp2.last_sample_rate;
-                self.or_fma_word(0x02, 0x0004);
-                self.or_fma_word(FMA_ISR, 0x0004);
-                self.fma_decoded_since_play += self.mp2.pcm.len() as u64;
-                self.extend_playout(self.mp2.pcm.len());
-                while let Some(sample) = self.mp2.pcm.pop_front() {
-                    if self.audio_out.len() < 32 * 1024 {
-                        self.audio_out.push_back(sample);
-                    }
-                }
-            }
-        }
+        self.process_audio();
 
         // Process video stream (drain from both FMV demux and FMA demux)
         let mut video_data = std::mem::take(&mut self.demux.video);
@@ -1232,45 +1508,102 @@ impl Dvc {
         self.set_fmv_word(0x0A, hr_min);  // word 0x05
     }
 
-    // Input holds no whole MP2 frame and all decoded audio has been played.
-    fn fma_drained(&self) -> bool {
-        // Concealment: report underflow only once playback has run (half a second decoded), not during pre-roll.
-        let fma_started = self.fma_decoded_since_play >= u64::from(self.audio_sample_rate / 2);
-        fma_started
-            && self.fma_playout_end == 0
-            && self.fma_stream_fifo.is_empty()
-            && !Mp2Decoder::has_frame(&self.fma_demux.audio)
-            && !Mp2Decoder::has_frame(&self.demux.audio)
-    }
-
     fn raise_fma_underflow(&mut self) {
         trace!(">>> [DVC FMA] AUDIO BUFFER UNDERFLOW (raising FMA_IRQ_UNF)");
-        self.or_fma_word(FMA_ISR, FMA_IRQ_UNF);
-        self.or_fma_word(0x02, 0x0008);
+        self.fma_pending |= FMA_IRQ_UNF;
     }
 
-    // Decoded samples are queued for output at once, but play for their length at the stream's rate.
-    fn extend_playout(&mut self, samples: usize) {
-        let rate = u64::from(self.audio_sample_rate.max(1));
-        self.fma_playout_end = self.fma_playout_end.max(self.total_cycles) + samples as u64 * MASTER_CLOCK / rate;
+    // Decode events reach the ISR and status words on the next 1/75 s tick, then the starved clock runs.
+    fn fma_tick(&mut self) {
+        let bits = std::mem::take(&mut self.fma_pending);
+        if bits != 0 {
+            self.or_fma_word(FMA_ISR, bits);
+            self.or_fma_word(0x02, bits & (FMA_IRQ_DEC | FMA_IRQ_UNF));
+        }
+        for which in 0..2 {
+            let d = self.audio_demux(which);
+            if let Some(clock) = d.tick_clock() {
+                d.backfill(clock);
+                let n = d.pop_due(clock);
+                self.decode_due(which, n);
+            }
+        }
+    }
+
+    fn audio_demux(&mut self, which: usize) -> &mut MpegSystemDemux {
+        if which == 0 { &mut self.fma_demux } else { &mut self.demux }
+    }
+
+    // Schedules and decodes what the parsed audio packets and pack headers make due; a stream without PTS or SCR decodes on arrival.
+    fn process_audio(&mut self) {
+        for which in 0..2 {
+            let events = std::mem::take(&mut self.audio_demux(which).events);
+            for ev in events {
+                let d = self.audio_demux(which);
+                if ev.packet {
+                    if let Some(t) = ev.pts {
+                        d.backfill(t);
+                        d.save_due(t);
+                    }
+                    if d.due.is_empty() {
+                        continue;
+                    }
+                    if let Some(c) = ev.clock {
+                        d.backfill(c);
+                    }
+                }
+                if let Some(c) = ev.clock {
+                    let n = d.pop_due(c);
+                    self.decode_due(which, n);
+                }
+            }
+            let d = self.audio_demux(which);
+            if !d.audio.is_empty() && (d.scr_base.is_none() || d.first_audio_pts.is_none()) {
+                let mut audio = std::mem::take(&mut d.audio);
+                if self.mp2.decode_available(&mut audio) != 0 {
+                    self.audio_sample_rate = self.mp2.last_sample_rate;
+                    self.fma_pending |= FMA_IRQ_DEC;
+                    self.audio_out.extend(self.mp2.pcm.drain(..));
+                }
+                self.audio_demux(which).audio = audio;
+            }
+        }
+    }
+
+    // Decodes `n` due frames; one that finds no whole frame buffered raises underflow and consumes the rest.
+    fn decode_due(&mut self, which: usize, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let mut audio = std::mem::take(&mut self.audio_demux(which).audio);
+        for _ in 0..n {
+            let Some(f) = self.mp2.decode_one(&mut audio) else {
+                if self.audio_enabled || self.audio_armed {
+                    self.raise_fma_underflow();
+                }
+                break;
+            };
+            self.audio_demux(which).interval = Mp2Decoder::interval_units(f.samples as u32, f.rate);
+            self.audio_sample_rate = self.mp2.last_sample_rate;
+            if !self.fma_started {
+                self.fma_started = true;
+                self.fma_pending |= FMA_IRQ_PLAY;
+                // The first frame decoded after a parser reset plays as silence.
+                for s in self.mp2.pcm.iter_mut() {
+                    *s = (0.0, 0.0);
+                }
+            }
+            let header = u32::from_be_bytes(f.header) & !0x0300;
+            if header != std::mem::replace(&mut self.fma_last_header, header) {
+                self.fma_pending |= FMA_IRQ_DEC;
+            }
+            self.audio_out.extend(self.mp2.pcm.drain(..));
+        }
+        self.audio_demux(which).audio = audio;
     }
 
     pub fn on_vsync(&mut self) {
         self.process_stream();
-
-        // Check for FMA audio buffer drain / underflow when audio is active
-        if self.audio_enabled || self.audio_armed {
-            if self.fma_drained() {
-                self.fma_underflow_count = self.fma_underflow_count.saturating_add(1);
-                if self.fma_underflow_count == 10 {
-                    self.raise_fma_underflow();
-                } else if self.fma_underflow_count > 10 && self.fma_underflow_count % 15 == 0 {
-                    self.or_fma_word(FMA_ISR, FMA_IRQ_UNF);
-                }
-            } else {
-                self.fma_underflow_count = 0;
-            }
-        }
 
         // Always raise VSYNC in ISR on every vertical blank interval (matches hardware VMPEG ASIC)
         self.or_fmv_word(FMV_ISR, FMV_IRQ_VSYNC);
@@ -1488,15 +1821,16 @@ opencdi::impl_state!(Dvc {
     dvc_stream_fifo, fma_stream_fifo, transfer_for_fma, fma_dma_seen, dma_requested, framebuffer, window, border_color,
     demux, fma_demux, mp2, audio_sample_rate, audio_out,
     video_decoder, video_width, video_height, frames_decoded_count, frames_presented_count, vsync_counter,
-    underflow_count, fma_underflow_count, fma_decoded_since_play, fma_playout_end, has_valid_frame,
+    underflow_count, fma_started, fma_tick_accum, fma_pending, fma_last_header, has_valid_frame,
+    impeg_regs, impeg_pio, impeg_hi_valid,
 } skip {
-    rom,
+    rom, impeg, impeg_fw, impeg_ivec_zero_logged, cpu_hz, audio_stopped, dsp_att,
 });
 
 opencdi::impl_state!(MpegSystemDemux {
     pending, video, audio, last_scr, first_video_pts, last_video_pts, last_video_dts, first_audio_pts, last_audio_pts,
-    selected_audio_stream, selected_video_stream, program_ends,
-} skip {});
+    selected_audio_stream, selected_video_stream, program_ends, scr_base, mux_rate, pack_bytes, tick_bytes, due, last_due, interval,
+} skip { events });
 
 // The oxideav filterbank is private to that crate; its V buffer holds only the last frame's subband samples, so replaying that frame on load rebuilds it.
 impl opencdi::savestate::State for Mp2Decoder {
@@ -1556,5 +1890,333 @@ mod window_tests {
         assert_eq!(out[10], 0xFF00_001C);
         d.get_scanline(13, &mut out, &mut present);
         assert!(!present.iter().any(|&p| p));
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    // Silent Layer II frame at 44.1 kHz, 192 kbit/s, stereo, no padding (626 bytes).
+    pub(super) fn silent_frame() -> Vec<u8> {
+        let mut f = vec![0u8; 626];
+        f[..4].copy_from_slice(&[0xFF, 0xFD, 0xA0, 0x00]);
+        f
+    }
+
+    // MPEG-1 pack header: SCR in 90 kHz ticks, mux rate in 50 byte/s units.
+    pub(super) fn pack(scr: u64, mux: u32) -> Vec<u8> {
+        vec![
+            0, 0, 1, 0xBA,
+            0x21 | (((scr >> 30) & 7) as u8) << 1,
+            (scr >> 22) as u8,
+            0x01 | (((scr >> 15) & 0x7F) as u8) << 1,
+            (scr >> 7) as u8,
+            0x01 | ((scr & 0x7F) as u8) << 1,
+            0x80 | ((mux >> 15) & 0x7F) as u8,
+            (mux >> 7) as u8,
+            0x01 | ((mux & 0x7F) as u8) << 1,
+        ]
+    }
+
+    // MPEG-1 audio packet with a PTS (90 kHz ticks).
+    pub(super) fn audio_packet(pts: Option<u64>, payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        match pts {
+            Some(t) => body.extend_from_slice(&[
+                0x21 | (((t >> 30) & 7) as u8) << 1,
+                (t >> 22) as u8,
+                0x01 | (((t >> 15) & 0x7F) as u8) << 1,
+                (t >> 7) as u8,
+                0x01 | ((t & 0x7F) as u8) << 1,
+            ]),
+            None => body.push(0x0F),
+        }
+        body.extend_from_slice(payload);
+        let mut p = vec![0, 0, 1, 0xC0];
+        p.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        p.extend_from_slice(&body);
+        p
+    }
+
+    #[test]
+    fn decode_one_equals_the_loop() {
+        let mut stream = VecDeque::new();
+        for _ in 0..3 {
+            stream.extend(silent_frame());
+        }
+        let mut a = Mp2Decoder::default();
+        let mut b = Mp2Decoder::default();
+        let mut sa = stream.clone();
+        let mut sb = stream;
+        assert_eq!(a.decode_available(&mut sa), 3);
+        let mut n = 0;
+        while let Some(f) = b.decode_one(&mut sb) {
+            assert_eq!((f.samples, f.rate), (1152, 44_100));
+            n += 1;
+        }
+        assert_eq!(n, 3);
+        assert_eq!(a.pcm, b.pcm);
+        assert!(sa.is_empty() && sb.is_empty());
+    }
+
+    #[test]
+    fn frame_interval_in_decode_units() {
+        let mut s = VecDeque::new();
+        s.extend(silent_frame());
+        assert_eq!(Mp2Decoder::peek_interval(&s), Some((1152, 44_100)));
+        assert_eq!(Mp2Decoder::interval_units(1152, 44_100), 588);
+        assert_eq!(Mp2Decoder::interval_units(384, 44_100), 196);
+    }
+
+    #[test]
+    fn clock_follows_scr_and_bytes_whatever_the_chunking() {
+        let mut data = pack(90_000, 3528);
+        data.extend(audio_packet(Some(90_000 + 9_000), &silent_frame()));
+        let mut whole = MpegSystemDemux::default();
+        whole.feed(&data);
+        let mut bytewise = MpegSystemDemux::default();
+        for b in &data {
+            bytewise.feed(&[*b]);
+        }
+        assert_eq!(whole.scr_base, Some(22_500));
+        assert_eq!(whole.mux_rate, 3528);
+        assert_eq!(whole.pack_bytes, 4 + (6 + 5 + 626) as u64);
+        assert_eq!((whole.scr_base, whole.mux_rate, whole.pack_bytes), (bytewise.scr_base, bytewise.mux_rate, bytewise.pack_bytes));
+        assert_eq!(whole.clock(), bytewise.clock());
+        assert_eq!(whole.clock(), Some(22_500 + 642 * 450 / 3528));
+    }
+
+    #[test]
+    fn tick_clock_waits_for_two_ticks_without_a_pack() {
+        let mut d = MpegSystemDemux::default();
+        d.feed(&pack(0, 3528));
+        assert_eq!(d.tick_clock(), None);
+        assert_eq!(d.tick_clock(), Some(2 * 2352 * 450 / 3528));
+        d.feed(&pack(900, 3528));
+        assert_eq!(d.tick_bytes, 0);
+    }
+
+    // Layer II frame with one non-silent subband (sample code 0 of a three-level quantiser).
+    pub(super) fn loud_frame() -> Vec<u8> {
+        let mut f = silent_frame();
+        f[4] = 0x10;
+        f[26] = 0x80;
+        f
+    }
+
+    fn dvc() -> Dvc {
+        let mut d = Dvc::new();
+        d.audio_enabled = true;
+        d.audio_armed = true;
+        d
+    }
+
+    fn feed(d: &mut Dvc, bytes: &[u8]) {
+        d.fma_stream_fifo.extend_from_slice(bytes);
+        d.process_stream();
+    }
+
+    fn stream(scr: u64, pts: Option<u64>, frames: usize) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for _ in 0..frames {
+            payload.extend(loud_frame());
+        }
+        let mut v = pack(scr, 3528);
+        v.extend(audio_packet(pts, &payload));
+        v
+    }
+
+    fn tick(d: &mut Dvc) {
+        d.tick((d.cpu_hz / 75) as u32);
+    }
+
+    #[test]
+    fn frame_waits_for_the_clock_and_chunking_does_not_matter() {
+        let mut whole = dvc();
+        feed(&mut whole, &stream(90_000, Some(99_000), 1));
+        assert!(whole.audio_out.is_empty() && whole.fma_demux.due.len() == 1);
+        feed(&mut whole, &pack(99_800, 3528));
+        assert_eq!(whole.audio_out.len(), 1152);
+        let mut bytewise = dvc();
+        for b in stream(90_000, Some(99_000), 1).iter().chain(pack(99_800, 3528).iter()) {
+            feed(&mut bytewise, &[*b]);
+        }
+        assert_eq!(whole.audio_out, bytewise.audio_out);
+    }
+
+    #[test]
+    fn first_frame_after_a_stop_is_silent_then_not() {
+        let mut d = dvc();
+        feed(&mut d, &stream(90_000, Some(99_000), 3));
+        feed(&mut d, &pack(99_800, 3528));
+        assert!(d.audio_out.iter().all(|&s| s == (0.0, 0.0)) && d.audio_out.len() == 1152);
+        feed(&mut d, &audio_packet(Some(99_000 + 2 * 2_352), &loud_frame()));
+        feed(&mut d, &pack(105_000, 3528));
+        assert!(d.audio_out.len() > 1152 && d.audio_out.iter().skip(1152).any(|&s| s != (0.0, 0.0)));
+        d.set_fma_word(FMA_CMD, 1);
+        d.handle_fma_write(FMA_CMD);
+        assert!(!d.fma_started && d.fma_demux.due.is_empty() && d.fma_demux.interval == 0 && d.audio_stopped);
+        d.audio_out.clear();
+        feed(&mut d, &stream(90_000, Some(99_000), 1));
+        feed(&mut d, &pack(99_800, 3528));
+        assert!(d.audio_out.iter().all(|&s| s == (0.0, 0.0)) && d.audio_out.len() == 1152);
+    }
+
+    #[test]
+    fn first_pes_after_a_reset_only_stores_its_pts() {
+        let mut d = dvc();
+        feed(&mut d, &stream(90_000, Some(99_000), 1));
+        assert_eq!(d.fma_demux.due.len(), 1);
+        assert_eq!(d.fma_demux.last_due, Some(99_000 >> 2));
+    }
+
+    #[test]
+    fn decode_events_reach_the_isr_at_the_next_tick() {
+        let mut d = dvc();
+        feed(&mut d, &stream(90_000, Some(99_000), 1));
+        feed(&mut d, &pack(99_800, 3528));
+        assert_eq!(d.get_fma_word(FMA_ISR) & 0x14, 0);
+        tick(&mut d);
+        assert_eq!(d.get_fma_word(FMA_ISR) & 0x14, 0x14);
+    }
+
+    #[test]
+    fn a_due_frame_without_data_raises_underflow_and_makes_no_sound() {
+        let mut d = dvc();
+        feed(&mut d, &stream(90_000, Some(99_000), 1));
+        feed(&mut d, &pack(99_800, 3528));
+        tick(&mut d);
+        d.acknowledge_fma_isr();
+        d.audio_out.clear();
+        feed(&mut d, &audio_packet(Some(99_000 + 2_352), &[]));
+        feed(&mut d, &pack(120_000, 3528));
+        feed(&mut d, &pack(140_000, 3528));
+        let before = d.audio_out.len();
+        tick(&mut d);
+        assert_eq!(before, 0);
+        assert_eq!(d.get_fma_word(FMA_ISR) & 0x08, 0x08);
+        assert!(d.fma_demux.due.is_empty());
+    }
+
+    #[test]
+    fn ticks_without_a_pack_header_keep_raising_underflow() {
+        let mut d = dvc();
+        feed(&mut d, &stream(90_000, Some(99_000), 1));
+        feed(&mut d, &pack(99_800, 3528));
+        let mut hits = 0;
+        for _ in 0..40 {
+            tick(&mut d);
+            if d.get_fma_word(FMA_ISR) & 0x08 != 0 {
+                hits += 1;
+                d.acknowledge_fma_isr();
+            }
+        }
+        assert!(hits >= 5, "underflow repeats while the clock runs: {hits}");
+    }
+
+    #[test]
+    fn addly_does_not_move_the_schedule() {
+        let mut d = dvc();
+        feed(&mut d, &stream(90_000, Some(99_000), 1));
+        let (due, last) = (d.fma_demux.due.clone(), d.fma_demux.last_due);
+        d.set_fma_word(0x18, 5);
+        d.handle_fma_write(0x18);
+        assert_eq!((d.fma_demux.due.clone(), d.fma_demux.last_due), (due, last));
+    }
+
+    #[test]
+    fn a_stream_without_pts_decodes_on_arrival() {
+        let mut d = dvc();
+        feed(&mut d, &stream(90_000, None, 2));
+        assert_eq!(d.audio_out.len(), 2 * 1152);
+    }
+
+    #[test]
+    fn schedule_survives_the_timestamp_wrap() {
+        let mut d = dvc();
+        let wrap = 1u64 << 33;
+        feed(&mut d, &stream(wrap - 9_000, Some(wrap - 1_000), 1));
+        assert!(d.audio_out.is_empty());
+        feed(&mut d, &pack(wrap - 300, 3528));
+        assert_eq!(d.audio_out.len(), 1152);
+        feed(&mut d, &pack(500, 3528));
+        feed(&mut d, &audio_packet(Some(5_000), &loud_frame()));
+        feed(&mut d, &pack(6_000, 3528));
+        assert_eq!(d.audio_out.len(), 2 * 1152);
+    }
+}
+
+#[cfg(test)]
+mod attenuation_tests {
+    use super::*;
+
+    fn dsp(d: &mut Dvc, index: u16, data: u16) {
+        d.write_word(0xE03022, index);
+        d.write_word(0xE03024, data);
+    }
+
+    #[test]
+    fn vmpeg_attenuation_powers_up_muted_and_follows_the_dsp_upload() {
+        let mut d = Dvc::new();
+        assert_eq!(d.audio_gains(), Some([0.0; 4]));
+        // Program words on other indexes are not attenuation.
+        for (i, v) in [(5, 0x0A), (6, 0xF0), (7, 0x80)] {
+            dsp(&mut d, i, v);
+        }
+        assert_eq!(d.audio_gains(), Some([0.0; 4]));
+        dsp(&mut d, 0, 0xF2);
+        dsp(&mut d, 1, 0x93);
+        for b in [0x00, 0x80, 0x80, 0x00] {
+            dsp(&mut d, 7, b);
+        }
+        assert_eq!(d.audio_gains(), None);
+        dsp(&mut d, 1, 0x93);
+        for b in [10, 0x80, 0x80, 0x00] {
+            dsp(&mut d, 7, b);
+        }
+        let g = d.audio_gains().unwrap();
+        assert!((g[0] - 0.316_227_77).abs() < 1e-4 && g[1] == 0.0 && g[2] == 1.0 && g[3] == 0.0);
+    }
+}
+
+#[cfg(test)]
+mod impeg_tests {
+    use super::*;
+
+    #[test]
+    fn impeg_audio_bits_and_pio() {
+        assert_eq!(Dvc::impeg_bits_from(0x0100 | 0x0008 | 0x0020 | 0x0001 | 0x0004), 0x0800 | 0x0100 | 0x0400 | 0x8000 | 0x0004);
+        assert_eq!(Dvc::impeg_bits_to(0x3D14), 0x0100 | 0x0020 | 0x0008 | 0x0010 | 0x0004);
+        let mut d = Dvc::new();
+        d.impeg = true;
+        d.write_word(0xE0421C, 0x3D14);
+        assert_eq!(d.read_word(0xE0421C), 0x3D14);
+        assert_eq!(d.get_fma_word(FMA_IER), Dvc::impeg_bits_to(0x3D14));
+        // Data-port words go to the stream only in PIO mode and only as complete words.
+        let before = d.fma_stream_fifo.len();
+        d.write_word(0xE0411E, 0x1234);
+        assert_eq!(d.fma_stream_fifo.len(), before);
+        d.write_word(0xE04200, 0x0100);
+        d.write_byte(0xE0411F, 0x56);
+        assert_eq!(d.fma_stream_fifo.len(), before);
+        d.write_word(0xE0411E, 0xABCD);
+        assert_eq!(d.fma_stream_fifo.len(), before + 2);
+        d.reset();
+        assert!(!d.impeg_pio && d.impeg_regs[..IMPEG_ATT].iter().all(|&b| b == 0) && d.impeg_regs[IMPEG_ATT..IMPEG_ATT + 4] == [0x3F; 4]);
+    }
+
+    #[test]
+    fn impeg_attenuation_powers_up_muted_and_follows_its_registers() {
+        let mut d = Dvc::new();
+        d.impeg = true;
+        d.reset();
+        assert_eq!(d.audio_gains(), Some([0.0; 4]));
+        d.write_word(0xE0420C, 0x003F);
+        d.write_word(0xE0420E, 0x3F00);
+        assert_eq!(d.audio_gains(), None);
+        d.write_word(0xE0420C, 0x0A3F);
+        let g = d.audio_gains().unwrap();
+        assert!((g[0] - 0.1).abs() < 1e-4 && g[1] == 0.0 && g[2] == 1.0 && g[3] == 0.0);
     }
 }

@@ -1,4 +1,6 @@
+use opencdi::audio::to_i16;
 use opencdi::input_script::{self, Event, Player};
+use opencdi::bus::BoardKind;
 use opencdi::machine::Machine;
 use opencdi::mcd212::{VideoMode, SCREEN_HEIGHT, SCREEN_WIDTH};
 
@@ -21,15 +23,16 @@ fn video_hash(h: u64, fb: &[u32]) -> u64 {
     h
 }
 
-fn drain_audio(m: &mut Machine, buf: &mut Vec<(f32, f32)>, h: &mut u64, samples: &mut u64) {
+// Hashes the frames the last run_frame made; counts them and those that are not silent.
+fn drain_audio(m: &mut Machine, buf: &mut Vec<(f32, f32)>, h: &mut u64, samples: &mut u64, nonzero: &mut u64) {
     buf.clear();
-    let rate = m.drain_audio(buf);
+    m.drain_audio(buf);
     for &(l, r) in buf.iter() {
         *h = fnv(*h, &l.to_bits().to_le_bytes());
         *h = fnv(*h, &r.to_bits().to_le_bytes());
         *samples += 1;
+        *nonzero += (l != 0.0 || r != 0.0) as u64;
     }
-    *h = fnv(*h, &rate.to_le_bytes());
 }
 
 fn dump_ppm(fb: &[u32], path: &str) {
@@ -41,7 +44,7 @@ fn dump_ppm(fb: &[u32], path: &str) {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: harness <bios.rom> <disc|none> <frames> [--dvc <rom>] [--ppm <out.ppm>] [--ntsc] [--autoplay [--print-autoplay-script]] [--input <script|@file>] [--sample <n> [--sample-audio]] [--dump-every <n> <prefix>] [--roundtrip <frame>]");
+    eprintln!("usage: harness <bios.rom> <disc|none> <frames> [--dvc <rom>] [--ppm <out.ppm>] [--ntsc] [--autoplay [--print-autoplay-script]] [--input <script|@file>] [--sample <n> [--sample-audio]] [--dump-every <n> <prefix>] [--roundtrip <frame>] [--counters] [--idle-pc <hex>] [--board mono1|mono4] [--audio-out <file.s16>]");
     std::process::exit(2);
 }
 
@@ -62,12 +65,23 @@ fn main() {
     let mut sample_audio = false;
     let mut dump: Option<(u64, String)> = None;
     let mut roundtrip: Option<u64> = None;
+    let mut counters = false;
+    let mut board: Option<BoardKind> = None;
+    let mut idle_pc: Option<u32> = None;
+    let mut audio_out: Option<(String, Vec<u8>)> = None;
     let mut i = 4;
     while i < a.len() {
         match a[i].as_str() {
             "--dvc" => { i += 1; dvc = a.get(i); }
             "--ppm" => { i += 1; ppm = a.get(i); }
+            "--audio-out" => { i += 1; audio_out = Some((a.get(i).cloned().unwrap_or_else(|| usage()), Vec::new())); }
             "--ntsc" => ntsc = true,
+            "--counters" => counters = true,
+            "--board" => {
+                i += 1;
+                board = Some(a.get(i).and_then(|s| BoardKind::parse(s)).unwrap_or_else(|| usage()));
+            }
+            "--idle-pc" => { i += 1; idle_pc = Some(a.get(i).and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or_else(|| usage())); }
             "--autoplay" => autoplay = true,
             "--print-autoplay-script" => print_script = true,
             "--input" => { i += 1; input = Some(a.get(i).cloned().unwrap_or_else(|| usage())); }
@@ -98,6 +112,10 @@ fn main() {
     let mut m = Machine::new();
     let report = m.load_bios(bios).unwrap_or_else(|e| panic!("load bios {}: {}", bios, e));
     eprintln!("bios {}: {}", report.status, report.message);
+    if let Some(b) = board {
+        m.bus.set_board(b);
+    }
+    eprintln!("board {:?}", m.bus.board);
     if let Some(p) = dvc {
         let report = m.load_dvc(p).unwrap_or_else(|e| panic!("load dvc {}: {}", p, e));
         eprintln!("dvc {}: {}", report.status, report.message);
@@ -111,10 +129,12 @@ fn main() {
     let mut video_all = FNV_OFFSET;
     let mut audio_all = FNV_OFFSET;
     let mut audio_samples = 0u64;
+    let mut audio_nonzero = 0u64;
     let mut disc_launched = false;
     let mut shell_ready_count = 0u32;
     let mut audio_buf: Vec<(f32, f32)> = Vec::new();
     let (mut win_samples, mut win_nonzero) = (0u64, 0u64);
+    let mut idle_first: Option<u64> = None;
 
     // Round trip: save at `at`, run to the end (A), load, rerun the same frames with the same input (B).
     let mut saved: Option<(Vec<u8>, bool, u32, Option<Player>)> = None;
@@ -161,14 +181,23 @@ fn main() {
                     p.warp(slave.device_mouse_x, slave.device_mouse_y);
                 }
                 if let Some((x, y, b)) = p.step(frame) {
-                    slave.update_mouse(x, y, b);
+                    match m.bus.mono4.as_deref_mut() {
+                        Some(m4) => m4.ikat.update_pointer(x, y, b),
+                        None => slave.update_mouse(x, y, b),
+                    }
                 }
             }
 
             m.run_frame();
+            if idle_first.is_none() && idle_pc == Some(m.cpu.pc) {
+                idle_first = Some(frame + 1);
+            }
 
             video_all = video_hash(video_all, m.framebuffer());
-            drain_audio(&mut m, &mut audio_buf, &mut audio_all, &mut audio_samples);
+            drain_audio(&mut m, &mut audio_buf, &mut audio_all, &mut audio_samples, &mut audio_nonzero);
+            if let Some((_, bytes)) = audio_out.as_mut() {
+                bytes.extend(audio_buf.iter().flat_map(|&(l, r)| [to_i16(l), to_i16(r)]).flat_map(i16::to_le_bytes));
+            }
             if sample_audio {
                 win_samples += audio_buf.len() as u64;
                 win_nonzero += audio_buf.iter().filter(|&&(l, r)| l != 0.0 || r != 0.0).count() as u64;
@@ -221,10 +250,24 @@ fn main() {
     if let Some(p) = ppm {
         dump_ppm(m.framebuffer(), p);
     }
+    if let Some((p, bytes)) = &audio_out {
+        if let Err(e) = std::fs::write(p, bytes) {
+            eprintln!("cannot write audio {}: {}", p, e);
+            std::process::exit(1);
+        }
+    }
     println!(
-        "\nHARNESS frames={} pc={:08x} nonblack={} video_last={:016x} video_all={:016x} audio={:016x} audio_samples={}",
-        frames, m.cpu.pc, nonblack, video_last, video_all, audio_all, audio_samples
+        "\nHARNESS frames={} pc={:08x} nonblack={} video_last={:016x} video_all={:016x} audio={:016x} audio_samples={} audio_nonzero={}",
+        frames, m.cpu.pc, nonblack, video_last, video_all, audio_all, audio_samples, audio_nonzero
     );
+    if counters || idle_pc.is_some() {
+        let idle = idle_first.map_or("none".to_string(), |f| f.to_string());
+        let ciap = m.bus.mono4.as_deref().map_or(String::new(), |m4| {
+            let c = &m4.ciap;
+            format!(" buserr={} seeks={} sectors={} skipped={} dmas={} descrambled={} q={} abuf={} asec={} aover={}", m.bus.counters.bus_errors, c.seeks, c.sectors, c.skipped, c.dmas, c.descrambled, c.q_reports, c.audio_buffers, c.audio_sectors, c.audio_overlap)
+        });
+        println!("COUNTERS {}{} idle_first={}", m.bus.counters.summary(), ciap, idle);
+    }
     if print_script {
         println!("AUTOPLAY_SCRIPT {}", input_script::format(&recorded));
     }

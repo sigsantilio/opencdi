@@ -1,7 +1,10 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
+#[cfg(feature = "host")]
+use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
+#[cfg(feature = "host")]
 use log::{info, warn, error};
+use crate::mcd212::VideoMode;
 #[cfg(feature = "host")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -17,7 +20,8 @@ const XA_FILTER_COEF: [[i32; 2]; 4] = [
 const HEADER_OFFSET_4BIT: [usize; 8] = [4, 5, 6, 7, 12, 13, 14, 15];
 const DATA_OFFSET_4BIT: [usize; 8]   = [16, 16, 17, 17, 18, 18, 19, 19];
 
-const HEADER_OFFSET_8BIT: [usize; 4] = [4, 5, 6, 7];
+// 8-bit groups repeat the four sound parameters four times; the decoder uses the last copy (bytes 12-15).
+const HEADER_OFFSET_8BIT: [usize; 4] = [12, 13, 14, 15];
 const DATA_OFFSET_8BIT: [usize; 4]   = [16, 17, 18, 19];
 
 #[derive(Default, Clone, Copy)]
@@ -48,20 +52,218 @@ impl ChannelState {
     }
 }
 
+pub type Frame = (f32, f32);
+
+// Rate of the emulated audio output; ADPCM (37.8 and 18.9 kHz) is resampled to it, MPEG audio runs at it.
+pub const OUT_RATE: u32 = 44_100;
+const SECTORS_PER_SECOND: u64 = 75;
+
+pub fn frame_cycles(mode: VideoMode) -> u64 {
+    mode.total_scanlines() as u64 * mode.cycles_per_scanline() as u64
+}
+
+// Video frame rate on the CD sector clock (75 sectors per second), so one frame of audio is exactly what the emulation produces.
+pub fn frame_rate(mode: VideoMode) -> f64 {
+    (SECTORS_PER_SECOND * mode.cycles_per_sector() as u64) as f64 / frame_cycles(mode) as f64
+}
+
+// Hard clip at full scale, then scale to 16 bits.
+pub fn to_i16(x: f32) -> i16 {
+    (x.clamp(-1.0, 1.0) * 32767.0) as i16
+}
+
+// Output frames due for the cycles ticked: OUT_RATE / 75 per sector period, remainder carried.
+#[derive(Default, Clone, Copy, PartialEq, Debug)]
+pub struct OutputClock {
+    pub rem: u64,
+}
+
+impl OutputClock {
+    pub fn advance(&mut self, cycles: u64, sector_cycles: u32) -> usize {
+        self.rem += (OUT_RATE as u64 / SECTORS_PER_SECOND) * cycles;
+        let n = self.rem / sector_cycles as u64;
+        self.rem %= sector_cycles as u64;
+        n as usize
+    }
+}
+
+fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+// Four-path gain matrix (left-left, left-right, right-right, right-left) on a stereo run.
+fn apply_gains(frames: &mut [Frame], [ll, lr, rr, rl]: [f32; 4]) {
+    for (l, r) in frames.iter_mut() {
+        (*l, *r) = (*l * ll + *r * rl, *r * rr + *l * lr);
+    }
+}
+
+// Polyphase Catmull-Rom resampler to OUT_RATE with an exact rational step; plain f32 ops (no FMA), so results are the same on every IEEE-754 target.
+#[derive(Default, Clone, PartialEq, Debug)]
+pub struct Resampler {
+    rate: u32,
+    num: u32,
+    den: u32,
+    pos: u32,
+    hist: [Frame; 3],
+}
+
+// Catmull-Rom weights for the four inputs around the interval the phase t (0 to 1) falls in.
+fn catmull_rom(t: f32) -> [f32; 4] {
+    let (t2, t3) = (t * t, t * t * t);
+    [(2.0 * t2 - t3 - t) * 0.5, (3.0 * t3 - 5.0 * t2 + 2.0) * 0.5, (4.0 * t2 - 3.0 * t3 + t) * 0.5, (t3 - t2) * 0.5]
+}
+
+impl Resampler {
+    pub const fn new() -> Self {
+        Resampler { rate: 0, num: 0, den: 0, pos: 0, hist: [(0.0, 0.0); 3] }
+    }
+
+    // A new rate restarts the phase and keeps the history, so a sector edge has no step.
+    pub fn set_rate(&mut self, rate: u32) {
+        if rate == 0 || rate == self.rate {
+            return;
+        }
+        let g = gcd(rate, OUT_RATE);
+        (self.rate, self.num, self.den, self.pos) = (rate, rate / g, OUT_RATE / g, 0);
+    }
+
+    // Output trails input by two samples (the cubic needs the next two).
+    pub fn process(&mut self, input: &[Frame], out: &mut Vec<Frame>) {
+        if self.den == 0 {
+            return;
+        }
+        let den = self.den as f32;
+        for &d in input {
+            let [a, b, c] = self.hist;
+            while self.pos < self.den {
+                let w = catmull_rom(self.pos as f32 / den);
+                out.push((
+                    w[0] * a.0 + w[1] * b.0 + w[2] * c.0 + w[3] * d.0,
+                    w[0] * a.1 + w[1] * b.1 + w[2] * c.1 + w[3] * d.1,
+                ));
+                self.pos += self.num;
+            }
+            self.pos -= self.den;
+            self.hist = [b, c, d];
+        }
+    }
+}
+
+// Silence in front of an ADPCM stream that starts from empty: one sector period, as the decoder needs a whole sector first.
+pub const ADPCM_LATENCY: usize = OUT_RATE as usize / 75;
+// An MPEG stream starts one Layer II frame late, so decode times quantised to 1/75 s cannot run it dry.
+pub const MPEG_LATENCY: usize = 1152;
+// An MPEG stream holding more than this (two seconds) is reported; nothing is dropped.
+const MPEG_WARN: usize = 2 * OUT_RATE as usize;
+
+// One stream of the output mix at OUT_RATE.
+#[derive(Default, Clone, PartialEq, Debug)]
+pub struct Stream {
+    fifo: VecDeque<Frame>,
+    primed: bool,
+    warned: bool,
+    pub restarts: u64,
+    pub warnings: u64,
+    pub frames_in: u64,
+}
+
+impl Stream {
+    // Queues `src`, after `latency` frames of silence when the stream starts; holding more than `bound` frames is reported once per start.
+    pub fn push(&mut self, src: &[Frame], latency: usize, bound: usize, what: &dyn Fn() -> String) {
+        if src.is_empty() {
+            return;
+        }
+        self.frames_in += src.len() as u64;
+        if !self.primed {
+            self.fifo.resize(self.fifo.len() + latency, (0.0, 0.0));
+            self.primed = true;
+            self.warned = false;
+            self.restarts += 1;
+        }
+        self.fifo.extend(src.iter().copied());
+        if self.fifo.len() > bound && !self.warned {
+            self.warned = true;
+            self.warnings += 1;
+            eprintln!("audio: {} stream holds {} frames, more than {}", what(), self.fifo.len(), bound);
+        }
+    }
+
+    // Adds up to out.len() frames into out; running dry ends the stream, so the next push prefills again.
+    pub fn mix_into(&mut self, out: &mut [Frame]) {
+        let n = out.len().min(self.fifo.len());
+        for (o, s) in out.iter_mut().zip(self.fifo.drain(..n)) {
+            o.0 += s.0;
+            o.1 += s.1;
+        }
+        if n < out.len() {
+            self.primed = false;
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.fifo.len()
+    }
+
+    // Drops the unplayed frames; the next push starts the stream again.
+    pub fn clear(&mut self) {
+        self.fifo.clear();
+        self.primed = false;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fifo.is_empty()
+    }
+}
+
+// Coding of the last ADPCM sector a stream received: output frames per sector and the level, for the hold bound.
+#[derive(Default, Clone, Copy, PartialEq, Debug)]
+pub struct SectorKind {
+    pub frames: usize,
+    pub is_8bit: bool,
+    pub is_stereo: bool,
+    pub rate: u32,
+}
+
+impl SectorKind {
+    // Start latency plus one playing and one waiting sector.
+    fn bound(&self) -> usize {
+        ADPCM_LATENCY + 2 * self.frames
+    }
+
+    fn level(&self) -> String {
+        let level = if self.is_8bit { "A" } else if self.rate == 18900 { "C" } else { "B" };
+        format!("level {} {}", level, if self.is_stereo { "stereo" } else { "mono" })
+    }
+}
+
+// The board's audio output: decoders and the DVC feed three streams, mixed at OUT_RATE as the board is ticked.
 pub struct CdiAudio {
     pub left_state: ChannelState,
     pub right_state: ChannelState,
     pub map_left_state: ChannelState,
     pub map_right_state: ChannelState,
-    pub sample_queue: Arc<Mutex<VecDeque<(f32, f32)>>>,
-    pub sfx_queue: Arc<Mutex<VecDeque<(f32, f32)>>>,
-    pub dvc_queue: Arc<Mutex<VecDeque<(f32, f32)>>>,
-    pub source_rate: Arc<AtomicU32>,
-    pub dvc_rate: Arc<AtomicU32>,
+    pub resampler: Resampler,
+    pub map_resampler: Resampler,
     pub attenuation: [u8; 4],
-    pub volume: f32,
-    pub muted: bool,
     pub total_sectors_decoded: u64,
+    // ADPCM disc or CPU-fed, audio map or TACS, DVC MPEG audio.
+    pub main: Stream,
+    pub sfx: Stream,
+    pub mpeg: Stream,
+    rate_warned: bool,
+    clock: OutputClock,
+    out: Vec<Frame>,
+    scratch: Vec<Frame>,
+}
+
+impl Default for CdiAudio {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CdiAudio {
@@ -71,33 +273,90 @@ impl CdiAudio {
             right_state: ChannelState::default(),
             map_left_state: ChannelState::default(),
             map_right_state: ChannelState::default(),
-            sample_queue: Arc::new(Mutex::new(VecDeque::with_capacity(65536))),
-            sfx_queue: Arc::new(Mutex::new(VecDeque::with_capacity(65536))),
-            dvc_queue: Arc::new(Mutex::new(VecDeque::with_capacity(65536))),
-            source_rate: Arc::new(AtomicU32::new(37800)),
-            dvc_rate: Arc::new(AtomicU32::new(44100)),
+            resampler: Resampler::new(),
+            map_resampler: Resampler::new(),
             attenuation: [0xFF, 0, 0xFF, 0],
-            volume: 1.0,
-            muted: false,
             total_sectors_decoded: 0,
+            main: Stream::default(),
+            sfx: Stream::default(),
+            mpeg: Stream::default(),
+            rate_warned: false,
+            clock: OutputClock::default(),
+            out: Vec::new(),
+            scratch: Vec::new(),
         }
     }
 
+    // Player reset: the decoders restart; what the streams already hold plays on.
     pub fn reset(&mut self) {
         self.left_state.reset();
         self.right_state.reset();
         self.map_left_state.reset();
         self.map_right_state.reset();
+        self.resampler = Resampler::new();
+        self.map_resampler = Resampler::new();
         self.attenuation = [0xFF, 0, 0xFF, 0];
-        if let Ok(mut q) = self.sample_queue.lock() {
-            q.clear();
+    }
+
+    // Player attenuation matrix of the Mono-I slave (left-to-left, left-to-right, right-to-right, right-to-left); None while it passes stereo straight through.
+    pub fn slave_gains(&self) -> Option<[f32; 4]> {
+        if self.attenuation == [0xFF, 0, 0xFF, 0] {
+            return None;
         }
-        if let Ok(mut sq) = self.sfx_queue.lock() {
-            sq.clear();
+        let g = self.attenuation.map(|a| a as f32 / 255.0);
+        Some(g)
+    }
+
+    // Mixes the output frames that fall in `cycles` of board time; `gains` is the player attenuation as it stands now (ADPCM streams only), `dvc_gains` the cartridge's own (MPEG stream only).
+    pub fn advance(&mut self, cycles: u32, sector_cycles: u32, gains: Option<[f32; 4]>, dvc_gains: Option<[f32; 4]>) {
+        let n = self.clock.advance(cycles as u64, sector_cycles);
+        let start = self.out.len();
+        self.out.resize(start + n, (0.0, 0.0));
+        let frames = &mut self.out[start..];
+        self.main.mix_into(frames);
+        self.sfx.mix_into(frames);
+        if let Some(g) = gains {
+            apply_gains(frames, g);
         }
-        if let Ok(mut dq) = self.dvc_queue.lock() {
-            dq.clear();
+        match dvc_gains {
+            Some(g) if !self.mpeg.is_empty() => {
+                self.scratch.clear();
+                self.scratch.resize(n, (0.0, 0.0));
+                self.mpeg.mix_into(&mut self.scratch);
+                apply_gains(&mut self.scratch, g);
+                for (o, s) in self.out[start..].iter_mut().zip(self.scratch.iter()) {
+                    o.0 += s.0;
+                    o.1 += s.1;
+                }
+            }
+            _ => self.mpeg.mix_into(frames),
         }
+    }
+
+    // Queues decoded DVC PCM as it is; MPEG audio is 44.1 kHz, another rate is reported once and plays at the wrong pitch. It plays MPEG_LATENCY frames after the stream starts.
+    pub fn push_mpeg(&mut self, pcm: &mut VecDeque<Frame>, rate: u32) {
+        if pcm.is_empty() {
+            return;
+        }
+        if rate != OUT_RATE && !self.rate_warned {
+            self.rate_warned = true;
+            eprintln!("audio: mpeg stream at {} Hz is not supported, played as {} Hz", rate, OUT_RATE);
+        }
+        self.scratch.clear();
+        self.scratch.extend(pcm.drain(..));
+        self.mpeg.push(&self.scratch, MPEG_LATENCY, MPEG_WARN, &|| format!("mpeg {} Hz", rate));
+    }
+
+    // FMA stop or reset: the unplayed DVC audio goes.
+    pub fn stop_mpeg(&mut self) {
+        self.mpeg.clear();
+    }
+
+    // Appends the mixed frames made since the last call; returns how many.
+    pub fn drain(&mut self, out: &mut Vec<Frame>) -> usize {
+        let n = self.out.len();
+        out.append(&mut self.out);
+        n
     }
 
     pub fn set_attenuation(&mut self, atten: [u8; 4]) {
@@ -108,16 +367,10 @@ impl CdiAudio {
         payload: &[u8],
         is_stereo: bool,
         is_8bit: bool,
-        vol: f32,
-        attenuation: [u8; 4],
         left_state: &mut ChannelState,
         right_state: &mut ChannelState,
     ) -> Vec<(f32, f32)> {
         let mut samples = Vec::with_capacity(18 * 224);
-        let scale_ll = (attenuation[0] as f32 / 255.0) * vol;
-        let scale_lr = (attenuation[1] as f32 / 255.0) * vol;
-        let scale_rr = (attenuation[2] as f32 / 255.0) * vol;
-        let scale_rl = (attenuation[3] as f32 / 255.0) * vol;
 
         for g in 0..18 {
             let group = &payload[g * 128..(g + 1) * 128];
@@ -144,9 +397,7 @@ impl CdiAudio {
                     for s in 0..56 {
                         let sl = group_samples[0][s] as f32 / 32768.0;
                         let sr = group_samples[1][s] as f32 / 32768.0;
-                        let out_l = sl * scale_ll + sr * scale_rl;
-                        let out_r = sl * scale_lr + sr * scale_rr;
-                        samples.push((out_l, out_r));
+                        samples.push((sl, sr));
                     }
                 } else {
                     let mut mono_samples = [0i16; 112];
@@ -162,9 +413,7 @@ impl CdiAudio {
                     }
                     for s in 0..112 {
                         let sm = mono_samples[s] as f32 / 32768.0;
-                        let out_l = sm * (scale_ll + scale_rl);
-                        let out_r = sm * (scale_rr + scale_lr);
-                        samples.push((out_l, out_r));
+                        samples.push((sm, sm));
                     }
                 }
             } else {
@@ -192,9 +441,7 @@ impl CdiAudio {
                     for s in 0..112 {
                         let sl = group_samples[0][s] as f32 / 32768.0;
                         let sr = group_samples[1][s] as f32 / 32768.0;
-                        let out_l = sl * scale_ll + sr * scale_rl;
-                        let out_r = sl * scale_lr + sr * scale_rr;
-                        samples.push((out_l, out_r));
+                        samples.push((sl, sr));
                     }
                 } else {
                     let mut mono_samples = [0i16; 224];
@@ -212,9 +459,7 @@ impl CdiAudio {
                     }
                     for s in 0..224 {
                         let sm = mono_samples[s] as f32 / 32768.0;
-                        let out_l = sm * (scale_ll + scale_rl);
-                        let out_r = sm * (scale_rr + scale_lr);
-                        samples.push((out_l, out_r));
+                        samples.push((sm, sm));
                     }
                 }
             }
@@ -222,19 +467,12 @@ impl CdiAudio {
         samples
     }
 
-    fn upsample_if_needed(samples: Vec<(f32, f32)>, sample_rate: u32) -> Vec<(f32, f32)> {
-        if sample_rate == 18900 {
-            let mut upsampled = Vec::with_capacity(samples.len() * 2);
-            for i in 0..samples.len() {
-                let s0 = samples[i];
-                let s1 = if i + 1 < samples.len() { samples[i + 1] } else { s0 };
-                upsampled.push(s0);
-                upsampled.push(((s0.0 + s1.0) * 0.5, (s0.1 + s1.1) * 0.5));
-            }
-            upsampled
-        } else {
-            samples
-        }
+    // Brings a decoded sector from its ADPCM rate to OUT_RATE.
+    fn resample(r: &mut Resampler, samples: &[Frame], sample_rate: u32) -> Vec<Frame> {
+        let mut out = Vec::with_capacity(samples.len() * 7 / 3 + 2);
+        r.set_rate(sample_rate);
+        r.process(samples, &mut out);
+        out
     }
 
     pub fn decode_sector(&mut self, payload: &[u8], is_stereo: bool, is_8bit: bool, sample_rate: u32) {
@@ -242,32 +480,19 @@ impl CdiAudio {
             return;
         }
 
-        self.source_rate.store(37800, Ordering::Relaxed);
         self.total_sectors_decoded += 1;
 
-        let vol = if self.muted { 0.0 } else { self.volume };
         let samples = Self::decode_xa_payload(
             payload,
             is_stereo,
             is_8bit,
-            vol,
-            self.attenuation,
             &mut self.left_state,
             &mut self.right_state,
         );
-        let final_samples = Self::upsample_if_needed(samples, sample_rate);
+        let final_samples = Self::resample(&mut self.resampler, &samples, sample_rate);
 
-        if let Ok(mut q) = self.sample_queue.lock() {
-            // Cap queue at ~1.7s of audio (65536 samples) to prevent runaway latency while avoiding clicks
-            const MAX_QUEUE_SAMPLES: usize = 65536;
-            let current_len = q.len();
-            if current_len + final_samples.len() > MAX_QUEUE_SAMPLES {
-                let overflow = (current_len + final_samples.len()) - MAX_QUEUE_SAMPLES;
-                let to_drain = overflow.min(current_len);
-                q.drain(0..to_drain);
-            }
-            q.extend(final_samples);
-        }
+        let k = SectorKind { frames: final_samples.len(), is_8bit, is_stereo, rate: sample_rate };
+        self.main.push(&final_samples, ADPCM_LATENCY, k.bound(), &|| format!("main {}", k.level()));
     }
 
     pub fn decode_audio_map_sector(&mut self, payload: &[u8], is_stereo: bool, is_8bit: bool, sample_rate: u32) {
@@ -277,28 +502,17 @@ impl CdiAudio {
 
         self.total_sectors_decoded += 1;
 
-        let vol = if self.muted { 0.0 } else { self.volume };
         let samples = Self::decode_xa_payload(
             payload,
             is_stereo,
             is_8bit,
-            vol,
-            self.attenuation,
             &mut self.map_left_state,
             &mut self.map_right_state,
         );
-        let final_samples = Self::upsample_if_needed(samples, sample_rate);
+        let final_samples = Self::resample(&mut self.map_resampler, &samples, sample_rate);
 
-        if let Ok(mut sq) = self.sfx_queue.lock() {
-            const MAX_SFX_SAMPLES: usize = 65536;
-            let current_len = sq.len();
-            if current_len + final_samples.len() > MAX_SFX_SAMPLES {
-                let overflow = (current_len + final_samples.len()) - MAX_SFX_SAMPLES;
-                let to_drain = overflow.min(current_len);
-                sq.drain(0..to_drain);
-            }
-            sq.extend(final_samples);
-        }
+        let k = SectorKind { frames: final_samples.len(), is_8bit, is_stereo, rate: sample_rate };
+        self.sfx.push(&final_samples, ADPCM_LATENCY, k.bound(), &|| format!("sfx {}", k.level()));
     }
 }
 
@@ -307,15 +521,24 @@ pub struct HostAudioOutput {
     _stream: cpal::Stream,
 }
 
+// Most frames the sound-card ring holds (about 1.7 s); the oldest are dropped beyond it.
+pub const RING_CAP: usize = 65536;
+
+// Appends output frames to the sound-card ring, dropping the oldest beyond RING_CAP.
+pub fn feed_ring(ring: &Mutex<VecDeque<Frame>>, frames: &[Frame]) {
+    if let Ok(mut q) = ring.lock() {
+        q.extend(frames.iter().copied());
+        if q.len() > RING_CAP {
+            let n = q.len() - RING_CAP;
+            q.drain(..n);
+        }
+    }
+}
+
 #[cfg(feature = "host")]
 impl HostAudioOutput {
-    pub fn try_start(
-        sample_queue: Arc<Mutex<VecDeque<(f32, f32)>>>,
-        sfx_queue: Arc<Mutex<VecDeque<(f32, f32)>>>,
-        dvc_queue: Arc<Mutex<VecDeque<(f32, f32)>>>,
-        source_rate: Arc<AtomicU32>,
-        dvc_rate: Arc<AtomicU32>,
-    ) -> Option<Self> {
+    // Plays the ring (OUT_RATE frames) on the default device; `gain` holds the volume as f32 bits (0 is mute).
+    pub fn try_start(ring: Arc<Mutex<VecDeque<Frame>>>, gain: Arc<AtomicU32>) -> Option<Self> {
         let host = cpal::default_host();
         let device = match host.default_output_device() {
             Some(d) => d,
@@ -345,203 +568,84 @@ impl HostAudioOutput {
             config.sample_rate, channels, sample_format
         );
 
-        let mut resample_phase: f64 = 0.0;
-        let mut curr_sample = (0.0f32, 0.0f32);
-        let mut next_sample = (0.0f32, 0.0f32);
+        let mut phase: f64 = 0.0;
+        let mut curr = (0.0f32, 0.0f32);
+        let mut next = (0.0f32, 0.0f32);
         let mut prebuffering = true;
-        let mut starved_count: usize = 0;
-
-        let mut dvc_phase: f64 = 0.0;
-        let mut dvc_curr = (0.0f32, 0.0f32);
-        let mut dvc_next = (0.0f32, 0.0f32);
-        let mut dvc_prebuffering = true;
-        let mut dvc_starved: usize = 0;
-
-        let mut sfx_phase: f64 = 0.0;
-        let mut sfx_curr = (0.0f32, 0.0f32);
-        let mut sfx_next = (0.0f32, 0.0f32);
-        let mut sfx_prebuffering = true;
-        let mut sfx_starved: usize = 0;
+        let mut starved: usize = 0;
 
         let err_fn = |err| error!("Audio output stream error: {:?}", err);
 
         let stream_res = device.build_output_stream(
             config,
             move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                let src_rate = source_rate.load(Ordering::Relaxed) as f64;
-                let mpeg_rate = dvc_rate.load(Ordering::Relaxed) as f64;
-
-                let mut q_guard = match sample_queue.lock() {
+                let vol = f32::from_bits(gain.load(Ordering::Relaxed));
+                let mut q = match ring.lock() {
                     Ok(g) => g,
                     Err(_) => {
                         output.fill(0.0);
                         return;
                     }
                 };
-                let mut sfx_guard = sfx_queue.lock().ok();
-                let mut dvc_guard = dvc_queue.lock().ok();
+                let q_len = q.len();
 
-                let q_len = q_guard.len();
-                let sq_len = sfx_guard.as_ref().map_or(0, |sq| sq.len());
-                let dvc_len = dvc_guard.as_ref().map_or(0, |dq| dq.len());
-
-                // Prebuffering management for CDIC XA stream (~4096 samples / ~108 ms at 37.8 kHz)
-                // Ensures at least 1-2 sectors of Level B/C Mono are queued before playback starts
-                const PREBUFFER_SAMPLES: usize = 1536;
-                if prebuffering && q_len >= PREBUFFER_SAMPLES {
+                // Start playing once about 40 ms are queued.
+                const PREBUFFER: usize = 1536;
+                if prebuffering && q_len >= PREBUFFER {
                     prebuffering = false;
-                    curr_sample = q_guard.pop_front().unwrap_or((0.0, 0.0));
-                    next_sample = q_guard.pop_front().unwrap_or(curr_sample);
-                    resample_phase = 0.0;
-                    starved_count = 0;
+                    curr = q.pop_front().unwrap_or((0.0, 0.0));
+                    next = q.pop_front().unwrap_or(curr);
+                    phase = 0.0;
+                    starved = 0;
                 }
-
-                // Prebuffering management for DVC MP2 stream (~2304 samples = 2 MP2 frames / ~52 ms at 44.1 kHz)
-                const DVC_PREBUFFER_SAMPLES: usize = 2304;
-                if dvc_prebuffering && dvc_len >= DVC_PREBUFFER_SAMPLES {
-                    if let Some(ref mut dq) = dvc_guard {
-                        dvc_prebuffering = false;
-                        dvc_curr = dq.pop_front().unwrap_or((0.0, 0.0));
-                        dvc_next = dq.pop_front().unwrap_or(dvc_curr);
-                        dvc_phase = 0.0;
-                        dvc_starved = 0;
-                    }
-                }
-
-                // Prebuffering management for SFX / Audio Map stream (~1536 samples / ~40 ms at 37.8 kHz)
-                const SFX_PREBUFFER_SAMPLES: usize = 1536;
-                if sfx_prebuffering && sq_len >= SFX_PREBUFFER_SAMPLES {
-                    if let Some(ref mut sq) = sfx_guard {
-                        sfx_prebuffering = false;
-                        sfx_curr = sq.pop_front().unwrap_or((0.0, 0.0));
-                        sfx_next = sq.pop_front().unwrap_or(sfx_curr);
-                        sfx_phase = 0.0;
-                        sfx_starved = 0;
-                    }
-                }
-
-                if prebuffering && dvc_prebuffering && sfx_prebuffering {
+                if prebuffering {
                     output.fill(0.0);
                     return;
                 }
 
-                // Smooth Proportional Dynamic Rate Control (DRC) for CDIC stream:
-                // Target ~8192 samples (~216ms at 37.8kHz) gives ample room for 4032-sample
-                // Level B Mono sector bursts without queue underruns or stuttering.
-                const TARGET_QUEUE: f64 = 8192.0;
-                let diff = (q_len as f64 - TARGET_QUEUE) / TARGET_QUEUE;
+                // Proportional rate control towards about 8192 queued frames absorbs the drift between emulated and wall-clock time.
+                const TARGET: f64 = 8192.0;
+                let diff = (q_len as f64 - TARGET) / TARGET;
                 let drc = (1.0 + diff * 0.008).clamp(0.990, 1.010);
-                let step = (src_rate / host_sample_rate) * drc;
+                let step = (OUT_RATE as f64 / host_sample_rate) * drc;
 
-                // Smooth Proportional DRC for DVC MP2 stream:
-                const TARGET_DVC_QUEUE: f64 = 4000.0;
-                let dvc_diff = (dvc_len as f64 - TARGET_DVC_QUEUE) / TARGET_DVC_QUEUE;
-                let dvc_drc = (1.0 + dvc_diff * 0.004).clamp(0.996, 1.004);
-                let dvc_step = (mpeg_rate / host_sample_rate) * dvc_drc;
-
-                // Smooth Proportional DRC for SFX / Audio Map stream:
-
-                const TARGET_SFX_QUEUE: f64 = 4096.0;
-
-                let sfx_diff = (sq_len as f64 - TARGET_SFX_QUEUE) / TARGET_SFX_QUEUE;
-
-                let sfx_drc = (1.0 + sfx_diff * 0.008).clamp(0.990, 1.010);
-
-                let sfx_step = (37800.0 / host_sample_rate) * sfx_drc;
+                #[inline]
+                fn soft_saturate(x: f32) -> f32 {
+                    if x > 1.25 {
+                        1.0
+                    } else if x < -1.25 {
+                        -1.0
+                    } else {
+                        x - 0.16 * x * x * x
+                    }
+                }
 
                 let mut out_idx = 0;
                 while out_idx < output.len() {
                     let (mut l, mut r) = (0.0f32, 0.0f32);
-
                     if !prebuffering {
-                        while resample_phase >= 1.0 {
-                            resample_phase -= 1.0;
-                            curr_sample = next_sample;
-                            if let Some(s) = q_guard.pop_front() {
-                                next_sample = s;
-                                starved_count = 0;
+                        while phase >= 1.0 {
+                            phase -= 1.0;
+                            curr = next;
+                            if let Some(s) = q.pop_front() {
+                                next = s;
+                                starved = 0;
                             } else {
-                                starved_count += 1;
-                                next_sample = (curr_sample.0 * 0.95, curr_sample.1 * 0.95);
-                                if starved_count >= 512 {
+                                starved += 1;
+                                next = (curr.0 * 0.95, curr.1 * 0.95);
+                                if starved >= 512 {
                                     prebuffering = true;
                                     break;
                                 }
                             }
                         }
                         if !prebuffering {
-                            let t = resample_phase as f32;
-                            l += curr_sample.0 * (1.0 - t) + next_sample.0 * t;
-                            r += curr_sample.1 * (1.0 - t) + next_sample.1 * t;
-                            resample_phase += step;
+                            let t = phase as f32;
+                            l = (curr.0 * (1.0 - t) + next.0 * t) * vol;
+                            r = (curr.1 * (1.0 - t) + next.1 * t) * vol;
+                            phase += step;
                         }
                     }
-
-                    if !dvc_prebuffering {
-                        while dvc_phase >= 1.0 {
-                            dvc_phase -= 1.0;
-                            dvc_curr = dvc_next;
-                            let popped = dvc_guard.as_mut().and_then(|dq| dq.pop_front());
-                            if let Some(s) = popped {
-                                dvc_next = s;
-                                dvc_starved = 0;
-                            } else {
-                                dvc_starved += 1;
-                                dvc_next = (dvc_curr.0 * 0.95, dvc_curr.1 * 0.95);
-                                if dvc_starved >= 512 {
-                                    dvc_prebuffering = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if !dvc_prebuffering {
-                            let dt = dvc_phase as f32;
-                            l += dvc_curr.0 * (1.0 - dt) + dvc_next.0 * dt;
-                            r += dvc_curr.1 * (1.0 - dt) + dvc_next.1 * dt;
-                            dvc_phase += dvc_step;
-                        }
-                    }
-
-                    if !sfx_prebuffering {
-                        while sfx_phase >= 1.0 {
-                            sfx_phase -= 1.0;
-                            sfx_curr = sfx_next;
-                            let popped = sfx_guard.as_mut().and_then(|sq| sq.pop_front());
-                            if let Some(s) = popped {
-                                sfx_next = s;
-                                sfx_starved = 0;
-                            } else {
-                                sfx_starved += 1;
-                                sfx_next = (sfx_curr.0 * 0.95, sfx_curr.1 * 0.95);
-                                if sfx_starved >= 512 {
-                                    sfx_prebuffering = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if !sfx_prebuffering {
-                            let st = sfx_phase as f32;
-                            let sl = sfx_curr.0 * (1.0 - st) + sfx_next.0 * st;
-                            let sr = sfx_curr.1 * (1.0 - st) + sfx_next.1 * st;
-                            l += sl;
-                            r += sr;
-                            sfx_phase += sfx_step;
-                        }
-                    }
-
-                    // Smooth soft-saturation: prevents harsh clipping distortion when mixing
-                    // disc audio stream and audio map sound effects
-                    #[inline]
-                    fn soft_saturate(x: f32) -> f32 {
-                        if x > 1.25 {
-                            1.0
-                        } else if x < -1.25 {
-                            -1.0
-                        } else {
-                            x - 0.16 * x * x * x
-                        }
-                    }
-
                     l = soft_saturate(l);
                     r = soft_saturate(r);
 
@@ -582,37 +686,212 @@ impl HostAudioOutput {
 }
 
 opencdi::impl_state!(ChannelState { s0, s1 } skip {});
+opencdi::impl_state!(OutputClock { rem } skip {});
+opencdi::impl_state!(Resampler { rate, num, den, pos, hist } skip {});
 
-// Host queues are not state (the frontend drains them every frame); volume and mute are host settings.
+opencdi::impl_state!(Stream { fifo, primed } skip { warned, restarts, warnings, frames_in });
+
 impl opencdi::savestate::State for CdiAudio {
     fn save(&self, w: &mut Vec<u8>) {
-        let Self { left_state, right_state, map_left_state, map_right_state, sample_queue: _, sfx_queue: _, dvc_queue: _, source_rate, dvc_rate, attenuation, volume: _, muted: _, total_sectors_decoded } = self;
+        let Self { left_state, right_state, map_left_state, map_right_state, resampler, map_resampler, attenuation, total_sectors_decoded, main, sfx, mpeg, rate_warned: _, clock, out, scratch: _ } = self;
         for s in [left_state, right_state, map_left_state, map_right_state] {
             s.save(w);
         }
-        source_rate.load(Ordering::Relaxed).save(w);
-        dvc_rate.load(Ordering::Relaxed).save(w);
         attenuation.save(w);
         total_sectors_decoded.save(w);
+        resampler.save(w);
+        map_resampler.save(w);
+        for s in [main, sfx, mpeg] {
+            s.save(w);
+        }
+        clock.save(w);
+        out.save(w);
     }
 
     fn load(&mut self, r: &mut opencdi::savestate::Reader) -> Result<(), opencdi::savestate::StateError> {
-        let Self { left_state, right_state, map_left_state, map_right_state, sample_queue, sfx_queue, dvc_queue, source_rate, dvc_rate, attenuation, volume: _, muted: _, total_sectors_decoded } = self;
+        let Self { left_state, right_state, map_left_state, map_right_state, resampler, map_resampler, attenuation, total_sectors_decoded, main, sfx, mpeg, rate_warned: _, clock, out, scratch: _ } = self;
         for s in [left_state, right_state, map_left_state, map_right_state] {
             s.load(r)?;
         }
-        let mut rate = 0u32;
-        rate.load(r)?;
-        source_rate.store(rate, Ordering::Relaxed);
-        rate.load(r)?;
-        dvc_rate.store(rate, Ordering::Relaxed);
         attenuation.load(r)?;
         total_sectors_decoded.load(r)?;
-        for q in [sample_queue, sfx_queue, dvc_queue] {
-            if let Ok(mut q) = q.lock() {
-                q.clear();
-            }
+        resampler.load(r)?;
+        map_resampler.load(r)?;
+        for s in [main, sfx, mpeg] {
+            s.load(r)?;
         }
+        clock.load(r)?;
+        out.load(r)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn player_attenuation_acts_on_adpcm_at_the_mix_and_not_on_mpeg() {
+        let mut a = CdiAudio::new();
+        a.main.push(&[(0.5, 0.25); 4000], 0, usize::MAX, &String::new);
+        a.mpeg.push(&[(0.1, 0.1); 4000], 0, usize::MAX, &String::new);
+        let sector = VideoMode::Pal.cycles_per_sector();
+        let mut out = Vec::new();
+        a.advance(960, sector, None, None);
+        a.advance(960, sector, Some([1.0, 1.0, 1.0, 1.0]), None);
+        a.advance(960, sector, Some([0.0, 0.0, 1.0, 0.0]), None);
+        a.drain(&mut out);
+        let n = out.len() / 3;
+        assert_eq!(out[0], (0.6, 0.35));
+        assert_eq!(out[n + 1], (0.85, 0.85));
+        assert_eq!(out[2 * n + 1], (0.1, 0.35));
+    }
+
+    #[test]
+    fn cartridge_attenuation_acts_on_mpeg_only() {
+        let mut a = CdiAudio::new();
+        a.main.push(&[(0.5, 0.25); 100], 0, usize::MAX, &String::new);
+        a.mpeg.push(&[(0.4, 0.2); 100], 0, usize::MAX, &String::new);
+        a.advance(960, VideoMode::Pal.cycles_per_sector(), None, Some([0.5, 0.0, 0.5, 0.0]));
+        let mut out = Vec::new();
+        a.drain(&mut out);
+        assert_eq!(out[0], (0.7, 0.35));
+    }
+
+    #[test]
+    fn slave_gains_follow_the_attenuation_registers() {
+        let mut a = CdiAudio::new();
+        assert_eq!(a.slave_gains(), None);
+        a.set_attenuation([255, 255, 0, 0]);
+        assert_eq!(a.slave_gains(), Some([1.0, 1.0, 0.0, 0.0]));
+    }
+
+    #[test]
+    fn eight_bit_groups_use_the_last_parameter_copy() {
+        let mut payload = vec![0u8; 18 * 128];
+        for g in payload.chunks_exact_mut(128) {
+            g[0..12].fill(0x08); // range 8 in the first three copies
+            g[12..16].fill(0x00); // range 0 in the last copy
+            g[16..].fill(0x01);
+        }
+        let (mut l, mut r) = (ChannelState::default(), ChannelState::default());
+        let out = CdiAudio::decode_xa_payload(&payload, false, true, &mut l, &mut r);
+        assert_eq!(out[0].0, 256.0 / 32768.0);
+    }
+
+    #[test]
+    fn frame_rate_and_lengths_follow_the_sector_clock() {
+        let mut c = OutputClock::default();
+        let pal: usize = (0..1000).map(|_| c.advance(frame_cycles(VideoMode::Pal), VideoMode::Pal.cycles_per_sector())).sum();
+        assert_eq!(pal, (588u64 * 299_520 * 1000 / 200_000) as usize);
+        assert!((frame_rate(VideoMode::Pal) - 50.0801).abs() < 1e-4);
+        let mut c = OutputClock::default();
+        let lens: Vec<usize> = (0..4).map(|_| c.advance(frame_cycles(VideoMode::Ntsc), VideoMode::Ntsc.cycles_per_sector())).collect();
+        assert_eq!(lens, [734, 734, 735, 734]);
+        assert!((frame_rate(VideoMode::Ntsc) - 60.0543).abs() < 1e-4);
+    }
+
+    // Counts rising zero crossings of the left channel.
+    fn crossings(s: &[Frame]) -> usize {
+        s.windows(2).filter(|w| w[0].0 < 0.0 && w[1].0 >= 0.0).count()
+    }
+
+    #[test]
+    fn resampler_keeps_pitch_for_adpcm_rates() {
+        for rate in [37_800u32, 18_900] {
+            let tone = 1000.0f64;
+            let input: Vec<Frame> = (0..rate as usize * 2)
+                .map(|i| {
+                    let v = (2.0 * std::f64::consts::PI * tone * (i as f64 + 0.25) / rate as f64).sin() as f32;
+                    (v, v)
+                })
+                .collect();
+            let mut r = Resampler::default();
+            r.set_rate(rate);
+            let mut out = Vec::new();
+            for chunk in input.chunks(2016) {
+                r.process(chunk, &mut out);
+            }
+            let want = OUT_RATE as usize * 2;
+            assert!(out.len().abs_diff(want) <= 1, "{} Hz: {} frames, want {}", rate, out.len(), want);
+            assert!(crossings(&out[..OUT_RATE as usize]).abs_diff(1000) <= 1, "{} Hz: {} crossings", rate, crossings(&out[..OUT_RATE as usize]));
+        }
+    }
+
+    #[test]
+    fn resampler_follows_a_ramp_and_converts_sector_lengths() {
+        let mut r = Resampler::default();
+        r.set_rate(37_800);
+        let ramp: Vec<Frame> = (0..2016).map(|i| (i as f32, -(i as f32))).collect();
+        let mut out = Vec::new();
+        r.process(&ramp, &mut out);
+        assert_eq!(out.len(), 2016 * 7 / 6);
+        // Catmull-Rom is exact on a line: input i sits at output 7i/6 after the two samples of delay.
+        let (a, b) = (out[100], out[101]);
+        assert!((b.0 - a.0 - 6.0 / 7.0).abs() < 1e-3 && (a.0 + a.1).abs() < 1e-3);
+        let mut c = Resampler::default();
+        c.set_rate(18_900);
+        let mut out = Vec::new();
+        c.process(&vec![(0.0, 0.0); 4032], &mut out);
+        assert_eq!(out.len(), 9408);
+    }
+
+    #[test]
+    fn to_i16_clips_hard() {
+        assert_eq!((to_i16(2.0), to_i16(-2.0), to_i16(0.5)), (32767, -32767, 16383));
+    }
+
+    #[test]
+    fn stream_prefills_pads_and_warns() {
+        const PREFILL: usize = 2048;
+        let mut c = Stream::default();
+        let what = || "test".to_string();
+        c.push(&[(0.5, 0.5); 100], PREFILL, usize::MAX, &what);
+        assert_eq!(c.len(), PREFILL + 100);
+        let mut out = vec![(0.0, 0.0); PREFILL + 150];
+        c.mix_into(&mut out);
+        assert_eq!(out[PREFILL - 1], (0.0, 0.0));
+        assert_eq!(out[PREFILL], (0.5, 0.5));
+        assert_eq!(out[PREFILL + 100], (0.0, 0.0));
+        c.push(&[(0.25, 0.25); 3000], PREFILL, PREFILL + 2000, &what);
+        c.push(&[(0.25, 0.25); 10], PREFILL, PREFILL + 2000, &what);
+        assert_eq!((c.len(), c.restarts, c.warnings), (PREFILL + 3010, 2, 1));
+    }
+
+    #[test]
+    fn mpeg_starts_one_frame_late() {
+        let mut a = CdiAudio::new();
+        a.push_mpeg(&mut VecDeque::from(vec![(0.25, 0.25); 1152]), 44_100);
+        assert_eq!(a.mpeg.len(), MPEG_LATENCY + 1152);
+        a.advance(960, VideoMode::Pal.cycles_per_sector(), None, None);
+        let mut out = Vec::new();
+        a.drain(&mut out);
+        assert_eq!((out[0], out[1]), ((0.0, 0.0), (0.0, 0.0)));
+    }
+
+    #[test]
+    fn output_state_round_trips() {
+        use opencdi::savestate::{Reader, State};
+        let sector = VideoMode::Ntsc.cycles_per_sector();
+        let run = |a: &mut CdiAudio, v: f32| {
+            a.main.push(&[(v, -v); 700], ADPCM_LATENCY, usize::MAX, &String::new);
+            a.push_mpeg(&mut VecDeque::from(vec![(0.2, 0.3); 1152]), 44_100);
+            for _ in 0..262 {
+                a.advance(960, sector, None, None);
+            }
+        };
+        let mut a = CdiAudio::new();
+        run(&mut a, 0.1);
+        let mut buf = Vec::new();
+        a.save(&mut buf);
+        let mut b = CdiAudio::new();
+        b.load(&mut Reader::new(&buf)).unwrap();
+        for _ in 0..8 {
+            run(&mut a, 0.4);
+            run(&mut b, 0.4);
+            let (mut x, mut y) = (Vec::new(), Vec::new());
+            assert_eq!(a.drain(&mut x), b.drain(&mut y));
+            assert_eq!(x, y);
+        }
     }
 }
