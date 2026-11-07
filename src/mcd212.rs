@@ -1,7 +1,7 @@
 pub const SCREEN_WIDTH: usize = 768;
 pub const SCREEN_HEIGHT: usize = 560;
 pub const TOTAL_SCANLINES: usize = 312;
-pub const CYCLES_PER_SCANLINE: u32 = 993; // 15.5 MHz / 15,625 Hz (PAL default)
+pub const CYCLES_PER_SCANLINE: u32 = 960; // 15 MHz CPU / 15,625 Hz (PAL default)
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoMode {
@@ -18,15 +18,25 @@ impl VideoMode {
         }
     }
 
+    // CPU clock is half the video crystal: 30 MHz (PAL) or 30.2098 MHz (NTSC).
+    #[inline]
+    pub fn cpu_clock_hz(self) -> u32 {
+        match self {
+            VideoMode::Pal => 15_000_000,
+            VideoMode::Ntsc => 15_104_900,
+        }
+    }
+
+    // 960 CPU cycles per line on both standards (15,625 Hz PAL, 15,734 Hz NTSC lines).
     #[inline]
     pub fn cycles_per_scanline(self) -> u32 {
-        // SCC68070 Master clock: ~15.5 MHz
-        // PAL line frequency: 15,625 Hz -> 15,500,000 / 15,625 = 992 cycles (use 993)
-        // NTSC line frequency: 15,734 Hz -> 15,500,000 / 15,734 = 985 cycles
-        match self {
-            VideoMode::Pal => 993,
-            VideoMode::Ntsc => 985,
-        }
+        960
+    }
+
+    // One CD sector at 75 sectors per second: 200,000 cycles (PAL) or 201,398 (NTSC).
+    #[inline]
+    pub fn cycles_per_sector(self) -> u32 {
+        self.cpu_clock_hz() / 75
     }
 
     #[inline]
@@ -73,6 +83,7 @@ pub const CSR1W_DD2_SHIFT: u32 = 8;
 pub const CSR2R_IT1: u8 = 0x04; // Interrupt 1
 pub const CSR2R_IT2: u8 = 0x02; // Interrupt 2
 pub const CSR2R_BE: u8 = 0x01;  // Bus Error
+pub const CSRW_DI: u16 = 0x8000; // CSR1W/CSR2W: disable the channel's interrupt request (IT1/IT2 status still set)
 
 pub const DCR_DCA_BIT: u16 = 1 << 8;
 pub const DCR_ICA_BIT: u16 = 1 << 9;
@@ -122,8 +133,6 @@ pub const S_4BPP_DISPLAY_COLOR: [u32; 16] = [
 pub struct Mcd212 {
     pub plane_a: Box<[u8; 512 * 1024]>,
     pub plane_b: Box<[u8; 512 * 1024]>,
-    pub display_plane_a: Box<[u8; 512 * 1024]>,
-    pub display_plane_b: Box<[u8; 512 * 1024]>,
 
     pub csrr: [u8; 2],  // [0] = CSR1R (status ch1), [1] = CSR2R (status ch2)
     pub csrw: [u16; 2], // [0] = CSR1W (control ch1), [1] = CSR2W (control ch2)
@@ -173,6 +182,8 @@ pub struct Mcd212 {
     pub external_video_line: [u32; 768],
     pub external_video_present: [bool; 768],
     pub trace_dca: bool,
+    // Executed ICA/DCA instructions (line, path, word) for the OS-9 tracer's display log; None when off.
+    pub dc_log: Option<Vec<(u16, u8, u32)>>,
 }
 
 impl Mcd212 {
@@ -220,8 +231,6 @@ impl Mcd212 {
         let mut mcd = Self {
             plane_a: vec![0u8; 512 * 1024].into_boxed_slice().try_into().unwrap(),
             plane_b: vec![0u8; 512 * 1024].into_boxed_slice().try_into().unwrap(),
-            display_plane_a: vec![0u8; 512 * 1024].into_boxed_slice().try_into().unwrap(),
-            display_plane_b: vec![0u8; 512 * 1024].into_boxed_slice().try_into().unwrap(),
 
             csrr: [0; 2],
             csrw: [0; 2],
@@ -271,6 +280,7 @@ impl Mcd212 {
             external_video_line: [0xFF00_0000; 768],
             external_video_present: [false; 768],
             trace_dca: false,
+            dc_log: None,
         };
         mcd.init_default_palette();
         mcd
@@ -286,8 +296,6 @@ impl Mcd212 {
     pub fn reset(&mut self) {
         self.plane_a.fill(0);
         self.plane_b.fill(0);
-        self.display_plane_a.fill(0);
-        self.display_plane_b.fill(0);
         self.csrr = [0; 2];
         self.csrw = [0; 2];
         self.dcr = [0; 2];
@@ -322,6 +330,13 @@ impl Mcd212 {
         self.external_video_line.fill(0xFF00_0000);
         self.external_video_present.fill(false);
         self.init_default_palette();
+    }
+
+    /// Interrupt output: IT1 or IT2 set while its channel's disable bit is clear.
+    pub fn int_line(&self) -> bool {
+        let it1 = (self.csrr[1] & CSR2R_IT1) != 0 && (self.csrw[0] & CSRW_DI) == 0;
+        let it2 = (self.csrr[1] & CSR2R_IT2) != 0 && (self.csrw[1] & CSRW_DI) == 0;
+        it1 || it2
     }
 
     pub fn read_reg(&mut self, offset: u32) -> u16 {
@@ -429,7 +444,7 @@ impl Mcd212 {
             return 2;
         }
 
-        // Stalled waiting for the system slot (1 to 5 clocks at 15.5 MHz)
+        // Stalled waiting for the system slot (1 to 5 CPU clocks)
         2 + (((11 - slot_cycle) + 1) >> 1)
     }
 
@@ -489,7 +504,7 @@ impl Mcd212 {
             0xC0 => {
                 if PATH == 0 {
                     if self.image_coding_method != val {
-                        println!(">>> [Scanline {}] ICMR changed from 0x{:08X} to 0x{:08X}", self.scanline, self.image_coding_method, val);
+                        log::debug!(">>> [Scanline {}] ICMR changed from 0x{:08X} to 0x{:08X}", self.scanline, self.image_coding_method, val);
                     }
                     self.image_coding_method = val;
                 }
@@ -650,10 +665,6 @@ impl Mcd212 {
             // End of frame / Start of VBLANK
             self.csrr[0] &= !CSR1R_DA;
 
-            // Stage completed VRAM frame into display planes (eliminates in-flight blitter race/tearing)
-            self.display_plane_a.copy_from_slice(&self.plane_a[..]);
-            self.display_plane_b.copy_from_slice(&self.plane_b[..]);
-
             // Process ICA: Path 1 then Path 0 for correct hardware precedence (Path 0 wins)
             self.process_ica::<1>();
             self.process_ica::<0>();
@@ -766,6 +777,7 @@ impl Mcd212 {
                 ])
             };
             addr += 2;
+            if let Some(log) = self.dc_log.as_mut() { log.push((self.scanline as u16, PATH as u8, cmd)); }
 
             match (cmd >> 24) as u8 {
                 0x00..=0x0F => return, // STOP
@@ -791,7 +803,7 @@ impl Mcd212 {
                 0x60..=0x6F => {
                     // INTERRUPT
                     self.csrr[1] |= 1 << (2 - PATH);
-                    self.vblank_irq = true;
+                    self.vblank_irq |= (self.csrw[PATH] & CSRW_DI) == 0;
                 }
                 0x78..=0x7F => {
                     // RELOAD DISPLAY PARAMETERS
@@ -836,6 +848,7 @@ impl Mcd212 {
                 ])
             };
             addr += 2;
+            if let Some(log) = self.dc_log.as_mut() { log.push((self.scanline as u16, PATH as u8, cmd)); }
             count += 4;
 
             if trace_this {
@@ -863,7 +876,7 @@ impl Mcd212 {
                 0x60..=0x6F => {
                     // INTERRUPT
                     self.csrr[1] |= 1 << (2 - PATH);
-                    self.vblank_irq = true;
+                    self.vblank_irq |= (self.csrw[PATH] & CSRW_DI) == 0;
                 }
                 0x78..=0x7F => {
                     // RELOAD DISPLAY PARAMETERS
@@ -958,9 +971,9 @@ impl Mcd212 {
         if icm == ICM_DYUV {
             let mut x = 0;
             while x < width {
-                let byte0 = if PATH == 0 { self.display_plane_a[(vsr & 0x0007_FFFF) as usize] } else { self.display_plane_b[(vsr & 0x0007_FFFF) as usize] };
+                let byte0 = if PATH == 0 { self.plane_a[(vsr & 0x0007_FFFF) as usize] } else { self.plane_b[(vsr & 0x0007_FFFF) as usize] };
                 vsr += 1;
-                let byte1 = if PATH == 0 { self.display_plane_a[(vsr & 0x0007_FFFF) as usize] } else { self.display_plane_b[(vsr & 0x0007_FFFF) as usize] };
+                let byte1 = if PATH == 0 { self.plane_a[(vsr & 0x0007_FFFF) as usize] } else { self.plane_b[(vsr & 0x0007_FFFF) as usize] };
                 vsr += 1;
 
                 let y2 = y.wrapping_add(self.delta_y_lut[byte0 as usize]);
@@ -973,8 +986,8 @@ impl Mcd212 {
                 let b0 = self.dyuv_limit_lut[(0x100 + y2 as isize + self.dyuv_u_to_b[u as usize] as isize).clamp(0, 0x2FF) as usize];
                 let color0 = 0xFF00_0000 | (r0 << 16) | (g0 << 8) | b0;
 
-                let byte2 = if PATH == 0 { self.display_plane_a[(vsr & 0x0007_FFFF) as usize] } else { self.display_plane_b[(vsr & 0x0007_FFFF) as usize] };
-                let byte3 = if PATH == 0 { self.display_plane_a[((vsr + 1) & 0x0007_FFFF) as usize] } else { self.display_plane_b[((vsr + 1) & 0x0007_FFFF) as usize] };
+                let byte2 = if PATH == 0 { self.plane_a[(vsr & 0x0007_FFFF) as usize] } else { self.plane_b[(vsr & 0x0007_FFFF) as usize] };
+                let byte3 = if PATH == 0 { self.plane_a[((vsr + 1) & 0x0007_FFFF) as usize] } else { self.plane_b[((vsr + 1) & 0x0007_FFFF) as usize] };
                 let u8 = u.wrapping_add(self.delta_uv_lut[byte2 as usize]);
                 let v8 = v.wrapping_add(self.delta_uv_lut[byte3 as usize]);
                 let u6 = (u >> 1) + (u8 >> 1) + (u & u8 & 1);
@@ -1006,11 +1019,11 @@ impl Mcd212 {
             let mut x = 0;
             while x < width {
                 let mut rgb_tp_bit = false;
-                let byte = if PATH == 0 { self.display_plane_a[(vsr & 0x0007_FFFF) as usize] } else { self.display_plane_b[(vsr & 0x0007_FFFF) as usize] };
+                let byte = if PATH == 0 { self.plane_a[(vsr & 0x0007_FFFF) as usize] } else { self.plane_b[(vsr & 0x0007_FFFF) as usize] };
                 vsr += 1;
 
                 let (color0, color1) = if icm == ICM_RGB555 && PATH == 1 {
-                    let byte1 = self.display_plane_a[(vsr2 & 0x0007_FFFF) as usize];
+                    let byte1 = self.plane_a[(vsr2 & 0x0007_FFFF) as usize];
                     vsr2 += 1;
                     let blue = ((byte & 0x1F) as u32) << 3;
                     let green = (((byte & 0xE0) as u32) >> 2) + (((byte1 & 0x03) as u32) << 6);
@@ -1031,7 +1044,7 @@ impl Mcd212 {
                 let mut length_m = if mosaic_enable { mosaic_factor * 2 } else { 2 };
                 if decoding_mode == DDR_FT_RLE {
                     let length = if (byte & 0x80) != 0 {
-                        let l = if PATH == 0 { self.display_plane_a[(vsr & 0x0007_FFFF) as usize] } else { self.display_plane_b[(vsr & 0x0007_FFFF) as usize] };
+                        let l = if PATH == 0 { self.plane_a[(vsr & 0x0007_FFFF) as usize] } else { self.plane_b[(vsr & 0x0007_FFFF) as usize] };
                         vsr += 1;
                         l as usize
                     } else {
@@ -1159,9 +1172,8 @@ impl Mcd212 {
             let mixed_g = (weighted_a_g + weighted_b_g + 16).clamp(0, 255);
             let mixed_b = (weighted_a_b + weighted_b_b + 16).clamp(0, 255);
 
-            let out_r = (((mixed_r - 16) * 298 + 128) >> 8).clamp(0, 255) as u32;
-            let out_g = (((mixed_g - 16) * 298 + 128) >> 8).clamp(0, 255) as u32;
-            let out_b = (((mixed_b - 16) * 298 + 128) >> 8).clamp(0, 255) as u32;
+            // Output stays at studio level (black 16, white 235), no range expansion.
+            let (out_r, out_g, out_b) = (mixed_r as u32, mixed_g as u32, mixed_b as u32);
 
             out[x] = 0xFF00_0000 | (out_r << 16) | (out_g << 8) | out_b;
         }
@@ -1261,5 +1273,51 @@ impl Mcd212 {
             let start = (y_offset + active_lines * 2) * SCREEN_WIDTH;
             self.framebuffer[start..].fill(0xFF00_0000);
         }
+    }
+}
+
+opencdi::impl_state_enum!(VideoMode { Pal = 0, Ntsc = 1 });
+
+opencdi::impl_state!(Mcd212 {
+    plane_a, plane_b,
+    csrr, csrw, dcr, vsr, ddr, dcp, dca,
+    clut, clut_bank, image_coding_method, transparency_control, plane_order, transparent_color, mask_color, dyuv_abs_start,
+    cursor_position, cursor_control, cursor_pattern, matte_control, backdrop_color, mosaic_hold, weight_factor, matte_flag,
+    blink_time, blink_active,
+    framebuffer, interlace_field,
+    scanline, scanline_cycles, vblank_irq, video_mode, external_video_line, external_video_present,
+} skip {
+    s_4bpp_color, delta_y_lut, delta_uv_lut, dyuv_limit_lut, dyuv_u_to_b, dyuv_u_to_g, dyuv_v_to_g, dyuv_v_to_r, trace_dca, dc_log,
+});
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Channel 1 ICA at 0x400: INTERRUPT, then reload DCP and stop.
+    fn mcd_with_int() -> Mcd212 {
+        let mut m = Mcd212::new();
+        m.dcr[0] = DCR_ICA_BIT;
+        m.plane_a[0x400..0x408].copy_from_slice(&[0x60, 0, 0, 0, 0x30, 0, 0, 0]);
+        m
+    }
+
+    #[test]
+    fn interrupt_disable_bit_gates_request_not_status() {
+        let mut m = mcd_with_int();
+        m.write_reg(0x10, CSRW_DI | 0x0003);
+        m.tick_scanline(0);
+        assert_eq!(m.csrr[1] & CSR2R_IT1, CSR2R_IT1);
+        assert!(!m.vblank_irq && !m.int_line());
+        assert_eq!(m.read_reg(0x00) & 0x07, CSR2R_IT1 as u16);
+        assert_eq!(m.csrr[1] & CSR2R_IT1, 0);
+
+        let mut m = mcd_with_int();
+        m.write_reg(0x10, 0x0003);
+        m.write_reg(0x00, CSRW_DI);
+        m.tick_scanline(0);
+        assert!(m.vblank_irq && m.int_line());
+        m.read_reg(0x00);
+        assert!(!m.int_line());
     }
 }

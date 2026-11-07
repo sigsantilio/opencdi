@@ -56,7 +56,7 @@ L'obiettivo del progetto è preservare e rendere fruibile la libreria software e
 ## Come Compilare ed Eseguire
 
 ### Prerequisiti
-- [Rust & Cargo](https://rustup.rs/) (versione 1.70 o superiore).
+- [Rust & Cargo](https://rustup.rs/) (versione 1.93 o superiore).
 
 ### Compilazione
 ```bash

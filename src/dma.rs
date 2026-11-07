@@ -36,8 +36,9 @@ impl SccDma {
             0x0A => ch.transfer_counter,
             0x0C => (ch.memory_address_counter >> 16) as u16,
             0x0E => (ch.memory_address_counter & 0xFFFF) as u16,
-            0x14 => (ch.device_address_counter >> 16) as u16,
-            0x16 => (ch.device_address_counter & 0xFFFF) as u16,
+            // The device address counter exists on the second channel only.
+            0x14 if ch_idx == 1 => (ch.device_address_counter >> 16) as u16,
+            0x16 if ch_idx == 1 => (ch.device_address_counter & 0xFFFF) as u16,
             _ => 0,
         }
     }
@@ -61,9 +62,9 @@ impl SccDma {
             0x06 => {
                 ch.sequence_control = (val >> 8) as u8;
                 ch.channel_control = (val & 0x7F) as u8;
-                // If software operation bit set, flag complete
+                // Start: channel active (CA) until the device completes it (COC); with no words left it completes at once.
                 if (val & 0x80) != 0 {
-                    ch.channel_status |= 0x80;
+                    ch.channel_status = if ch.transfer_counter == 0 { (ch.channel_status & !0x08) | 0x80 } else { (ch.channel_status & !0x80) | 0x08 };
                 }
             }
             0x0A => {
@@ -75,13 +76,37 @@ impl SccDma {
             0x0E => {
                 ch.memory_address_counter = (ch.memory_address_counter & 0xFFFF_0000) | (val as u32);
             }
-            0x14 => {
+            0x14 if ch_idx == 1 => {
                 ch.device_address_counter = (ch.device_address_counter & 0x0000_FFFF) | ((val as u32) << 16);
             }
-            0x16 => {
+            0x16 if ch_idx == 1 => {
                 ch.device_address_counter = (ch.device_address_counter & 0xFFFF_0000) | (val as u32);
             }
             _ => {}
         }
+    }
+}
+
+opencdi::impl_state!(DmaChannel {
+    channel_status, channel_error, device_control, operation_control, sequence_control, channel_control,
+    transfer_counter, memory_address_counter, device_address_counter,
+} skip {});
+
+opencdi::impl_state!(SccDma { channels } skip {});
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_clears_by_byte_and_first_channel_has_no_device_counter() {
+        let mut d = SccDma::new();
+        d.channels[0].channel_status = 0xB0;
+        d.channels[0].channel_error = 0x05;
+        d.write_reg(0x00, 0x8000);
+        assert_eq!(d.read_reg(0x00), 0x3005);
+        d.write_reg(0x14, 0x1234);
+        d.write_reg(0x54, 0x1234);
+        assert_eq!((d.read_reg(0x14), d.read_reg(0x54)), (0, 0x1234));
     }
 }

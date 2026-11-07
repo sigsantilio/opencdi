@@ -633,7 +633,7 @@ fn main() {
             cycle_debt = (line_cycles - cyc_per_line as i32).clamp(0, 100);
             bus.render_scanline(_line);
 
-            // Clock real-time peripherals (Slave MCU, CDIC, DVC) strictly at 15.5 MHz master clock
+            // Clock real-time peripherals (Slave MCU, CDIC, DVC) on the CPU clock
             bus.tick_slave(cyc_per_line);
             bus.tick_cdic(cyc_per_line);
             bus.tick_dvc(cyc_per_line);

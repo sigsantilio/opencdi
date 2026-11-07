@@ -320,8 +320,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  CLUT Bank: {:?}, Backdrop: 0x{:02X}", bus.mcd212.clut_bank, bus.mcd212.backdrop_color);
             println!("  TP Color: 0x{:06X} / 0x{:06X}, Mask: 0x{:06X} / 0x{:06X}", bus.mcd212.transparent_color[0], bus.mcd212.transparent_color[1], bus.mcd212.mask_color[0], bus.mcd212.mask_color[1]);
             println!("  WF[0][0]={} WF[1][0]={}", bus.mcd212.weight_factor[0][0], bus.mcd212.weight_factor[1][0]);
-            let nz_a = bus.mcd212.display_plane_a.iter().filter(|&&b| b != 0).count();
-            let nz_b = bus.mcd212.display_plane_b.iter().filter(|&&b| b != 0).count();
+            let nz_a = bus.mcd212.plane_a.iter().filter(|&&b| b != 0).count();
+            let nz_b = bus.mcd212.plane_b.iter().filter(|&&b| b != 0).count();
             let clut_nz = bus.mcd212.clut.iter().filter(|&&c| (c & 0xFFFFFF) != 0).count();
             println!("  Plane A nz={}, Plane B nz={}, CLUT nz={}, FB nz={}", nz_a, nz_b, clut_nz, nz);
         }

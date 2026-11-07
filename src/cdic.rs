@@ -5,7 +5,7 @@ use crate::audio::CdiAudio;
 pub const CDIC_RAM_SIZE: usize = 0x3C00; // 15360 bytes
 
 // Generate Yellow Book scrambler table (2448 bytes)
-fn generate_sector_scramble() -> [u8; 2448] {
+pub fn generate_sector_scramble() -> [u8; 2448] {
     let mut table = [0u8; 2448];
     let mut reg: u16 = 0x0001;
 
@@ -319,9 +319,7 @@ impl Cdic {
         if is_seek {
             self.audio.left_state.reset();
             self.audio.right_state.reset();
-            if let Ok(mut q) = self.audio.sample_queue.lock() {
-                q.clear();
-            }
+            self.audio.main.clear();
         }
 
         info!(
@@ -450,15 +448,12 @@ impl Cdic {
         }
     }
 
-    pub fn step_cycles(&mut self, cycles: u32, cdrom: &mut Option<CdRom>) {
-        // CD-i 1x Red/Green Book read speed = 75 sectors/sec
-        // At 15,500,000 cycles/sec (SCC68070 master clock): 15,500,000 / 75 = 206,667 cycles/sector
-        const CYCLES_PER_SECTOR: u32 = 206_700;
-
+    // `sector_cycles` is one sector at 1x speed (75 per second) in CPU cycles of the current video standard.
+    pub fn step_cycles(&mut self, cycles: u32, sector_cycles: u32, cdrom: &mut Option<CdRom>) {
         // 1. Audio tick (75 Hz) for audio maps
         self.audio_cycle_accumulator += cycles;
-        while self.audio_cycle_accumulator >= CYCLES_PER_SECTOR {
-            self.audio_cycle_accumulator -= CYCLES_PER_SECTOR;
+        while self.audio_cycle_accumulator >= sector_cycles {
+            self.audio_cycle_accumulator -= sector_cycles;
 
             if self.audio_map_counter > 0 {
                 self.audio_map_counter -= 1;
@@ -475,8 +470,8 @@ impl Cdic {
         }
 
         self.cycle_accumulator += cycles;
-        while self.cycle_accumulator >= CYCLES_PER_SECTOR {
-            self.cycle_accumulator -= CYCLES_PER_SECTOR;
+        while self.cycle_accumulator >= sector_cycles {
+            self.cycle_accumulator -= sector_cycles;
 
             if self.disc_spinup_counter > 0 {
                 self.disc_spinup_counter -= 1;
@@ -821,3 +816,14 @@ impl Cdic {
         }
     }
 }
+
+opencdi::impl_state!(Cdic {
+    ram, audio,
+    command, time, file, channel, audio_channel, audio_buffer, x_buffer, dma_control, z_buffer, interrupt_vector, data_buffer,
+    disc_command, disc_mode, disc_spinup_counter, curr_lba,
+    decoding_audio_map, decode_addr, audio_sector_counter, audio_map_counter, audio_format_sectors, audio_cycle_accumulator,
+    cycle_accumulator, irq_pending, dma_triggered,
+    cd_byteswap,
+} skip {
+    scramble_table,
+});

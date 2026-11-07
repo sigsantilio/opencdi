@@ -1,8 +1,10 @@
 // OpenCDi Release Build - 2026-09-29 15:45
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 use std::path::{Path, PathBuf};
-use log::{info, error};
-use std::collections::HashSet;
+use log::{info, error, warn};
+use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -12,12 +14,14 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode as Key, ModifiersState, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
-use opencdi::audio::HostAudioOutput;
+use opencdi::audio::{self, Frame, HostAudioOutput};
 use opencdi::frontend::{pop_action, push_action, GuiAction, InputDeviceMode, KeyBindings};
 #[cfg(target_os = "windows")]
 use opencdi::gui;
+use opencdi::bios;
 use opencdi::machine::Machine;
 use opencdi::mcd212::{SCREEN_WIDTH, SCREEN_HEIGHT, VideoMode};
+use opencdi::savestate::{Reader, State, StateError};
 
 #[cfg(target_os = "windows")]
 #[link(name = "winmm")]
@@ -94,17 +98,6 @@ Usage: opencdi [options] [disc image (cue, chd, iso, bin)]
 ";
 
 
-fn savestate_path_for(game_name: &str, slot: usize) -> PathBuf {
-    let safe_name: String = game_name
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' || c == '(' || c == ')' { c } else { '_' })
-        .collect();
-    let trimmed = safe_name.trim();
-    let base = if trimmed.is_empty() { "cdi_bios" } else { trimmed };
-    let _ = std::fs::create_dir_all("savestates");
-    PathBuf::from("savestates").join(format!("{}_slot{}.st", base, slot))
-}
-
 fn default_nvram_save_path() -> PathBuf {
     if let Some(p) = find_nvram_file() {
         return p;
@@ -154,23 +147,39 @@ fn find_bios_rom() -> Option<PathBuf> {
     const BIOS_CANDIDATES: &[&str] = &[
         "bios/cdi220b.rom",
         "cdi220b.rom",
-        "bios/cdi220.rom",
-        "cdi220.rom",
         "bios/cdi200.rom",
         "cdi200.rom",
+        "bios/cdimono1.zip",
+        "cdimono1.zip",
+        "bios/cdibios.zip",
+        "cdibios.zip",
         "bios/cdi.rom",
         "cdi.rom",
+        "bios/cdi220.rom",
+        "cdi220.rom",
         "bios/cdi490a.rom",
         "cdi490a.rom",
+        "bios/cdi490a.zip",
+        "cdi490a.zip",
     ];
-    for &name in BIOS_CANDIDATES {
-        if let Some(p) = find_file(name) {
-            return Some(p);
+    // Each found file is checked; the best one wins and a Mono-IV image is still the last resort.
+    let mut seen = HashSet::new();
+    let found = BIOS_CANDIDATES.iter().filter_map(|n| find_file(n)).filter(|p| seen.insert(p.clone())).filter_map(|p| {
+        match Machine::read_bios(&p) {
+            Ok((_, img)) => {
+                info!("BIOS candidate {:?} [{}]: {}", p, img.report.status, img.report.message);
+                Some((p, img))
+            }
+            Err(e) => {
+                warn!("BIOS candidate {:?}: {}", p, e);
+                None
+            }
         }
-    }
-    None
+    });
+    bios::best(found).filter(|(_, img)| img.report.status != bios::Status::Error).map(|(p, _)| p)
 }
 
+// First candidate that passes the cartridge check; refused files are logged with the reason.
 fn find_dvc_rom() -> Option<PathBuf> {
     const DVC_CANDIDATES: &[&str] = &[
         "dvc/vmpega.rom",
@@ -181,8 +190,11 @@ fn find_dvc_rom() -> Option<PathBuf> {
         "impega.rom",
     ];
     for &name in DVC_CANDIDATES {
-        if let Some(p) = find_file(name) {
-            return Some(p);
+        let Some(p) = find_file(name) else { continue };
+        match Machine::read_dvc(&p) {
+            Ok((_, img)) if img.report.status != bios::Status::Error => return Some(p),
+            Ok((_, img)) => warn!("DVC ROM {:?} refused: {}", p, img.report.message),
+            Err(e) => warn!("DVC ROM {:?}: {}", p, e),
         }
     }
     None
@@ -236,12 +248,54 @@ fn save_screenshot(frame_count: u64, framebuffer: &[u32]) {
     }
 }
 
-// F8: binary PPM (no image crate needed) into screenshots/ next to the binary
+// Savestates go into local/states when run from the repo, else states/ next to the binary
+fn states_dir() -> PathBuf {
+    if Path::new("local").is_dir() {
+        PathBuf::from("local").join("states")
+    } else {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("states")))
+            .unwrap_or_else(|| PathBuf::from("states"))
+    }
+}
+
+// RetroArch naming: slot 0 is <name>.state, slot N is <name>.stateN
+fn state_path(dir: &Path, game: &str, slot: u32) -> PathBuf {
+    let name: String = game.chars().map(|c| if c.is_alphanumeric() || " ()-_.,'&!".contains(c) { c } else { '_' }).collect();
+    let name = if name.is_empty() { "opencdi".to_string() } else { name };
+    if slot == 0 { dir.join(format!("{}.state", name)) } else { dir.join(format!("{}.state{}", name, slot)) }
+}
+
+// Written to a temporary file first so a crash never leaves a half-written slot
+fn write_state_file(path: &Path, m: &Machine, frontend: &[u8]) -> std::io::Result<usize> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut buf = Vec::new();
+    m.save_state(frontend, &mut buf);
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &buf)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(buf.len())
+}
+
+// Returns the frontend bytes; the machine is unchanged on any error
+fn read_state_file(path: &Path, m: &mut Machine) -> Result<Vec<u8>, String> {
+    let data = std::fs::read(path).map_err(|e| e.to_string())?;
+    m.load_state(&data).map(|fe| fe.to_vec()).map_err(|e: StateError| e.to_string())
+}
+
+// F8: binary PPM (no image crate needed) into local/screenshots when run from the repo, else screenshots/ next to the binary
 fn save_screenshot_ppm(frame_count: u64, framebuffer: &[u32]) {
-    let dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("screenshots")))
-        .unwrap_or_else(|| PathBuf::from("screenshots"));
+    let dir = if Path::new("local").is_dir() {
+        PathBuf::from("local").join("screenshots")
+    } else {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("screenshots")))
+            .unwrap_or_else(|| PathBuf::from("screenshots"))
+    };
     if let Err(e) = std::fs::create_dir_all(&dir) {
         error!("Cannot create screenshot directory {:?}: {}", dir, e);
         return;
@@ -309,13 +363,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let error_msg =
                 "OpenCDi - Required System BIOS Missing\n\
                 ======================================\n\n\
-                The emulator cannot start because no Philips CD-i system BIOS ROM was found.\n\n\
+                The emulator cannot start because no usable Philips CD-i system BIOS ROM was found (see the log and doc/bios-dumping.md).\n\n\
                 Recommended File:\n\
                   • cdi220b.rom (512 KB, Philips CD-i 220 European PAL BIOS)\n\
                     SHA-1: 53360A1F21DDAC952E95306CED64186A3FC0B93E\n\
                     MD5:   AC0D468BE366779C9DF633BE98DA250A\n\n\
                 Alternative Supported BIOSes:\n\
-                  • cdi220.rom, cdi200.rom, cdi490a.rom\n\n\
+                  • cdi200.rom, cdi.rom, cdimono1.zip / cdibios.zip\n\
+                  • cdi220.rom is a truncated dump; cdi490a.rom (CD-i 490) is experimental\n\n\
                 Where to place the BIOS ROM:\n\
                   1. In a 'bios/' subfolder next to opencdi.exe\n\
                   2. OR directly in the same folder as opencdi.exe\n\
@@ -347,7 +402,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     match m.load_bios(&bios_path) {
-        Ok(()) => info!("Loaded system BIOS from {:?}", bios_path),
+        Ok(r) if r.status == bios::Status::Ok => info!("Loaded system BIOS from {:?}: {}", bios_path, r.message),
+        Ok(r) => warn!("Loaded system BIOS from {:?} [{}]: {}", bios_path, r.status, r.message),
         Err(e) => {
             error!("Cannot use system BIOS {:?}: {}", bios_path, e);
             eprintln!("Cannot use system BIOS {:?}: {}", bios_path, e);
@@ -358,6 +414,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Load NVRAM if present
     let nvram_arg = args.iter().position(|a| a == "--nvram").and_then(|i| args.get(i + 1)).map(PathBuf::from);
     let resolved_nvram_path = nvram_arg.unwrap_or_else(default_nvram_save_path);
+    m.bus.nvram.save_path = resolved_nvram_path.clone();
     if resolved_nvram_path.is_file() {
         if let Err(e) = m.bus.nvram.load_from_file(&resolved_nvram_path) {
             log::warn!("Impossibile caricare NVRAM da {:?}: {:?}", resolved_nvram_path, e);
@@ -371,7 +428,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dvc_arg = flag_value("--dvc").map(PathBuf::from);
     if !dvc_disabled {
         if let Some(dvc_path) = dvc_arg.clone().or_else(find_dvc_rom) {
-            if let Ok(_) = m.load_dvc_rom(&dvc_path) {
+            if let Ok(_) = m.load_dvc(&dvc_path) {
                 info!("Loaded Digital Video Cartridge (DVC) ROM from {:?}", dvc_path);
             }
         } else {
@@ -442,13 +499,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input_device_mode = if has_flag("--mouse") { InputDeviceMode::Mouse } else { InputDeviceMode::Gamepad };
 
     // 6. Initialize Host Audio Playback
-    let host_audio = HostAudioOutput::try_start(
-        m.bus.cdic.audio.sample_queue.clone(),
-        m.bus.cdic.audio.sfx_queue.clone(),
-        m.bus.cdic.audio.dvc_queue.clone(),
-        m.bus.cdic.audio.source_rate.clone(),
-        m.bus.cdic.audio.dvc_rate.clone(),
-    );
+    let audio_ring: Arc<Mutex<VecDeque<Frame>>> = Arc::new(Mutex::new(VecDeque::with_capacity(audio::RING_CAP)));
+    let audio_gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+    let host_audio = HostAudioOutput::try_start(audio_ring.clone(), audio_gain.clone());
 
     // 7. Initialize USB Gamepad subsystem (Gilrs / XInput / DirectInput)
     let gilrs = gilrs::Gilrs::new().ok();
@@ -456,7 +509,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("USB Gamepad subsystem active (Xbox / PlayStation / Generic USB)");
     }
 
-    m.bus.emulate_wait_states = true; // Authentic hardware wait-states (15.5 MHz)
+    m.bus.emulate_wait_states = true; // Authentic hardware wait-states
     let (pad_x, pad_y) = if m.bus.cdrom.is_some() { (575, 335) } else { (384, 280) };
     let prev_vsr = (m.bus.mcd212.get_vsr::<0>(), m.bus.mcd212.get_vsr::<1>());
     let now = Instant::now();
@@ -475,6 +528,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         windowed: None,
         restore_check: None,
         _host_audio: host_audio,
+        audio_ring,
+        audio_gain,
+        audio_buf: Vec::new(),
+        volume: 1.0,
+        muted: false,
         gilrs,
         keys: HashSet::new(),
         mods: ModifiersState::empty(),
@@ -492,6 +550,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         paused: false,
         fast_forward: false,
         last_present: now,
+        state_slot: 0,
         occluded: false,
         grab_applied: None,
         frame_count: 0,
@@ -518,7 +577,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         measured_cd_rate: 0.0,
     };
 
-    info!("Emulation loop started. Shortcuts: [F11]/[Alt+Enter] Fullscreen, [F5]/[H] Reset, [P] Pause, [Space] hold Fast-forward, [F8] Screenshot (PPM), [F12] Screenshot (BMP), [M] Mute, [+]/[-] Volume, [Ctrl+I] Insert Disc, [Ctrl+O] Open & Reset, [Middle Click] Capture/Release Mouse, [Esc] Quit");
+    info!("Emulation loop started. Shortcuts: [F11]/[Alt+Enter] Fullscreen, [F5]/[H] Reset, [P] Pause, [Space] hold Fast-forward, [F8] Screenshot (PPM), [F12] Screenshot (BMP), [F2]/[F4] Save/Load state, [F6]/[F7] State slot, [M] Mute, [+]/[-] Volume, [Ctrl+I] Insert Disc, [Ctrl+O] Open & Reset, [Middle Click] Capture/Release Mouse, [Esc] Quit");
 
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut app)?;
@@ -615,6 +674,11 @@ struct App {
     windowed: Option<(Option<PhysicalPosition<i32>>, PhysicalSize<u32>)>,
     restore_check: Option<Instant>,
     _host_audio: Option<HostAudioOutput>,
+    audio_ring: Arc<Mutex<VecDeque<Frame>>>,
+    audio_gain: Arc<AtomicU32>,
+    audio_buf: Vec<Frame>,
+    volume: f32,
+    muted: bool,
     gilrs: Option<gilrs::Gilrs>,
     keys: HashSet<Key>,
     mods: ModifiersState,
@@ -634,6 +698,7 @@ struct App {
     paused: bool,
     fast_forward: bool,
     last_present: Instant,
+    state_slot: u32,
     grab_applied: Option<bool>,
     frame_count: u64,
     frames_run: u64,
@@ -762,14 +827,61 @@ impl App {
         [b.up, b.down, b.left, b.right, b.btn1, b.btn2].contains(&k)
     }
 
+    // Host-side input and autoplay state saved alongside the machine so a load does not re-run autoplay clicks
+    fn frontend_state(&self) -> Vec<u8> {
+        let mut w = Vec::new();
+        (self.frame_count, self.disc_launched, self.shell_ready_count).save(&mut w);
+        (self.pad_x, self.pad_y, self.prev_key_btn).save(&mut w);
+        (self.pad_x_f, self.pad_y_f).save(&mut w);
+        w
+    }
+
+    fn set_frontend_state(&mut self, data: &[u8]) -> Result<(), StateError> {
+        let mut r = Reader::new(data);
+        let mut a = (self.frame_count, self.disc_launched, self.shell_ready_count);
+        let mut b = (self.pad_x, self.pad_y, self.prev_key_btn);
+        let mut c = (self.pad_x_f, self.pad_y_f);
+        a.load(&mut r)?;
+        b.load(&mut r)?;
+        c.load(&mut r)?;
+        (self.frame_count, self.disc_launched, self.shell_ready_count) = a;
+        (self.pad_x, self.pad_y, self.prev_key_btn) = b;
+        (self.pad_x_f, self.pad_y_f) = c;
+        Ok(())
+    }
+
+    fn state_file(&self) -> PathBuf {
+        state_path(&states_dir(), &self.current_game_name, self.state_slot)
+    }
+
+    fn save_state(&mut self) {
+        let path = self.state_file();
+        match write_state_file(&path, &self.m, &self.frontend_state()) {
+            Ok(n) => info!("State slot {} saved to {:?} ({} bytes)", self.state_slot, path, n),
+            Err(e) => error!("State slot {} not saved to {:?}: {}", self.state_slot, path, e),
+        }
+    }
+
+    fn load_state(&mut self) {
+        let path = self.state_file();
+        match read_state_file(&path, &mut self.m) {
+            Ok(fe) => {
+                if let Err(e) = self.set_frontend_state(&fe) {
+                    error!("State slot {}: frontend section unreadable ({}); autoplay state kept", self.state_slot, e);
+                }
+                self.reset_telemetry();
+                info!("State slot {} loaded from {:?}", self.state_slot, path);
+            }
+            Err(e) => error!("State slot {} not loaded from {:?}: {}", self.state_slot, path, e),
+        }
+    }
+
     fn on_key_pressed(&mut self, el: &ActiveEventLoop, code: Key) {
         let ctrl = self.mods.control_key();
         let alt = self.mods.alt_key();
         match code {
             Key::Escape => el.exit(),
             Key::F1 => push_action(GuiAction::OpenFeedback),
-            Key::F6 => push_action(GuiAction::QuickSaveState),
-            Key::F7 => push_action(GuiAction::QuickLoadState),
             Key::F9 => {
                 let next_mode = match self.input_device_mode {
                     InputDeviceMode::Gamepad => InputDeviceMode::Mouse,
@@ -791,9 +903,17 @@ impl App {
             Key::Enter | Key::NumpadEnter if alt => self.toggle_fullscreen(),
             Key::F8 => save_screenshot_ppm(self.frame_count, &self.m.bus.mcd212.framebuffer[..]),
             Key::F12 => save_screenshot(self.frame_count, &self.m.bus.mcd212.framebuffer[..]),
+            Key::F2 => self.save_state(),
+            Key::F4 => self.load_state(),
+            Key::F6 | Key::F7 => {
+                self.state_slot = if code == Key::F6 { self.state_slot.saturating_sub(1) } else { (self.state_slot + 1).min(999) };
+                info!("State slot: {} ({:?})", self.state_slot, self.state_file());
+                self.refresh_title();
+            }
             Key::KeyM if !self.bound(code) => {
-                self.m.bus.cdic.audio.muted = !self.m.bus.cdic.audio.muted;
-                info!("Audio: {}", if self.m.bus.cdic.audio.muted { "MUTED" } else { "UNMUTED" });
+                self.muted = !self.muted;
+                self.publish_gain();
+                info!("Audio: {}", if self.muted { "MUTED" } else { "UNMUTED" });
             }
             _ => {}
         }
@@ -828,7 +948,7 @@ impl App {
 
                             if !self.dvc_disabled && !self.m.bus.dvc.is_fitted() {
                                 if let Some(dvc_path) = self.dvc_arg.clone().or_else(find_dvc_rom) {
-                                    if let Ok(_) = self.m.load_dvc_rom(&dvc_path) {
+                                    if let Ok(_) = self.m.load_dvc(&dvc_path) {
                                         info!("Loaded Digital Video Cartridge (DVC) extension from {:?}", dvc_path);
                                         #[cfg(target_os = "windows")]
                                         gui::update_dvc_menu(true);
@@ -913,14 +1033,17 @@ impl App {
                     info!("Mouse capture: {}", if self.mouse_captured { "CAPTURED" } else { "RELEASED" });
                 }
                 GuiAction::ToggleMute => {
-                    self.m.bus.cdic.audio.muted = !self.m.bus.cdic.audio.muted;
-                    info!("Audio: {}", if self.m.bus.cdic.audio.muted { "MUTED" } else { "UNMUTED" });
+                    self.muted = !self.muted;
+                    self.publish_gain();
+                    info!("Audio: {}", if self.muted { "MUTED" } else { "UNMUTED" });
                 }
                 GuiAction::VolumeUp => {
-                    self.m.bus.cdic.audio.volume = (self.m.bus.cdic.audio.volume + 0.05).min(2.0);
+                    self.volume = (self.volume + 0.05).min(2.0);
+                    self.publish_gain();
                 }
                 GuiAction::VolumeDown => {
-                    self.m.bus.cdic.audio.volume = (self.m.bus.cdic.audio.volume - 0.05).max(0.0);
+                    self.volume = (self.volume - 0.05).max(0.0);
+                    self.publish_gain();
                 }
                 GuiAction::ToggleFullscreen => {
                     self.toggle_fullscreen();
@@ -949,7 +1072,7 @@ impl App {
                         gui::update_dvc_menu(false);
                     } else {
                         if let Some(dvc_path) = self.dvc_arg.clone().or_else(find_dvc_rom) {
-                            if let Ok(_) = self.m.load_dvc_rom(&dvc_path) {
+                            if let Ok(_) = self.m.load_dvc(&dvc_path) {
                                 info!("Inserted Digital Video Cartridge (DVC) from {:?}", dvc_path);
                                 #[cfg(target_os = "windows")]
                                 gui::update_dvc_menu(true);
@@ -970,43 +1093,17 @@ impl App {
                     #[cfg(target_os = "windows")]
                     gui::post_menu_command(self.hwnd(), gui::ID_HELP_ABOUT);
                 }
-                GuiAction::QuickSaveState => {
-                    let st_path = savestate_path_for(&self.current_game_name, 1);
-                    match opencdi::savestate::save_state_to_file(&st_path, &self.m.cpu, &self.m.bus, self.disc_launched, self.shell_ready_count, self.pad_x, self.pad_y) {
-                        Ok(_) => info!("Quick Save State (Slot 1) salvato con successo: {:?}", st_path),
-                        Err(e) => error!("Errore salvataggio Quick Save State (Slot 1): {:?}", e),
+                GuiAction::QuickSaveState | GuiAction::SaveState(_) | GuiAction::QuickLoadState | GuiAction::LoadState(_) => {
+                    self.state_slot = match action {
+                        GuiAction::SaveState(slot) | GuiAction::LoadState(slot) => slot as u32,
+                        _ => 1,
+                    };
+                    if matches!(action, GuiAction::QuickSaveState | GuiAction::SaveState(_)) {
+                        self.save_state();
+                    } else {
+                        self.load_state();
                     }
-                }
-                GuiAction::QuickLoadState => {
-                    let st_path = savestate_path_for(&self.current_game_name, 1);
-                    match opencdi::savestate::load_state_from_file(&st_path, &mut self.m.cpu, &mut self.m.bus, &mut self.disc_launched, &mut self.shell_ready_count, &mut self.pad_x, &mut self.pad_y) {
-                        Ok(_) => {
-                            self.pad_x_f = self.pad_x as f32;
-                            self.pad_y_f = self.pad_y as f32;
-                            self.reset_telemetry();
-                            info!("Quick Load State (Slot 1) caricato con successo: {:?}", st_path);
-                        }
-                        Err(e) => error!("Errore caricamento Quick Load State (Slot 1): {:?}", e),
-                    }
-                }
-                GuiAction::SaveState(slot) => {
-                    let st_path = savestate_path_for(&self.current_game_name, slot);
-                    match opencdi::savestate::save_state_to_file(&st_path, &self.m.cpu, &self.m.bus, self.disc_launched, self.shell_ready_count, self.pad_x, self.pad_y) {
-                        Ok(_) => info!("Save State (Slot {}) salvato con successo: {:?}", slot, st_path),
-                        Err(e) => error!("Errore salvataggio Save State (Slot {}): {:?}", slot, e),
-                    }
-                }
-                GuiAction::LoadState(slot) => {
-                    let st_path = savestate_path_for(&self.current_game_name, slot);
-                    match opencdi::savestate::load_state_from_file(&st_path, &mut self.m.cpu, &mut self.m.bus, &mut self.disc_launched, &mut self.shell_ready_count, &mut self.pad_x, &mut self.pad_y) {
-                        Ok(_) => {
-                            self.pad_x_f = self.pad_x as f32;
-                            self.pad_y_f = self.pad_y as f32;
-                            self.reset_telemetry();
-                            info!("Load State (Slot {}) caricato con successo: {:?}", slot, st_path);
-                        }
-                        Err(e) => error!("Errore caricamento Load State (Slot {}): {:?}", slot, e),
-                    }
+                    self.refresh_title();
                 }
                 GuiAction::ClearNvram => {
                     let _ = self.m.bus.nvram.clear();
@@ -1245,13 +1342,20 @@ impl App {
         }
 
         // Audio hotkeys (+ / - = Volume, held)
-        let audio = &mut self.m.bus.cdic.audio;
         if self.keys.contains(&Key::Equal) || self.keys.contains(&Key::NumpadAdd) {
-            audio.volume = (audio.volume + 0.02).min(2.0);
+            self.volume = (self.volume + 0.02).min(2.0);
+            self.publish_gain();
         }
         if self.keys.contains(&Key::Minus) || self.keys.contains(&Key::NumpadSubtract) {
-            audio.volume = (audio.volume - 0.02).max(0.0);
+            self.volume = (self.volume - 0.02).max(0.0);
+            self.publish_gain();
         }
+    }
+
+    // Hands the volume (0 while muted) to the sound-card callback.
+    fn publish_gain(&self) {
+        let g = if self.muted { 0.0f32 } else { self.volume };
+        self.audio_gain.store(g.to_bits(), Ordering::Relaxed);
     }
 
     // Start a fresh speed window (pause, video mode switch, reset, fast-forward toggle)
@@ -1300,7 +1404,7 @@ impl App {
         }
         if self.measured_mips > 4.5 && m.bus.emulate_wait_states {
             log::warn!(
-                "[TELEMETRY CPU ANOMALY] Unexpected CPU throughput: {:.2} MIPS (expected ~3.2-3.5 MIPS for SCC68070 at 15.5MHz)",
+                "[TELEMETRY CPU ANOMALY] Unexpected CPU throughput: {:.2} MIPS (expected ~3.1-3.4 MIPS for SCC68070 at 15 MHz)",
                 self.measured_mips
             );
         }
@@ -1335,8 +1439,8 @@ impl App {
         };
         if let Some(window) = &self.window {
             window.set_title(&format!(
-                "OpenCDi – {} | {} | CPU: {:.2} MIPS | CD: {} | Render: {} | WaitStates: {}",
-                self.current_game_name, speed, self.measured_mips, cd_str, render_str, wait_status
+                "OpenCDi – {} | {} | CPU: {:.2} MIPS | CD: {} | Render: {} | WaitStates: {} | Slot: {}",
+                self.current_game_name, speed, self.measured_mips, cd_str, render_str, wait_status, self.state_slot
             ));
         }
     }
@@ -1352,7 +1456,7 @@ impl App {
             self.windowed = None;
         }
         if self.paused {
-            // Keep the title live (disc, wait states) at about two updates a second
+            // Keep the title live (disc, slot, wait states) at about two updates a second
             self.paused_ticks += 1;
             if self.paused_ticks % 25 == 0 {
                 self.refresh_title();
@@ -1373,14 +1477,15 @@ impl App {
 
         self.update_input();
         // Emulation runs on the timer; only the picture is skipped while the window is hidden
+        self.audio_buf.clear();
+        self.m.drain_audio(&mut self.audio_buf);
         if self.fast_forward {
-            // Drop fast-forward audio so the queues never hold sped-up backlog
-            let audio = &self.m.bus.cdic.audio;
-            for q in [&audio.sample_queue, &audio.sfx_queue] {
-                if let Ok(mut q) = q.lock() {
-                    q.clear();
-                }
+            // Drop fast-forward audio so the ring never holds sped-up backlog
+            if let Ok(mut q) = self.audio_ring.lock() {
+                q.clear();
             }
+        } else {
+            audio::feed_ring(&self.audio_ring, &self.audio_buf);
         }
         // While fast-forwarding, present at most about 60 times a second
         let due = !self.in_modal_pump && (!self.fast_forward || self.last_present.elapsed() >= Duration::from_millis(16));
@@ -1638,5 +1743,23 @@ mod tests {
         assert_eq!(cursor_to_cdi(PhysicalPosition::new(100.0, 200.0), image_rect(768, 560)), (100, 200));
         assert_eq!(cursor_to_cdi(PhysicalPosition::new(219.0 + 1481.0, 1080.0), image_rect(1920, 1080)), (767, 559));
         assert_eq!(cursor_to_cdi(PhysicalPosition::new(0.0, 0.0), image_rect(1920, 1080)), (0, 0));
+    }
+
+    #[test]
+    fn state_file_round_trip_and_names() {
+        let dir = std::env::temp_dir().join(format!("opencdi-state-test-{}", std::process::id()));
+        assert_eq!(state_path(&dir, "Hotel Mario (Europe)", 0), dir.join("Hotel Mario (Europe).state"));
+        assert_eq!(state_path(&dir, "a/b", 3), dir.join("a_b.state3"));
+        let mut m = Machine::new();
+        m.bus.sys_ram[7] = 0x5A;
+        let p = state_path(&dir, "test", 1);
+        write_state_file(&p, &m, b"front").unwrap();
+        let mut n = Machine::new();
+        assert_eq!(read_state_file(&p, &mut n).unwrap(), b"front");
+        assert_eq!(n.bus.sys_ram[7], 0x5A);
+        n.bus.rom[0] = 9;
+        assert!(read_state_file(&p, &mut n).is_err());
+        assert!(read_state_file(&state_path(&dir, "missing", 0), &mut n).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
