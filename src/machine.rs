@@ -100,7 +100,7 @@ impl Machine {
 
                 line_cycles += batch_cycles;
                 bus.tick_timer(batch_cycles as u32);
-                if bus.slave.reset_request {
+                if bus.board_reset_request() {
                     bus.player_reset();
                     cpu.reset(bus);
                 }
@@ -111,9 +111,7 @@ impl Machine {
 
             bus.render_scanline(line);
 
-            bus.tick_slave(cyc_per_line);
-            bus.tick_cdic(cyc_per_line);
-            bus.tick_dvc(cyc_per_line);
+            bus.tick_board(cyc_per_line);
             bus.tick_audio(cyc_per_line);
         }
         bus.counters.end_frame();
@@ -132,7 +130,5 @@ impl Default for Machine {
 fn highest_ipl(bus: &mut CdiBus) -> u8 {
     let int1_lvl = bus.scc_timer.int1_level();
     let timer_lvl = if bus.scc_timer.timer_irq { bus.scc_timer.picr1 & 7 } else { 0 };
-    let cdic_lvl = if bus.in4_pending() { 4 } else { 0 };
-    let slave_lvl = if bus.slave.irq_pending { 2 } else { 0 };
-    int1_lvl.max(timer_lvl).max(cdic_lvl).max(slave_lvl)
+    int1_lvl.max(timer_lvl).max(bus.board_ipl())
 }
