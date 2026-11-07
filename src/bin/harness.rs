@@ -1,5 +1,6 @@
 use opencdi::audio::to_i16;
 use opencdi::input_script::{self, Event, Player};
+use opencdi::bus::BoardKind;
 use opencdi::machine::Machine;
 use opencdi::mcd212::{VideoMode, SCREEN_HEIGHT, SCREEN_WIDTH};
 
@@ -43,7 +44,7 @@ fn dump_ppm(fb: &[u32], path: &str) {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: harness <bios.rom> <disc|none> <frames> [--dvc <rom>] [--ppm <out.ppm>] [--ntsc] [--autoplay [--print-autoplay-script]] [--input <script|@file>] [--sample <n> [--sample-audio]] [--dump-every <n> <prefix>] [--counters] [--idle-pc <hex>] [--audio-out <file.s16>]");
+    eprintln!("usage: harness <bios.rom> <disc|none> <frames> [--dvc <rom>] [--ppm <out.ppm>] [--ntsc] [--autoplay [--print-autoplay-script]] [--input <script|@file>] [--sample <n> [--sample-audio]] [--dump-every <n> <prefix>] [--counters] [--idle-pc <hex>] [--board mono1|mono4] [--audio-out <file.s16>]");
     std::process::exit(2);
 }
 
@@ -64,6 +65,7 @@ fn main() {
     let mut sample_audio = false;
     let mut dump: Option<(u64, String)> = None;
     let mut counters = false;
+    let mut board: Option<BoardKind> = None;
     let mut idle_pc: Option<u32> = None;
     let mut audio_out: Option<(String, Vec<u8>)> = None;
     let mut i = 4;
@@ -74,6 +76,10 @@ fn main() {
             "--audio-out" => { i += 1; audio_out = Some((a.get(i).cloned().unwrap_or_else(|| usage()), Vec::new())); }
             "--ntsc" => ntsc = true,
             "--counters" => counters = true,
+            "--board" => {
+                i += 1;
+                board = Some(match a.get(i).map(String::as_str) { Some("mono1") => BoardKind::Mono1, Some("mono4") => BoardKind::Mono4, _ => usage() });
+            }
             "--idle-pc" => { i += 1; idle_pc = Some(a.get(i).and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or_else(|| usage())); }
             "--autoplay" => autoplay = true,
             "--print-autoplay-script" => print_script = true,
@@ -103,6 +109,10 @@ fn main() {
 
     let mut m = Machine::new();
     m.load_bios(bios).unwrap_or_else(|e| panic!("load bios {}: {}", bios, e));
+    if let Some(b) = board {
+        m.bus.set_board(b);
+    }
+    eprintln!("board {:?}", m.bus.board);
     if let Some(p) = dvc {
         m.load_dvc_rom(p).unwrap_or_else(|e| panic!("load dvc {}: {}", p, e));
     }

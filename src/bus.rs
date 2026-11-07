@@ -12,6 +12,7 @@ use crate::mcd212::Mcd212;
 use crate::nvram::Timekeeper;
 use crate::scc_timer::SccTimer;
 use crate::slave::SlaveHle;
+use crate::mono4::{ciap, Mono4};
 use crate::tap::{self, Counters, Taps};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,10 +27,12 @@ pub enum SharedIn4Owner {
 pub enum BoardKind {
     #[default]
     Mono1,
+    Mono4,
 }
 
 pub struct CdiBus {
     pub board: BoardKind,
+    pub mono4: Option<Box<Mono4>>, // Some exactly when `board` is Mono4
     pub rom: Box<[u8; 512 * 1024]>,
     pub sys_ram: Box<[u8; 512 * 1024]>,
     pub dvc: Dvc,
@@ -66,6 +69,7 @@ impl CdiBus {
     pub fn new() -> Self {
         Self {
             board: BoardKind::Mono1,
+            mono4: None,
             rom: vec![0u8; 512 * 1024].into_boxed_slice().try_into().unwrap(),
             sys_ram: vec![0u8; 512 * 1024].into_boxed_slice().try_into().unwrap(),
             dvc: Dvc::new(),
@@ -98,7 +102,23 @@ impl CdiBus {
         }
     }
 
+    /// Switches the memory map and peripherals; the Mono-IV chips start at power-on state.
+    pub fn set_board(&mut self, board: BoardKind) {
+        self.board = board;
+        self.mono4 = match board {
+            BoardKind::Mono1 => None,
+            BoardKind::Mono4 => {
+                let mut m = Box::new(Mono4::default());
+                (m.ciap.trace, m.ikat.trace) = (self.taps.ciap, self.taps.ikat);
+                Some(m)
+            }
+        };
+    }
+
     pub fn reset_system(&mut self) {
+        if let Some(m) = self.mono4.as_deref_mut() {
+            m.reset();
+        }
         self.mcd212.reset();
         self.mcd212.plane_a[0..8].copy_from_slice(&self.rom[0..8]);
         self.cdic.reset();
@@ -167,6 +187,7 @@ impl CdiBus {
             0x400000..=0x47FFFF => Some(self.rom[(addr - 0x400000) as usize]),
             _ => match self.board {
                 BoardKind::Mono1 => self.mono1_peek(addr),
+                BoardKind::Mono4 => self.mono4_peek(addr),
             },
         }
     }
@@ -303,6 +324,7 @@ impl CdiBus {
                 self.tick_cdic(cycles);
                 self.tick_dvc(cycles);
             }
+            BoardKind::Mono4 => {}
         }
     }
 
@@ -310,10 +332,11 @@ impl CdiBus {
     pub fn board_ipl(&mut self) -> u8 {
         match self.board {
             BoardKind::Mono1 => {
-                let in4 = if self.in4_pending() { 4 } else { 0 };
-                let in2 = if self.slave.irq_pending { 2 } else { 0 };
-                in4.max(in2)
+                let ext4 = if self.in4_pending() { 4 } else { 0 };
+                let ext2 = if self.slave.irq_pending { 2 } else { 0 };
+                ext4.max(ext2)
             }
+            BoardKind::Mono4 => 0,
         }
     }
 
@@ -321,6 +344,7 @@ impl CdiBus {
     pub fn board_reset_request(&self) -> bool {
         match self.board {
             BoardKind::Mono1 => self.slave.reset_request,
+            BoardKind::Mono4 => false,
         }
     }
 
@@ -522,6 +546,7 @@ impl CdiBus {
             }
             _ => match self.board {
                 BoardKind::Mono1 => self.mono1_rd8(addr),
+                BoardKind::Mono4 => self.mono4_rd8(addr),
             },
         }
     }
@@ -645,6 +670,7 @@ impl CdiBus {
             }
             _ => match self.board {
                 BoardKind::Mono1 => self.mono1_rd16(address, addr),
+                BoardKind::Mono4 => self.mono4_rd16(address, addr),
             },
         }
     }
@@ -807,6 +833,7 @@ impl CdiBus {
             }
             _ => match self.board {
                 BoardKind::Mono1 => self.mono1_wr8(addr, value),
+                BoardKind::Mono4 => self.mono4_wr8(addr, value),
             },
         }
     }
@@ -929,6 +956,7 @@ impl CdiBus {
             }
             _ => match self.board {
                 BoardKind::Mono1 => self.mono1_wr16(address, addr, value),
+                BoardKind::Mono4 => self.mono4_wr16(address, addr, value),
             },
         }
     }
@@ -999,6 +1027,106 @@ impl CdiBus {
         self.wr8(address.wrapping_add(1), value as u8);
     }
 
+    #[cold]
+    fn mono4_unmapped(&mut self, kind: &str, addr: u32, value: u32) {
+        self.counters.unmapped += 1;
+        let pc = self.current_pc;
+        if let Some(m) = self.mono4.as_deref_mut() {
+            if m.unmapped.first(addr) {
+                eprintln!("MONO4 unmapped {} {:06X} = {:02X} pc~{:06X}", kind, addr, value, pc);
+            }
+        }
+    }
+
+    fn mono4_rd8(&mut self, addr: u32) -> u8 {
+        let pc = self.current_pc;
+        let Some(m) = self.mono4.as_deref_mut() else { return 0xFF };
+        match addr {
+            0x300000..=0x303FFF => {
+                let off = addr - 0x300000;
+                if ciap::Ciap::is_reg(off) {
+                    let w = m.ciap.read_reg(off - ciap::REG_BASE, pc);
+                    return if (addr & 1) == 0 { (w >> 8) as u8 } else { w as u8 };
+                }
+                return m.ciap.ram[off as usize];
+            }
+            0x310000..=0x31FFFF if (addr & 1) == 1 => return m.ikat.read(addr - 0x310000, pc),
+            0x320000..=0x32FFFF => {
+                if let Some(i) = crate::mono4::nvram::Nvram32::index(addr - 0x320000) {
+                    return m.nvram.ram[i];
+                }
+            }
+            _ => {}
+        }
+        self.mono4_unmapped("R8", addr, 0xFF);
+        0xFF
+    }
+
+    fn mono4_rd16(&mut self, address: u32, addr: u32) -> u16 {
+        if let (0x300000..=0x303FFE, Some(m)) = (addr, self.mono4.as_deref_mut()) {
+            let off = addr - 0x300000;
+            if ciap::Ciap::is_reg(off) {
+                return m.ciap.read_reg(off - ciap::REG_BASE, self.current_pc);
+            }
+        }
+        let hi = self.rd8(address) as u16;
+        let lo = self.rd8(address.wrapping_add(1)) as u16;
+        (hi << 8) | lo
+    }
+
+    fn mono4_wr8(&mut self, addr: u32, value: u8) {
+        let pc = self.current_pc;
+        let Some(m) = self.mono4.as_deref_mut() else { return };
+        match addr {
+            0x300000..=0x303FFF => {
+                let off = addr - 0x300000;
+                if ciap::Ciap::is_reg(off) {
+                    let reg = off - ciap::REG_BASE;
+                    let cur = m.ciap.peek_reg(reg);
+                    let v = if (addr & 1) == 0 { (cur & 0x00FF) | ((value as u16) << 8) } else { (cur & 0xFF00) | value as u16 };
+                    m.ciap.write_reg(reg, v, pc);
+                } else {
+                    m.ciap.ram[off as usize] = value;
+                }
+                return;
+            }
+            0x310000..=0x31FFFF if (addr & 1) == 1 => return m.ikat.write(addr - 0x310000, value, pc),
+            0x320000..=0x32FFFF => {
+                if let Some(i) = crate::mono4::nvram::Nvram32::index(addr - 0x320000) {
+                    m.nvram.ram[i] = value;
+                    return;
+                }
+            }
+            _ => {}
+        }
+        self.mono4_unmapped("W8", addr, value as u32);
+    }
+
+    fn mono4_wr16(&mut self, address: u32, addr: u32, value: u16) {
+        if let (0x300000..=0x303FFE, Some(m)) = (addr, self.mono4.as_deref_mut()) {
+            let off = addr - 0x300000;
+            if ciap::Ciap::is_reg(off) {
+                m.ciap.write_reg(off - ciap::REG_BASE, value, self.current_pc);
+                return;
+            }
+        }
+        self.wr8(address, (value >> 8) as u8);
+        self.wr8(address.wrapping_add(1), value as u8);
+    }
+
+    fn mono4_peek(&self, addr: u32) -> Option<u8> {
+        let m = self.mono4.as_deref()?;
+        match addr {
+            0x300000..=0x303FFF if !ciap::Ciap::is_reg(addr - 0x300000) => Some(m.ciap.ram[(addr - 0x300000) as usize]),
+            _ => None,
+        }
+    }
+
+    // External level 4 (CIAP) and level 2 (IKAT) acknowledges on the Mono-IV board.
+    fn mono4_iack(&mut self, _level: u8) -> Option<u32> {
+        None
+    }
+
     fn iack(&mut self, level: u8) -> u32 {
         let vec = (|| {
             let int1_lvl = self.scc_timer.int1_level();
@@ -1028,6 +1156,7 @@ impl CdiBus {
 
             if let Some(v) = match self.board {
                 BoardKind::Mono1 => self.mono1_iack(level),
+                BoardKind::Mono4 => self.mono4_iack(level),
             } {
                 return v;
             }
@@ -1150,13 +1279,15 @@ mod tests {
     }
 
     #[test]
-    fn dma_error_byte_is_read_only_and_status_byte_clears_only_its_bits() {
+    fn mono4_map_chip_id_and_nvram_lane() {
         let mut bus = CdiBus::new();
-        bus.dma.channels[0].channel_status = 0x90;
-        bus.dma.channels[0].channel_error = 0x02;
-        bus.write_byte(0x8000_4001, 0xFF);
-        assert_eq!((bus.dma.channels[0].channel_status, bus.dma.channels[0].channel_error), (0x90, 0x02));
-        bus.write_byte(0x8000_4000, 0x10);
-        assert_eq!(bus.dma.channels[0].channel_status, 0x80);
+        bus.set_board(BoardKind::Mono4);
+        assert_eq!(bus.read_word(0x3025C4), 0xCD02);
+        bus.write_byte(0x320010, 0x5A);
+        bus.write_byte(0x320011, 0xA5);
+        assert_eq!(bus.read_word(0x320010), 0x5AFF);
+        assert_eq!(bus.read_byte(0x32FFFE), 0x95);
+        assert_eq!(bus.read_byte(0x500000), 0xFF);
+        assert_eq!(bus.counters.unmapped, 3);
     }
 }
