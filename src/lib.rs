@@ -1,3 +1,6 @@
+// Lets the state macros name `opencdi::` both here and in bins that include these files by path.
+extern crate self as opencdi;
+
 pub mod audio;
 pub mod bus;
 pub mod cdic;

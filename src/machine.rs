@@ -1,5 +1,6 @@
 use crate::bus::CdiBus;
 use crate::mcd212::VideoMode;
+use crate::savestate::{self, Identity, Reader, State, StateError};
 use m68k::{CpuCore, CpuType};
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -122,6 +123,71 @@ impl Machine {
         }
     }
 }
+
+impl Machine {
+    // BIOS, disc and DVC ROM the state belongs to; a state is only loaded into a machine with the same three.
+    pub fn state_identity(&self) -> Identity {
+        let disc = self.bus.cdrom.as_ref().map_or(0, |cd| {
+            let mut t = Vec::new();
+            ((cd.total_sectors, cd.disc_type), cd.tracks.len() as u32).save(&mut t);
+            for tr in &cd.tracks {
+                (tr.number, tr.control).save(&mut t);
+                (tr.start_lba, tr.length_sectors).save(&mut t);
+            }
+            savestate::checksum(&t)
+        });
+        Identity {
+            bios: savestate::checksum(&self.bus.rom[..]),
+            disc,
+            dvc: self.bus.dvc.rom.as_ref().map_or(0, |r| savestate::checksum(&r[..])),
+        }
+    }
+
+    // Replaces `out` with header, machine payload and the frontend's own bytes (opaque here).
+    pub fn save_state(&self, frontend: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        out.resize(savestate::HEADER_LEN, 0);
+        self.save(out);
+        let payload_len = out.len() - savestate::HEADER_LEN;
+        out.extend_from_slice(frontend);
+        let sum = savestate::checksum(&out[savestate::HEADER_LEN..]);
+        savestate::write_header(out, payload_len, frontend.len(), sum, self.state_identity());
+    }
+
+    // Loads a state from `save_state` (trailing padding allowed); on any error the machine is left unchanged.
+    pub fn load_state<'a>(&mut self, data: &'a [u8]) -> Result<&'a [u8], StateError> {
+        let h = savestate::read_header(data)?;
+        let body = &data[savestate::HEADER_LEN..savestate::HEADER_LEN + h.payload_len + h.frontend_len];
+        if savestate::checksum(body) != h.checksum {
+            return Err(StateError::Checksum);
+        }
+        let id = self.state_identity();
+        if h.id.bios != id.bios {
+            return Err(StateError::BiosMismatch);
+        }
+        if h.id.disc != id.disc {
+            return Err(StateError::DiscMismatch);
+        }
+        if h.id.dvc != id.dvc {
+            return Err(StateError::DvcMismatch);
+        }
+        let (payload, frontend) = body.split_at(h.payload_len);
+        let mut backup = Vec::new();
+        self.save(&mut backup);
+        let mut r = Reader::new(payload);
+        let res = self.load(&mut r).and_then(|_| match r.remaining() {
+            0 => Ok(()),
+            n => Err(StateError::Trailing(n)),
+        });
+        if let Err(e) = res {
+            let _ = self.load(&mut Reader::new(&backup));
+            return Err(e);
+        }
+        Ok(frontend)
+    }
+}
+
+crate::impl_state!(Machine { cpu, bus, instructions } skip {});
 
 impl Default for Machine {
     fn default() -> Self {

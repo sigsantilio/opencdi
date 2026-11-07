@@ -76,6 +76,8 @@ pub struct Mp2Decoder {
     pub synchronized: bool,
     pub conceal_discontinuity_frame: bool,
     pub concealed_frames: u64,
+    /// Bytes of the last frame decoded, replayed on load to rebuild the filterbank.
+    pub last_frame: Vec<u8>,
 }
 
 impl Default for Mp2Decoder {
@@ -89,6 +91,7 @@ impl Default for Mp2Decoder {
             synchronized: false,
             conceal_discontinuity_frame: false,
             concealed_frames: 0,
+            last_frame: Vec::new(),
         }
     }
 }
@@ -102,6 +105,7 @@ impl Mp2Decoder {
         self.synchronized = false;
         self.conceal_discontinuity_frame = false;
         self.concealed_frames = 0;
+        self.last_frame.clear();
     }
 
     pub fn decode_available(&mut self, input: &mut VecDeque<u8>) -> u64 {
@@ -146,6 +150,8 @@ impl Mp2Decoder {
                         self.conceal_discontinuity_frame = false;
                     }
                     Self::append_native(&mut self.pcm, &frame.pcm);
+                    self.last_frame.clear();
+                    self.last_frame.extend_from_slice(&contiguous[..frame_size]);
                     input.drain(..frame_size);
                     decoded += 1;
                     self.synchronized = true;
@@ -153,6 +159,7 @@ impl Mp2Decoder {
                 Err(_) => {
                     input.pop_front();
                     self.state.reset();
+                    self.last_frame.clear();
                     self.errors += 1;
                     self.synchronized = false;
                 }
@@ -1463,6 +1470,55 @@ impl Dvc {
             present[x] = true;
             present[x + 1] = true;
         }
+    }
+}
+
+// Savestate: the DVC ROM is re-loaded by path, never stored.
+opencdi::impl_state!(Dvc {
+    ram1, ram2, ram2_enabled, reg_write_count, reg_read_count, rom_read_count,
+    fma_regs, fmv_regs,
+    fma_cmd, fma_isr, fma_ier, fma_ivec, fmv_isr, fmv_ier, fmv_ivec, fmv_playback_active, fmv_decoder_active,
+    total_cycles, dclk, dclk_accum, timer_accum, timer_counter,
+    video_playing, video_armed, decoder_enabled, audio_armed, audio_enabled, vcd_pixel_clock_13_5,
+    display_timecode, decoder_timecode, display_frame_counter, decoder_frame_counter, fps, frame_accum, vsync_hz,
+    dvc_stream_fifo, fma_stream_fifo, transfer_for_fma, fma_dma_seen, dma_requested, framebuffer, window, border_color,
+    demux, fma_demux, mp2, audio_sample_rate, audio_out,
+    video_decoder, video_width, video_height, frames_decoded_count, frames_presented_count, vsync_counter,
+    underflow_count, fma_underflow_count, fma_decoded_since_play, fma_playout_end, has_valid_frame,
+} skip {
+    rom,
+});
+
+opencdi::impl_state!(MpegSystemDemux {
+    pending, video, audio, last_scr, first_video_pts, last_video_pts, last_video_dts, first_audio_pts, last_audio_pts,
+    selected_audio_stream, selected_video_stream, program_ends,
+} skip {});
+
+// The oxideav filterbank is private to that crate; its V buffer holds only the last frame's subband samples, so replaying that frame on load rebuilds it.
+impl opencdi::savestate::State for Mp2Decoder {
+    fn save(&self, w: &mut Vec<u8>) {
+        let Self { state: _, pcm, last_sample_rate, errors, resync_bytes, synchronized, conceal_discontinuity_frame, concealed_frames, last_frame } = self;
+        pcm.save(w);
+        (*last_sample_rate, *errors, *resync_bytes).save(w);
+        (*synchronized, *conceal_discontinuity_frame, *concealed_frames).save(w);
+        last_frame.save(w);
+    }
+
+    fn load(&mut self, r: &mut opencdi::savestate::Reader) -> Result<(), opencdi::savestate::StateError> {
+        let Self { state, pcm, last_sample_rate, errors, resync_bytes, synchronized, conceal_discontinuity_frame, concealed_frames, last_frame } = self;
+        pcm.load(r)?;
+        last_sample_rate.load(r)?;
+        errors.load(r)?;
+        resync_bytes.load(r)?;
+        synchronized.load(r)?;
+        conceal_discontinuity_frame.load(r)?;
+        concealed_frames.load(r)?;
+        last_frame.load(r)?;
+        state.reset();
+        if !last_frame.is_empty() {
+            let _ = oxideav_mp2::frame::decode_frame_with(last_frame, state);
+        }
+        Ok(())
     }
 }
 

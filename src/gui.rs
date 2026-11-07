@@ -847,6 +847,7 @@ pub fn show_controls_dialog(owner: *mut std::ffi::c_void) {
            • F9: Switch Active Input Device (Gamepad <-> Mouse)\n\
            • P: Pause  |  Space (hold): Fast-forward\n\
            • F8: Screenshot (PPM)  |  F12: Screenshot (BMP)\n\
+           • F2 / F4: Save / Load state  |  F6 / F7: State slot\n\
            • Ctrl+I: Insert disc  |  Ctrl+O: Open disc image and restart\n\
            • M: Mute / Unmute audio  |  + / - : Adjust volume\n\
            • Esc: Quit"
