@@ -330,7 +330,11 @@ impl CdiBus {
             self.cdic.audio.stop_mpeg();
         }
         let dvc_gains = if self.dvc.is_fitted() { self.dvc.audio_gains() } else { None };
-        self.cdic.audio.advance(cycles, self.mcd212.video_mode.cycles_per_sector(), self.cdic.audio.slave_gains(), dvc_gains);
+        let gains = match self.board {
+            BoardKind::Mono1 => self.cdic.audio.slave_gains(),
+            BoardKind::Mono4 => self.mono4.as_deref().and_then(|m| m.ciap.attenuation()),
+        };
+        self.cdic.audio.advance(cycles, self.mcd212.video_mode.cycles_per_sector(), gains, dvc_gains);
     }
 
     pub fn tick_slave(&mut self, cycles: u32) {
