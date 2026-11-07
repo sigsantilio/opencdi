@@ -1115,7 +1115,7 @@ impl CdiBus {
             0x310000..=0x31FFFF if (addr & 1) == 1 => return m.ikat.read(addr - 0x310000, pc),
             0x320000..=0x32FFFF => {
                 if let Some(i) = crate::mono4::nvram::Nvram32::index(addr - 0x320000) {
-                    return m.nvram.ram[i];
+                    return m.nvram.read(i);
                 }
             }
             _ => {}
@@ -1167,7 +1167,7 @@ impl CdiBus {
             }
             0x320000..=0x32FFFF => {
                 if let Some(i) = crate::mono4::nvram::Nvram32::index(addr - 0x320000) {
-                    m.nvram.ram[i] = value;
+                    m.nvram.write(i, value);
                     return;
                 }
             }
@@ -1371,7 +1371,7 @@ mod tests {
         bus.write_byte(0x320010, 0x5A);
         bus.write_byte(0x320011, 0xA5);
         assert_eq!(bus.read_word(0x320010), 0x5AFF);
-        assert_eq!(bus.read_byte(0x32FFFE), 0x95);
+        assert_eq!(bus.read_byte(0x32FFFE), 0x00);
         assert_eq!(bus.read_byte(0x500000), 0xFF);
         assert_eq!(bus.counters.unmapped, 3);
     }
