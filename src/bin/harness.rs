@@ -41,7 +41,7 @@ fn dump_ppm(fb: &[u32], path: &str) {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: harness <bios.rom> <disc|none> <frames> [--dvc <rom>] [--ppm <out.ppm>] [--ntsc] [--autoplay [--print-autoplay-script]] [--input <script|@file>] [--sample <n> [--sample-audio]] [--dump-every <n> <prefix>]");
+    eprintln!("usage: harness <bios.rom> <disc|none> <frames> [--dvc <rom>] [--ppm <out.ppm>] [--ntsc] [--autoplay [--print-autoplay-script]] [--input <script|@file>] [--sample <n> [--sample-audio]] [--dump-every <n> <prefix>] [--roundtrip <frame>]");
     std::process::exit(2);
 }
 
@@ -61,6 +61,7 @@ fn main() {
     let mut sample = 0u64;
     let mut sample_audio = false;
     let mut dump: Option<(u64, String)> = None;
+    let mut roundtrip: Option<u64> = None;
     let mut i = 4;
     while i < a.len() {
         match a[i].as_str() {
@@ -72,6 +73,7 @@ fn main() {
             "--input" => { i += 1; input = Some(a.get(i).cloned().unwrap_or_else(|| usage())); }
             "--sample" => { i += 1; sample = a.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage()); }
             "--sample-audio" => sample_audio = true,
+            "--roundtrip" => { i += 1; roundtrip = Some(a.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())); }
             "--dump-every" => {
                 let n = a.get(i + 1).and_then(|s| s.parse().ok()).filter(|&n: &u64| n > 0).unwrap_or_else(|| usage());
                 dump = Some((n, a.get(i + 2).cloned().unwrap_or_else(|| usage())));
@@ -81,7 +83,7 @@ fn main() {
         }
         i += 1;
     }
-    if (print_script && !autoplay) || (autoplay && input.is_some()) || (sample_audio && sample == 0) {
+    if (print_script && !autoplay) || (autoplay && input.is_some()) || (sample_audio && sample == 0) || roundtrip.is_some_and(|n| n >= frames) {
         usage();
     }
     let mut player = input.map(|s| {
@@ -114,8 +116,18 @@ fn main() {
     let mut audio_buf: Vec<(f32, f32)> = Vec::new();
     let (mut win_samples, mut win_nonzero) = (0u64, 0u64);
 
-    {
-        for frame in 0..frames {
+    // Round trip: save at `at`, run to the end (A), load, rerun the same frames with the same input (B).
+    let mut saved: Option<(Vec<u8>, bool, u32, Option<Player>)> = None;
+    let mut pass_a: Option<(u64, u64, u64, u64)> = None;
+    let mut start = 0;
+    'passes: loop {
+        for frame in start..frames {
+            if roundtrip == Some(frame) && saved.is_none() {
+                let mut buf = Vec::new();
+                m.save_state(&[], &mut buf);
+                saved = Some((buf, disc_launched, shell_ready_count, player.clone()));
+                (video_all, audio_all, audio_samples) = (FNV_OFFSET, FNV_OFFSET, 0);
+            }
             if autoplay && m.bus.cdrom.is_some() && !disc_launched {
                 let (bus, cpu) = (&mut m.bus, &m.cpu);
                 let shell_state = if bus.dvc.is_fitted() {
@@ -175,6 +187,33 @@ fn main() {
                 }
             }
         }
+        if let (Some(at), Some((buf, dl, src, pl))) = (roundtrip, saved.as_ref()) {
+            let now = (video_all, video_hash(FNV_OFFSET, m.framebuffer()), audio_all, audio_samples);
+            match pass_a {
+                None => {
+                    pass_a = Some(now);
+                    m.load_state(buf).expect("load_state");
+                    let mut again = Vec::new();
+                    m.save_state(&[], &mut again);
+                    eprintln!("ROUNDTRIP-RESAVE {} size={}", if &again == buf { "same" } else { "DIFF" }, buf.len());
+                    (disc_launched, shell_ready_count, player) = (*dl, *src, pl.clone());
+                    (video_all, audio_all, audio_samples) = (FNV_OFFSET, FNV_OFFSET, 0);
+                    start = at;
+                    continue 'passes;
+                }
+                Some(a) => {
+                    eprintln!("ROUNDTRIP-DETAIL a={:016x?} b={:016x?}", a, now);
+                    println!(
+                        "ROUNDTRIP at={} frames={} video={} audio={}",
+                        at, frames - at,
+                        if (a.0, a.1) == (now.0, now.1) { "match" } else { "DIFFER" },
+                        if (a.2, a.3) == (now.2, now.3) { "match" } else { "DIFFER" }
+                    );
+                    return;
+                }
+            }
+        }
+        break;
     }
 
     let video_last = video_hash(FNV_OFFSET, m.framebuffer());
