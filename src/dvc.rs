@@ -894,8 +894,8 @@ impl Dvc {
     }
 
     /// IMPEG addresses that some register, RAM or ROM answers; the rest of the cartridge window is a hole.
-    pub fn impeg_mapped(addr: u32) -> bool {
-        matches!(addr & 0x00FF_FFFF, 0xD00000..=0xDFFFFF | 0xE01000..=0xE01FFF | 0xE04000..=0xE043FF | 0xE04800..=0xE07FFF | 0xE40000..=0xEFFFFF)
+    pub fn impeg_mapped(&self, addr: u32) -> bool {
+        self.impeg && matches!(addr & 0x00FF_FFFF, 0xD00000..=0xDFFFFF | 0xE01000..=0xE01FFF | 0xE04000..=0xE043FF | 0xE04800..=0xE07FFF | 0xE40000..=0xEFFFFF)
     }
 
     pub fn tick(&mut self, cycles: u32) {
@@ -1792,27 +1792,6 @@ impl Dvc {
 
 #[cfg(test)]
 mod window_tests {
-    #[test]
-    fn impeg_audio_bits_and_pio() {
-        assert_eq!(Dvc::impeg_bits_from(0x0100 | 0x0008 | 0x0020 | 0x0001 | 0x0004), 0x0800 | 0x0100 | 0x0400 | 0x8000 | 0x0004);
-        assert_eq!(Dvc::impeg_bits_to(0x3D14), 0x0100 | 0x0020 | 0x0008 | 0x0010 | 0x0004);
-        let mut d = Dvc::new();
-        d.impeg = true;
-        d.write_word(0xE0421C, 0x3D14);
-        assert_eq!(d.read_word(0xE0421C), 0x3D14);
-        // Data-port words go to the stream only in PIO mode and only as complete words.
-        let before = d.fma_stream_fifo.len();
-        d.write_word(0xE0411E, 0x1234);
-        assert_eq!(d.fma_stream_fifo.len(), before);
-        d.write_word(0xE04200, 0x0100);
-        d.write_byte(0xE0411F, 0x56);
-        assert_eq!(d.fma_stream_fifo.len(), before);
-        d.write_word(0xE0411E, 0xABCD);
-        assert_eq!(d.fma_stream_fifo.len(), before + 2);
-        d.reset();
-        assert!(!d.impeg_pio && d.impeg_regs.iter().all(|&b| b == 0));
-    }
-
     use super::*;
 
     #[test]
@@ -2128,5 +2107,32 @@ mod attenuation_tests {
         }
         let g = d.audio_gains().unwrap();
         assert!((g[0] - 0.316_227_77).abs() < 1e-4 && g[1] == 0.0 && g[2] == 1.0 && g[3] == 0.0);
+    }
+}
+
+#[cfg(test)]
+mod impeg_tests {
+    use super::*;
+
+    #[test]
+    fn impeg_audio_bits_and_pio() {
+        assert_eq!(Dvc::impeg_bits_from(0x0100 | 0x0008 | 0x0020 | 0x0001 | 0x0004), 0x0800 | 0x0100 | 0x0400 | 0x8000 | 0x0004);
+        assert_eq!(Dvc::impeg_bits_to(0x3D14), 0x0100 | 0x0020 | 0x0008 | 0x0010 | 0x0004);
+        let mut d = Dvc::new();
+        d.impeg = true;
+        d.write_word(0xE0421C, 0x3D14);
+        assert_eq!(d.read_word(0xE0421C), 0x3D14);
+        assert_eq!(d.get_fma_word(FMA_IER), Dvc::impeg_bits_to(0x3D14));
+        // Data-port words go to the stream only in PIO mode and only as complete words.
+        let before = d.fma_stream_fifo.len();
+        d.write_word(0xE0411E, 0x1234);
+        assert_eq!(d.fma_stream_fifo.len(), before);
+        d.write_word(0xE04200, 0x0100);
+        d.write_byte(0xE0411F, 0x56);
+        assert_eq!(d.fma_stream_fifo.len(), before);
+        d.write_word(0xE0411E, 0xABCD);
+        assert_eq!(d.fma_stream_fifo.len(), before + 2);
+        d.reset();
+        assert!(!d.impeg_pio && d.impeg_regs.iter().all(|&b| b == 0));
     }
 }

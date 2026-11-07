@@ -1161,6 +1161,15 @@ impl CdiBus {
         }
     }
 
+    /// True (and reported once) when a cartridge-window address has no register, RAM or ROM behind it.
+    fn cartridge_hole(&mut self, kind: &str, addr: u32, value: u32) -> bool {
+        let hole = !self.dvc.impeg_mapped(addr);
+        if hole {
+            self.mono4_unmapped(kind, addr, value);
+        }
+        hole
+    }
+
     #[cold]
     fn mono4_unmapped(&mut self, kind: &str, addr: u32, value: u32) {
         self.counters.unmapped += 1;
@@ -1176,8 +1185,7 @@ impl CdiBus {
     fn mono4_rd8(&mut self, addr: u32) -> u8 {
         if self.dvc.is_fitted() && Self::cartridge_address(addr) {
             // A hole in the cartridge window reads open bus and is reported once.
-            if !crate::dvc::Dvc::impeg_mapped(addr) {
-                self.mono4_unmapped("R8", addr, 0xFF);
+            if self.cartridge_hole("R8", addr, 0xFF) {
                 return 0xFF;
             }
             return self.mono1_rd8(addr);
@@ -1207,8 +1215,7 @@ impl CdiBus {
     fn mono4_rd16(&mut self, address: u32, addr: u32) -> u16 {
         if self.dvc.is_fitted() && Self::cartridge_address(addr) {
             // A hole in the cartridge window reads open bus and is reported once.
-            if !crate::dvc::Dvc::impeg_mapped(addr) {
-                self.mono4_unmapped("R16", addr, 0xFF);
+            if self.cartridge_hole("R16", addr, 0xFF) {
                 return 0xFFFF;
             }
             return self.mono1_rd16(address, addr);
@@ -1230,10 +1237,9 @@ impl CdiBus {
 
     fn mono4_wr8(&mut self, addr: u32, value: u8) {
         if self.dvc.is_fitted() && Self::cartridge_address(addr) {
-            // A hole in the cartridge window reads open bus and is reported once.
-            if !crate::dvc::Dvc::impeg_mapped(addr) {
-                self.mono4_unmapped("W8", addr, value as u32);
-                return ();
+            // A write into a hole in the cartridge window is dropped and reported once.
+            if self.cartridge_hole("W8", addr, value as u32) {
+                return;
             }
             return self.mono1_wr8(addr, value);
         }
@@ -1274,10 +1280,9 @@ impl CdiBus {
 
     fn mono4_wr16(&mut self, address: u32, addr: u32, value: u16) {
         if self.dvc.is_fitted() && Self::cartridge_address(addr) {
-            // A hole in the cartridge window reads open bus and is reported once.
-            if !crate::dvc::Dvc::impeg_mapped(addr) {
-                self.mono4_unmapped("W16", addr, value as u32);
-                return ();
+            // A write into a hole in the cartridge window is dropped and reported once.
+            if self.cartridge_hole("W16", addr, value as u32) {
+                return;
             }
             return self.mono1_wr16(address, addr, value);
         }
