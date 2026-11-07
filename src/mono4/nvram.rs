@@ -81,11 +81,13 @@ impl Ds1216 {
 pub struct Nvram32 {
     pub ram: Vec<u8>,
     pub clock: Ds1216,
+    pub dirty: bool, // RAM changed since the last file write
+    pub save_path: Option<std::path::PathBuf>, // file the RAM persists to; None keeps it in memory only
 }
 
 impl Default for Nvram32 {
     fn default() -> Self {
-        Self { ram: vec![0; NVRAM32_SIZE], clock: Ds1216::default() }
+        Self { ram: vec![0; NVRAM32_SIZE], clock: Ds1216::default(), dirty: false, save_path: None }
     }
 }
 
@@ -108,14 +110,50 @@ impl Nvram32 {
 
     /// CPU write of chip byte `i`; pattern writes also reach the RAM, clock data writes do not.
     pub fn write(&mut self, i: usize, value: u8) {
-        if !self.clock.write(value) {
+        if !self.clock.write(value) && self.ram[i] != value {
             self.ram[i] = value;
+            self.dirty = true;
         }
     }
 
     pub fn load_bytes(&mut self, data: &[u8]) {
         let len = data.len().min(NVRAM32_SIZE);
         self.ram[..len].copy_from_slice(&data[..len]);
+    }
+
+    /// Persist the RAM to `path` from now on, loading it first when the file exists; returns whether it was loaded.
+    pub fn attach_file(&mut self, path: &std::path::Path) -> std::io::Result<bool> {
+        self.save_path = Some(path.to_path_buf());
+        self.dirty = false;
+        if !path.is_file() {
+            return Ok(false);
+        }
+        self.load_bytes(&std::fs::read(path)?);
+        Ok(true)
+    }
+
+    /// Write the RAM to the attached file when it changed.
+    pub fn flush_if_dirty(&mut self) {
+        let Some(path) = self.save_path.as_ref().filter(|_| self.dirty) else { return };
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match std::fs::write(path, &self.ram) {
+            Ok(()) => {
+                self.dirty = false;
+                log::info!("Mono-IV NVRAM saved to {:?}", path);
+            }
+            Err(e) => log::warn!("Cannot save Mono-IV NVRAM to {:?}: {}", path, e),
+        }
+    }
+
+    /// Empty the RAM and delete the attached file.
+    pub fn clear(&mut self) {
+        self.ram.fill(0);
+        self.dirty = false;
+        if let Some(path) = &self.save_path {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -141,6 +179,23 @@ impl Nvram32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ram_persists_to_attached_file() {
+        let path = std::env::temp_dir().join(format!("opencdi-nvram490-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut a = Nvram32::default();
+        assert!(!a.attach_file(&path).unwrap());
+        a.write(10, 0x42);
+        assert!(a.dirty);
+        a.flush_if_dirty();
+        assert!(!a.dirty && std::fs::metadata(&path).unwrap().len() == NVRAM32_SIZE as u64);
+        let mut b = Nvram32::default();
+        assert!(b.attach_file(&path).unwrap());
+        assert_eq!(b.peek(10), 0x42);
+        b.clear();
+        assert!(!path.exists() && b.peek(10) == 0);
+    }
 
     // Same sequence as the 490 clock module: save byte, 64 pattern writes, 64 reads, restore.
     fn bios_read(n: &mut Nvram32) -> (u32, u32) {
