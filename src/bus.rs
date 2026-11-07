@@ -1157,19 +1157,33 @@ impl CdiBus {
         !matches!(address & 0x00FF_FFFF, 0x000000..=0x07FFFF | 0x200000..=0x27FFFF | 0x300000..=0x303FFF | 0x310000..=0x32FFFF | 0x400000..=0x47FFFF | 0x4FFFE0..=0x4FFFFF)
     }
 
-    // A bus error for an unmapped Mono-IV access when that policy is on; counted and logged like other unmapped accesses.
+    /// Mono-I address with no device; the on-chip block is only at 0x80000000, not at its 0x800000 alias.
+    fn mono1_unmapped_address(address: u32) -> bool {
+        if (address & 0xFFFF_0000) == 0x8000_0000 {
+            return false;
+        }
+        !matches!(address & 0x00FF_FFFF, 0x000000..=0x07FFFF | 0x200000..=0x27FFFF | 0x300000..=0x303FFF | 0x310000..=0x31FFFF | 0x320000..=0x323FFF | 0x400000..=0x47FFFF | 0x4FFFE0..=0x4FFFFF | 0x500000..=0x57FFFF)
+    }
+
+    // A bus error for an unmapped CPU access (Mono-I always, Mono-IV unless switched off); counted and logged like other unmapped accesses.
     #[inline]
     fn bus_error(&mut self, kind: &str, address: u32, last: u32) -> Result<(), BusFault> {
-        if !self.mono4_bus_errors || self.board != BoardKind::Mono4 {
+        let mono1 = self.board == BoardKind::Mono1;
+        if !mono1 && !self.mono4_bus_errors {
             return Ok(());
         }
         let cart = self.dvc.is_fitted();
-        let hit = (address..=address.wrapping_add(last)).step_by(2).find(|&a| Self::mono4_unmapped_address(a) && !(cart && Self::cartridge_address(a)));
+        let hit = (address..=address.wrapping_add(last)).step_by(2).find(|&a| {
+            let unmapped = if mono1 { Self::mono1_unmapped_address(a) } else { Self::mono4_unmapped_address(a) };
+            unmapped && !(cart && Self::cartridge_address(a))
+        });
         match hit {
             None => Ok(()),
             Some(a) => {
                 self.counters.bus_errors += 1;
-                self.mono4_unmapped(kind, a & 0x00FF_FFFF, 0xFF);
+                if !mono1 {
+                    self.mono4_unmapped(kind, a & 0x00FF_FFFF, 0xFF);
+                }
                 Err(BusFault { kind: BusFaultKind::BusError, address: a })
             }
         }
@@ -1542,6 +1556,18 @@ mod tests {
         assert!(bus.try_read_word(0x500000).is_err() && bus.try_read_word(0x800000).is_err());
         assert!(bus.try_read_word(0x320011).is_ok() && bus.try_read_byte(0x8000_2011).is_ok());
         assert_eq!(bus.counters.bus_errors, 2);
+    }
+
+    #[test]
+    fn mono1_unmapped_access_raises_bus_error() {
+        let mut bus = CdiBus::new();
+        assert!(bus.try_read_word(0x600000).is_err() && bus.try_read_word(0x800000).is_err());
+        assert!(bus.try_read_word(0xD00000).is_err() && bus.try_write_byte(0xE00001, 0).is_err());
+        assert_eq!(bus.counters.bus_errors, 4);
+        assert!(bus.try_read_word(0x500000).is_ok() && bus.try_read_long(0x400000).is_ok() && bus.try_read_byte(0x8000_2011).is_ok());
+        assert_eq!(bus.counters.bus_errors, 4);
+        bus.dvc.load_rom_bytes(&[0x4A, 0xFC, 0, 0]);
+        assert!(bus.try_read_word(0xE40000).is_ok());
     }
 
     #[test]
