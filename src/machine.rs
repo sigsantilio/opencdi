@@ -34,6 +34,7 @@ impl Machine {
         self.cpu.set_cpu_type(CpuType::SCC68070);
         self.cpu.reset(&mut self.bus);
         self.bus.emulate_wait_states = true;
+        self.bus.counters.halted = false;
     }
 
     pub fn framebuffer(&self) -> &[u32] {
@@ -103,6 +104,7 @@ impl Machine {
                 if bus.board_reset_request() {
                     bus.player_reset();
                     cpu.reset(bus);
+                    bus.counters.halted = false;
                 }
                 cpu.set_irq(highest_ipl(bus));
             }
@@ -115,6 +117,11 @@ impl Machine {
             bus.tick_audio(cyc_per_line);
         }
         bus.counters.end_frame();
+        // A double fault parks the CPU for good; say so once instead of idling silently.
+        if cpu.is_halted() && !bus.counters.halted {
+            bus.counters.halted = true;
+            eprintln!("CPU halted (double fault) at frame {} pc {:06X}", bus.current_frame, cpu.pc);
+        }
         if bus.taps.pc && bus.counters.frames % 10 == 0 {
             eprintln!("PC F{} {:06X}", bus.current_frame, cpu.pc);
         }
