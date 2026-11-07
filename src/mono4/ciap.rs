@@ -1,5 +1,6 @@
 // CIAP disc and audio interface at 0x300000: RAM and program memory around a block of word registers at 0x2580.
 use super::Loud;
+use crate::audio::CdiAudio;
 use crate::cdrom::{CdRom, CD_SECTOR_RAW_SIZE};
 
 /// Size of the CIAP window: RAM 0x0000-0x257F, registers 0x2580-0x25FF, program memory 0x2600-0x3FFF.
@@ -17,6 +18,12 @@ pub const REG_ICR: u32 = 0x40;
 pub const REG_DMACTL: u32 = 0x42;
 pub const REG_ID: u32 = 0x44;
 pub const REG_TEST: u32 = 0x46;
+pub const REG_TACS: u32 = 0x08;
+pub const REG_ASHDW: u32 = 0x1A;
+pub const REG_APTR: u32 = 0x34;
+pub const ISR_AUDIO_DONE: u16 = 0x0002;
+const AUDIO_BUFS: [usize; 2] = [0x0000, 0x0900];
+const AUDIO_LEN: usize = 0x900;
 pub const CHIP_ID: u16 = 0xCD02;
 
 // Registers that are stored and read back as written.
@@ -32,6 +39,17 @@ pub const BMAN_RESET: u16 = 0x0054;
 // Data buffers in CIAP RAM and their buffer-manager bits; the set bit names the buffer the chip fills.
 const DATA_BUFS: [(u16, usize); 2] = [(0x04, 0x1200), (0x08, 0x1BC2)];
 const DATA_LEN: usize = 2340;
+
+// Coding byte from the audio shadow register: bit 13 8-bit, bit 12 18.9 kHz, bit 11 stereo, bit 3 emphasis.
+fn ashdw_coding(v: u16) -> u8 {
+    let mut c = 0;
+    for (bit, out) in [(13, 0x10), (12, 0x04), (11, 0x01), (3, 0x40)] {
+        if v & (1 << bit) != 0 {
+            c |= out;
+        }
+    }
+    c
+}
 
 // Sync field of a data sector as a byte-swapped image stores it.
 const SWAPPED_SYNC: [u8; 12] = [0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFF];
@@ -57,6 +75,14 @@ pub struct Ciap {
     pub q_mode: bool,
     pub lba: u32,
     pub drive_active: bool,
+    pub audio_playing: bool, // CPU-fed playback started by APCR 0x140
+    pub audio_wait: u8, // sector periods until the next audio-done step
+    pub audio_next: usize, // audio buffer the next step looks at first
+    pub audio_coding: [u8; 2], // coding captured from ASHDW when the CPU queued each buffer
+    pub asel: bool, // CCR 0x0008: chip plays audio sectors of the TACS channels until CCR 0x0100
+    pub audio_buffers: u64,
+    pub audio_sectors: u64,
+    pub audio_overlap: u64, // TACS sectors played while CPU-fed playback ran
     pub toc: bool, // table of contents read: Q reports carry lead-in entries
     pub toc_index: usize,
     pub start_delay: u8, // sector periods after a seek before the first sector
@@ -76,7 +102,7 @@ pub struct Ciap {
 
 impl Default for Ciap {
     fn default() -> Self {
-        Self { ram: vec![0; WINDOW_SIZE], regs: power_on_regs(), running: false, q_mode: false, lba: 0, drive_active: false, toc: false, toc_index: 0, start_delay: 0, drive_stopped: false, cycles: 0, dma_request: None, seeks: 0, sectors: 0, skipped: 0, dmas: 0, byteswap: false, descrambled: 0, q_reports: 0, loud: Loud::default(), trace: false }
+        Self { ram: vec![0; WINDOW_SIZE], regs: power_on_regs(), running: false, q_mode: false, lba: 0, drive_active: false, audio_playing: false, audio_wait: 0, audio_next: 0, audio_coding: [0; 2], asel: false, audio_buffers: 0, audio_sectors: 0, audio_overlap: 0, toc: false, toc_index: 0, start_delay: 0, drive_stopped: false, cycles: 0, dma_request: None, seeks: 0, sectors: 0, skipped: 0, dmas: 0, byteswap: false, descrambled: 0, q_reports: 0, loud: Loud::default(), trace: false }
     }
 }
 
@@ -92,6 +118,7 @@ impl Ciap {
         (self.running, self.q_mode, self.lba, self.drive_active) = (false, false, 0, false);
         (self.start_delay, self.drive_stopped, self.toc, self.toc_index) = (0, false, false, 0);
         (self.dma_request, self.cycles) = (None, 0);
+        (self.audio_playing, self.audio_wait, self.audio_next, self.audio_coding, self.asel) = (false, 0, 0, [0; 2], false);
     }
 
     /// Drive request from IKAT port D: a seek positions the next sector and starts the drive, a stop halts delivery.
@@ -182,16 +209,45 @@ impl Ciap {
         match reg {
             REG_IER | REG_ICR | REG_TEST => self.set(reg, value),
             // A written 1 toggles the bit: swaps a data or Q pair, queues a CPU-filled audio buffer.
-            REG_BMAN => self.set(REG_BMAN, self.reg(REG_BMAN) ^ value),
+            REG_BMAN => {
+                let before = self.reg(REG_BMAN);
+                self.set(REG_BMAN, before ^ value);
+                // Queuing an audio buffer captures the coding of the last ASHDW write; unqueuing one is reported once.
+                for (i, bit) in [(0usize, 0x01u16), (1, 0x02)] {
+                    if value & bit != 0 && before & bit == 0 {
+                        self.audio_coding[i] = ashdw_coding(self.reg(REG_ASHDW));
+                    } else if value & bit != 0 && self.loud.first(0x9_0000 | bit as u32) {
+                        eprintln!("CIAP audio buffer {} unqueued by the CPU pc~{:06X}", i, pc);
+                    }
+                }
+            }
             REG_CCR => {
                 self.set(REG_CCR, value);
                 self.command(value, pc);
             }
+            // Play control: 0x140 starts CPU-fed playback; 0x20 ends it when nothing is queued, 0xA0 always.
             REG_APCR => {
                 self.set(REG_APCR, value);
-                if value == 0x20 || value == 0xA0 {
-                    self.set(REG_ISR, self.reg(REG_ISR) | ISR_AUDIO_EVENT);
-                    self.set(REG_ASTAT, self.reg(REG_ASTAT) | 0x80);
+                let queued = self.reg(REG_BMAN) & 0x03 != 0;
+                match value {
+                    0x0140 if !self.audio_playing => (self.audio_playing, self.audio_wait) = (true, 1),
+                    // 0xA0 ends playback now, queued buffers stay unplayed; 0x20 only once nothing is queued.
+                    0x0020 | 0x00A0 if value == 0x00A0 || !queued => {
+                        self.audio_playing = false;
+                        self.set(REG_ISR, self.reg(REG_ISR) | ISR_AUDIO_EVENT);
+                        self.set(REG_ASTAT, self.reg(REG_ASTAT) | 0x80);
+                    }
+                    0x0140 | 0x0020 => {}
+                    0x0006 | 0x0040 | 0x0101 | 0x0142 | 0x0200 => {
+                        if self.loud.first(0x8_0000 | value as u32) {
+                            eprintln!("CIAP APCR {:04X} accepted, no effect modelled pc~{:06X}", value, pc);
+                        }
+                    }
+                    _ => {
+                        if self.loud.first(0x8_0000 | value as u32) {
+                            eprintln!("CIAP unmodelled APCR value {:04X} pc~{:06X}", value, pc);
+                        }
+                    }
                 }
             }
             // Bit 14 starts a one-shot copy through CPU DMA channel 0; the board runs it.
@@ -258,10 +314,11 @@ impl Ciap {
     }
 
     /// Advances the sector clock: one drive step every `CYCLES_PER_SECTOR`; the first sector comes on the second step after a seek, and a step with delivery off stops the drive.
-    pub fn tick(&mut self, cycles: u32, sector_cycles: u32, cdrom: &mut Option<CdRom>) {
+    pub fn tick(&mut self, cycles: u32, sector_cycles: u32, cdrom: &mut Option<CdRom>, audio: &mut CdiAudio) {
         self.cycles += cycles;
         while self.cycles >= sector_cycles {
             self.cycles -= sector_cycles;
+            self.audio_step(audio);
             if self.toc && self.running && self.q_mode {
                 if let Some(cd) = cdrom.as_ref() {
                     self.toc_entry(cd);
@@ -279,7 +336,7 @@ impl Ciap {
                     eprintln!("CIAP DRIVE stopped, delivery off");
                 }
             } else if let Some(cd) = cdrom.as_mut() {
-                self.sector(cd);
+                self.sector(cd, audio);
             }
         }
     }
@@ -313,7 +370,7 @@ impl Ciap {
     }
 
     // Delivers the sector at the drive position into the current data buffer, then advances it; the buffer manager is left to the CPU.
-    fn sector(&mut self, cd: &mut CdRom) {
+    fn sector(&mut self, cd: &mut CdRom, audio: &mut CdiAudio) {
         let lba = self.lba;
         self.lba += 1;
         let mut raw = [0u8; CD_SECTOR_RAW_SIZE];
@@ -328,7 +385,17 @@ impl Ciap {
             self.q_locator(cd, lba);
         }
         let (file, channel, submode) = (raw[16], raw[17], raw[18]);
-        // Every sector, audio included, goes to the data buffer; the CPU copies audio out itself (no chip-side audio path).
+        // Form 2 audio on a TACS channel, with selection on, is played by the chip as it passes.
+        if self.tacs_selected(submode, channel) {
+            let coding = raw[23];
+            // Own decoder state and queue, so a CPU-fed stream at the same time is not disturbed.
+            audio.decode_audio_map_sector(&raw[24..24 + AUDIO_LEN], coding & 0x03 == 0x01, coding & 0x30 == 0x10, if coding & 0x0C == 0x04 { 18900 } else { 37800 });
+            self.audio_sectors += 1;
+            if self.audio_playing {
+                self.audio_overlap += 1;
+            }
+        }
+        // Every sector, audio included, also goes to the data buffer.
         let taken = self.data_buffer().map(|at| self.ram[at..at + DATA_LEN].copy_from_slice(&raw[12..12 + DATA_LEN]));
         let mut flags = if taken.is_some() { ISR_DATA } else { 0 };
         if submode & 0x10 != 0 {
@@ -388,17 +455,56 @@ impl Ciap {
         }
     }
 
+    // Selection on, Form 2 audio submode, channel in TACS.
+    fn tacs_selected(&self, submode: u8, channel: u8) -> bool {
+        self.asel && submode & 0x24 == 0x24 && self.reg(REG_TACS) & (1 << (channel & 15)) != 0
+    }
+
+    // CPU-fed playback, one step per sector period: when the current buffer has played, take the next queued one, play it, hand it back (BMAN bit cleared, ISR bit 1); stop when none is queued.
+    fn audio_step(&mut self, audio: &mut CdiAudio) {
+        if !self.audio_playing {
+            return;
+        }
+        self.audio_wait = self.audio_wait.saturating_sub(1);
+        if self.audio_wait > 0 {
+            return;
+        }
+        let bman = self.reg(REG_BMAN);
+        let first = self.audio_next & 1;
+        let pick = [first, first ^ 1].into_iter().find(|&i| bman & (1 << i) != 0);
+        let Some(i) = pick else {
+            self.audio_playing = false;
+            return;
+        };
+        let (at, coding) = (AUDIO_BUFS[i], self.audio_coding[i]);
+        audio.decode_sector(&self.ram[at..at + AUDIO_LEN], coding & 0x03 == 0x01, coding & 0x30 == 0x10, if coding & 0x0C == 0x04 { 18900 } else { 37800 });
+        self.set(REG_BMAN, bman & !(1 << i));
+        self.set(REG_ISR, self.reg(REG_ISR) | ISR_AUDIO_DONE);
+        self.set(REG_APTR, (at as u16 + 0x800) / 2);
+        (self.audio_wait, self.audio_next) = (crate::cdic::get_sector_count_for_coding(coding), i ^ 1);
+        self.audio_buffers += 1;
+        if self.trace {
+            eprintln!("CIAP AUDIO buffer {} coding {:02X} played, next in {} periods", i, coding, self.audio_wait);
+        }
+    }
+
     // Commands: 0x94, 0xC4, 0x44 and 0x80 start delivery, 0x100 stops it; Q reporting with 0x10, 0x44 and 0x94, not with 0xC4.
     fn command(&mut self, v: u16, pc: u32) {
         match v {
             0x0094 => (self.running, self.q_mode) = (true, true),
             0x00C4 => (self.running, self.q_mode) = (true, false),
-            0x0100 => (self.running, self.q_mode) = (false, false),
+            0x0100 => (self.running, self.q_mode, self.asel) = (false, false, false),
             0x0044 => (self.running, self.q_mode) = (true, true),
             0x0080 => self.running = true,
             0x0010 => self.q_mode = true,
             // Accepted without a modelled effect; logged once so a run shows they arrived.
-            0x0008 | 0x7000 | 0x3000 | 0x0200 | 0x0040 => {
+            0x0008 => {
+                self.asel = true;
+                if self.loud.first(0x1_0008) {
+                    eprintln!("CIAP command 0008: selection on, TACS audio played by the chip (inferred) pc~{:06X}", pc);
+                }
+            }
+            0x7000 | 0x3000 | 0x0200 | 0x0040 => {
                 if self.loud.first(0x1_0000 | v as u32) {
                     eprintln!("CIAP command {:04X} accepted, no effect modelled pc~{:06X}", v, pc);
                 }
@@ -468,9 +574,9 @@ mod tests {
         let mut c = Ciap::default();
         let period = crate::mcd212::VideoMode::Pal.cycles_per_sector();
         c.drive(super::super::ikat::DriveEvent::Seek(13));
-        c.tick(period, period, &mut None);
+        c.tick(period, period, &mut None, &mut CdiAudio::new());
         assert!(c.drive_active && !c.drive_stopped);
-        c.tick(period, period, &mut None);
+        c.tick(period, period, &mut None, &mut CdiAudio::new());
         assert!(!c.drive_active && c.drive_stopped);
     }
 
@@ -509,6 +615,73 @@ mod tests {
         assert!(c.toc && !c.drive_active);
         c.reset();
         assert!(!c.toc && c.toc_index == 0);
+    }
+
+    #[test]
+    fn cpu_fed_audio_plays_queued_buffers_and_hands_them_back() {
+        let mut c = Ciap::default();
+        let mut audio = CdiAudio::new();
+        let period = crate::mcd212::VideoMode::Pal.cycles_per_sector();
+        c.write_reg(REG_ASHDW, 0x0800, 0);
+        c.write_reg(REG_BMAN, 0x01, 0);
+        c.write_reg(REG_BMAN, 0x02, 0);
+        assert_eq!((c.peek_reg(REG_BMAN) & 3, c.audio_coding), (3, [0x01, 0x01]));
+        c.write_reg(REG_APCR, 0x20, 0);
+        assert_eq!(c.peek_reg(REG_ISR) & ISR_AUDIO_EVENT, 0);
+        c.write_reg(REG_APCR, 0x140, 0);
+        c.write_reg(REG_IER, ISR_AUDIO_DONE, 0);
+        c.tick(period, period, &mut None, &mut audio);
+        assert_eq!((c.peek_reg(REG_BMAN) & 3, c.read_reg(REG_ISR, 0) & ISR_AUDIO_DONE), (2, ISR_AUDIO_DONE));
+        c.tick(period * 3, period, &mut None, &mut audio);
+        assert_eq!(c.peek_reg(REG_BMAN) & 3, 2);
+        c.tick(period, period, &mut None, &mut audio);
+        assert_eq!((c.peek_reg(REG_BMAN) & 3, c.audio_buffers), (0, 2));
+        c.tick(period * 4, period, &mut None, &mut audio);
+        assert!(!c.audio_playing);
+        c.write_reg(REG_APCR, 0x20, 0);
+        assert_eq!(c.peek_reg(REG_ISR) & ISR_AUDIO_EVENT, ISR_AUDIO_EVENT);
+        assert!(audio.total_sectors_decoded == 2);
+    }
+
+    #[test]
+    fn audio_stop_tacs_reset_and_state() {
+        let period = crate::mcd212::VideoMode::Pal.cycles_per_sector();
+        let mut audio = CdiAudio::new();
+        let mut c = Ciap::default();
+        c.write_reg(REG_BMAN, 0x03, 0);
+        c.write_reg(REG_APCR, 0x140, 0);
+        c.tick(period, period, &mut None, &mut audio);
+        assert_eq!(c.peek_reg(REG_BMAN) & 3, 2);
+        // 0xA0 stops with a buffer still queued; nothing more is played.
+        c.write_reg(REG_APCR, 0xA0, 0);
+        assert!(!c.audio_playing && c.peek_reg(REG_ISR) & ISR_AUDIO_EVENT != 0);
+        c.tick(period * 8, period, &mut None, &mut audio);
+        assert_eq!((c.peek_reg(REG_BMAN) & 3, c.audio_buffers), (2, 1));
+        // A buffer queued while playing is played in turn.
+        c.write_reg(REG_APCR, 0x140, 0);
+        c.write_reg(REG_BMAN, 0x01, 0);
+        c.tick(period * 9, period, &mut None, &mut audio);
+        assert_eq!(c.peek_reg(REG_BMAN) & 3, 0);
+        // State round trip during playback.
+        c.write_reg(REG_ASHDW, 0x3000, 0);
+        c.write_reg(REG_BMAN, 0x03, 0);
+        c.write_reg(REG_APCR, 0x140, 0);
+        c.tick(period, period, &mut None, &mut audio);
+        assert_eq!(c.audio_coding[1], 0x14);
+        // TACS selection needs ASEL, Form 2 audio and the channel bit.
+        c.write_reg(REG_TACS, 0x8000, 0);
+        assert!(!c.tacs_selected(0x64, 15));
+        c.write_reg(REG_CCR, 0x0008, 0);
+        assert!(c.tacs_selected(0x64, 15) && !c.tacs_selected(0x64, 14) && !c.tacs_selected(0x48, 15));
+        c.write_reg(REG_CCR, 0x0100, 0);
+        assert!(!c.tacs_selected(0x64, 15));
+        // Unmodelled APCR values are reported; reset clears the audio fields.
+        let before = c.loud.count;
+        c.write_reg(REG_APCR, 0x1234, 0);
+        assert_eq!(c.loud.count, before + 1);
+        c.write_reg(REG_CCR, 0x0008, 0);
+        c.reset();
+        assert_eq!((c.audio_playing, c.audio_wait, c.audio_next, c.audio_coding, c.asel), (false, 0, 0, [0; 2], false));
     }
 
     #[test]
