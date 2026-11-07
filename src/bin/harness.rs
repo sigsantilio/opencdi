@@ -67,7 +67,7 @@ fn main() {
         match a[i].as_str() {
             "--dvc" => { i += 1; dvc = a.get(i); }
             "--ppm" => { i += 1; ppm = a.get(i); }
-            "--nvram-out" => { i += 1; nvram_out = a.get(i); }
+            "--nvram-out" => { i += 1; nvram_out = Some(a.get(i).unwrap_or_else(|| usage())); }
             "--ntsc" => ntsc = true,
             "--autoplay" => autoplay = true,
             "--print-autoplay-script" => print_script = true,
@@ -183,7 +183,10 @@ fn main() {
         dump_ppm(m.framebuffer(), p);
     }
     if let Some(p) = nvram_out {
-        std::fs::write(p, &m.bus.nvram.ram[..]).expect("write nvram");
+        if let Err(e) = std::fs::write(p, &m.bus.nvram.ram[..]) {
+            eprintln!("cannot write nvram {}: {}", p, e);
+            std::process::exit(1);
+        }
     }
     println!(
         "\nHARNESS frames={} pc={:08x} nonblack={} video_last={:016x} video_all={:016x} audio={:016x} audio_samples={}",
