@@ -83,6 +83,7 @@ pub struct Ciap {
     pub audio_wait: u8, // sector periods until the next audio-done step
     pub audio_next: usize, // audio buffer the next step looks at first
     pub audio_coding: [u8; 2], // coding captured from ASHDW when the CPU queued each buffer
+    pub event_armed: bool, // APCR 0x20 written while a buffer was queued
     pub asel: bool, // CCR 0x0008: chip plays audio sectors of the TACS channels until CCR 0x0100
     pub audio_buffers: u64,
     pub audio_sectors: u64,
@@ -106,7 +107,7 @@ pub struct Ciap {
 
 impl Default for Ciap {
     fn default() -> Self {
-        Self { ram: vec![0; WINDOW_SIZE], regs: power_on_regs(), running: false, q_mode: false, lba: 0, drive_active: false, audio_playing: false, audio_wait: 0, audio_next: 0, audio_coding: [0; 2], asel: false, audio_buffers: 0, audio_sectors: 0, audio_overlap: 0, toc: false, toc_index: 0, start_delay: 0, drive_stopped: false, cycles: 0, dma_request: None, seeks: 0, sectors: 0, skipped: 0, dmas: 0, byteswap: false, descrambled: 0, q_reports: 0, loud: Loud::default(), trace: false }
+        Self { ram: vec![0; WINDOW_SIZE], regs: power_on_regs(), running: false, q_mode: false, lba: 0, drive_active: false, audio_playing: false, audio_wait: 0, audio_next: 0, audio_coding: [0; 2], event_armed: false, asel: false, audio_buffers: 0, audio_sectors: 0, audio_overlap: 0, toc: false, toc_index: 0, start_delay: 0, drive_stopped: false, cycles: 0, dma_request: None, seeks: 0, sectors: 0, skipped: 0, dmas: 0, byteswap: false, descrambled: 0, q_reports: 0, loud: Loud::default(), trace: false }
     }
 }
 
@@ -131,6 +132,7 @@ impl Ciap {
         (self.start_delay, self.drive_stopped, self.toc, self.toc_index) = (0, false, false, 0);
         (self.dma_request, self.cycles) = (None, 0);
         (self.audio_playing, self.audio_wait, self.audio_next, self.audio_coding, self.asel) = (false, 0, 0, [0; 2], false);
+        self.event_armed = false;
     }
 
     /// Drive request from IKAT port D: a seek positions the next sector and starts the drive, a stop halts delivery.
@@ -243,12 +245,15 @@ impl Ciap {
                 let queued = self.reg(REG_BMAN) & 0x03 != 0;
                 match value {
                     0x0140 if !self.audio_playing => (self.audio_playing, self.audio_wait) = (true, 1),
-                    // Audio event: 0xA0 at once (queued buffers still play out), 0x20 only when nothing is queued.
+                    // Audio event: 0xA0 at once (queued buffers still play out), 0x20 at once only when nothing is queued.
                     0x0020 | 0x00A0 if value == 0x00A0 || !queued => {
                         self.set(REG_ISR, self.reg(REG_ISR) | ISR_AUDIO_EVENT);
                         self.set(REG_ASTAT, self.reg(REG_ASTAT) | 0x80);
+                        self.event_armed = false;
                     }
-                    0x0140 | 0x0020 => {}
+                    // 0x20 with a buffer queued: the event follows once the queue has played out.
+                    0x0020 => self.event_armed = true,
+                    0x0140 => {}
                     0x0006 | 0x0040 | 0x0101 | 0x0142 | 0x0200 => {
                         if self.loud.first(0x8_0000 | value as u32) {
                             eprintln!("CIAP APCR {:04X} accepted, no effect modelled pc~{:06X}", value, pc);
@@ -324,7 +329,7 @@ impl Ciap {
         self.dmas += 1;
     }
 
-    /// Advances the sector clock: one drive step every `CYCLES_PER_SECTOR`; the first sector comes on the second step after a seek, and a step with delivery off stops the drive.
+    /// Advances the sector clock: one drive step every `sector_cycles`; the first sector comes on the second step after a seek, and a step with delivery off stops the drive.
     pub fn tick(&mut self, cycles: u32, sector_cycles: u32, cdrom: &mut Option<CdRom>, audio: &mut CdiAudio) {
         self.cycles += cycles;
         while self.cycles >= sector_cycles {
@@ -494,6 +499,13 @@ impl Ciap {
         let pick = [first, first ^ 1].into_iter().find(|&i| bman & (1 << i) != 0);
         let Some(i) = pick else {
             self.audio_playing = false;
+            if std::mem::take(&mut self.event_armed) {
+                self.set(REG_ISR, self.reg(REG_ISR) | ISR_AUDIO_EVENT);
+                self.set(REG_ASTAT, self.reg(REG_ASTAT) | 0x80);
+                if self.trace {
+                    eprintln!("CIAP AUDIO event after the queue played out");
+                }
+            }
             return;
         };
         let (at, coding) = (AUDIO_BUFS[i], self.audio_coding[i]);
@@ -657,7 +669,11 @@ mod tests {
         c.tick(period, period, &mut None, &mut audio);
         assert_eq!((c.peek_reg(REG_BMAN) & 3, c.audio_buffers), (0, 2));
         c.tick(period * 4, period, &mut None, &mut audio);
-        assert!(!c.audio_playing);
+        // The 0x20 written while buffers were queued raises the event once the queue has played out.
+        assert!(!c.audio_playing && !c.event_armed);
+        assert_eq!(c.read_reg(REG_ISR, 0) & ISR_AUDIO_EVENT, ISR_AUDIO_EVENT);
+        c.tick(period * 4, period, &mut None, &mut audio);
+        assert_eq!(c.peek_reg(REG_ISR) & ISR_AUDIO_EVENT, 0);
         c.write_reg(REG_APCR, 0x20, 0);
         assert_eq!(c.peek_reg(REG_ISR) & ISR_AUDIO_EVENT, ISR_AUDIO_EVENT);
         assert!(audio.total_sectors_decoded == 2);
