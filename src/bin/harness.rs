@@ -223,7 +223,7 @@ fn main() {
         let idle = idle_first.map_or("none".to_string(), |f| f.to_string());
         let ciap = m.bus.mono4.as_deref().map_or(String::new(), |m4| {
             let c = &m4.ciap;
-            format!(" seeks={} sectors={} skipped={} dmas={}", c.seeks, c.sectors, c.skipped, c.dmas)
+            format!(" buserr={} seeks={} sectors={} skipped={} dmas={}", m.bus.counters.bus_errors, c.seeks, c.sectors, c.skipped, c.dmas)
         });
         println!("COUNTERS {}{} idle_first={}", m.bus.counters.summary(), ciap, idle);
     }
