@@ -16,6 +16,13 @@ pub struct Port {
     pub reply: VecDeque<u8>,
 }
 
+/// Drive request from a port D command, applied to the CIAP by the board.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveEvent {
+    Seek(u32),
+    Stop,
+}
+
 #[derive(Default)]
 pub struct Ikat {
     pub mode: u8,
@@ -23,6 +30,9 @@ pub struct Ikat {
     pub ports: [Port; 4],
     pub pointer_enabled: bool,
     pub pal: bool, // video standard reported by the identification reply; set by the bus before each write
+    pub disc_present: bool,
+    pub status_polls: u8, // drive status polls answered since the disc appeared
+    pub drive_event: Option<DriveEvent>,
     pub loud: Loud,
     pub trace: bool,
 }
@@ -39,9 +49,15 @@ fn hex(b: &[u8]) -> String {
 
 impl Ikat {
     pub fn reset(&mut self) {
-        let (pal, trace) = (self.pal, self.trace);
+        let (pal, trace, disc_present) = (self.pal, self.trace, self.disc_present);
         let loud = std::mem::take(&mut self.loud);
-        *self = Self { pal, trace, loud, ..Self::default() };
+        *self = Self { pal, trace, disc_present, loud, ..Self::default() };
+    }
+
+    /// Disc inserted or removed; the status replies restart their spin-up sequence.
+    pub fn set_disc_present(&mut self, present: bool) {
+        self.disc_present = present;
+        self.status_polls = 0;
     }
 
     /// Ports holding an unread reply, as pending bits.
@@ -173,8 +189,29 @@ impl Ikat {
     // Port D: drive commands, four bytes, command byte first with bit 7 set.
     fn execute_d(&mut self, cmd: &[u8], pc: u32) {
         match cmd[0] {
-            0xB0 | 0xA1 => self.respond(3, &[0xB0, 0x00, 0x00, 0x00]),
-            0xB2 => self.respond(3, &[0xB2, 0x00, 0x00, 0x00]),
+            // Status: without a disc all zero; with one, two spin-up replies (0x610, 0x60E), then ready (0x215).
+            0xB0 | 0xA1 => {
+                let st: [u8; 2] = match (self.disc_present, self.status_polls) {
+                    (false, _) => [0x00, 0x00],
+                    (true, 0) => [0x06, 0x10],
+                    (true, 1) => [0x06, 0x0E],
+                    (true, _) => [0x02, 0x15],
+                };
+                if self.disc_present {
+                    self.status_polls = self.status_polls.saturating_add(1);
+                }
+                self.respond(3, &[0xB0, 0x00, st[0], st[1]]);
+            }
+            0xB1 => self.respond(3, &[0xB1, 0x00, 0x02, 0x00]),
+            0xB2 => self.respond(3, if self.disc_present { &[0xB2, 0x20, 0x00, 0x01] } else { &[0xB2, 0x00, 0x00, 0x00] }),
+            // Seek to a BCD time; the next sector delivered is that time minus 150 frames. No reply.
+            0xE0 | 0xE1 => {
+                let bcd = |b: u8| ((b >> 4) * 10 + (b & 0x0F)) as u32;
+                let frames = (bcd(cmd[1]) * 60 + bcd(cmd[2])) * 75 + bcd(cmd[3]);
+                self.drive_event = Some(DriveEvent::Seek(frames.saturating_sub(150)));
+            }
+            0xC2 | 0xC3 => self.drive_event = Some(DriveEvent::Stop),
+            0xA2 | 0xA6 | 0xA7 | 0xC0 | 0xC1 | 0xC4 | 0xC5 => {}
             c => {
                 if self.loud.first(0x3_0000 | c as u32) {
                     eprintln!("IKAT unmodelled port D command {} pc~{:06X}", hex(cmd), pc);
@@ -206,5 +243,24 @@ mod tests {
         assert_eq!(k.ports[0].cmd, [0x80, 0x4E]);
         k.write(0x01, 0x73, 0);
         assert!(k.ports[0].cmd.is_empty());
+    }
+
+    #[test]
+    fn drive_status_sequence_and_seek() {
+        let mut k = Ikat::default();
+        k.set_disc_present(true);
+        let mut status = || {
+            for b in [0xB0, 0, 0, 0] {
+                k.write(0x07, b, 0);
+            }
+            (0..4).map(|_| k.read(0x0F, 0)).collect::<Vec<u8>>()
+        };
+        assert_eq!(status(), [0xB0, 0x00, 0x06, 0x10]);
+        assert_eq!(status(), [0xB0, 0x00, 0x06, 0x0E]);
+        assert_eq!(status(), [0xB0, 0x00, 0x02, 0x15]);
+        for b in [0xE1, 0x00, 0x02, 0x13] {
+            k.write(0x07, b, 0);
+        }
+        assert_eq!(k.drive_event, Some(DriveEvent::Seek(13)));
     }
 }

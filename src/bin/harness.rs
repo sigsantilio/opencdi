@@ -218,7 +218,11 @@ fn main() {
     );
     if counters || idle_pc.is_some() {
         let idle = idle_first.map_or("none".to_string(), |f| f.to_string());
-        println!("COUNTERS {} idle_first={}", m.bus.counters.summary(), idle);
+        let ciap = m.bus.mono4.as_deref().map_or(String::new(), |m4| {
+            let c = &m4.ciap;
+            format!(" seeks={} sectors={} skipped={} dmas={}", c.seeks, c.sectors, c.skipped, c.dmas)
+        });
+        println!("COUNTERS {}{} idle_first={}", m.bus.counters.summary(), ciap, idle);
     }
     if print_script {
         println!("AUTOPLAY_SCRIPT {}", input_script::format(&recorded));
