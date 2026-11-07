@@ -73,6 +73,22 @@ The optimized binary will be built in `target/release/opencdi.exe`.
 
 On Linux the same command builds `target/release/opencdi` (needs the ALSA and udev development packages; the window uses X11 or Wayland).
 
+## Raspberry Pi 4 (libretro core)
+
+The libretro core (`crates/opencdi-libretro`) is pure Rust with no ALSA or udev dependency, so it cross-builds for the Pi without a sysroot. [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild) with Zig as the linker pins the glibc version; `.2.36` matches Raspberry Pi OS Bookworm.
+
+```bash
+rustup target add aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf
+cargo install --locked cargo-zigbuild
+
+# 64-bit Raspberry Pi OS
+cargo zigbuild --release -p opencdi-libretro --target aarch64-unknown-linux-gnu.2.36
+# 32-bit Raspberry Pi OS
+cargo zigbuild --release -p opencdi-libretro --target armv7-unknown-linux-gnueabihf.2.36
+```
+
+The core is `target/<triple>/release/libopencdi_libretro.so`. Copy it to the RetroArch cores directory and `crates/opencdi-libretro/opencdi_libretro.info` to the core info directory, and put the system ROM in RetroArch's `system` directory. To tune for the Pi 4, set `RUSTFLAGS="-C target-cpu=cortex-a72"` for the build.
+
 ## System BIOS & Required Files Setup
 
 OpenCDi is a low-level hardware emulator that executes authentic Philips CD-i firmware to initialize the OS-9 operating system kernel, bus controllers, and system drivers. Due to copyright restrictions, **these proprietary system ROMs are not bundled with the emulator and must be provided by the user.**
