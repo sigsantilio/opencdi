@@ -5,12 +5,12 @@ use std::path::Path;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use m68k::{CpuCore, CpuType};
 
-use crate::bus::{CdiBus, SharedIn4Owner};
+use crate::bus::{BoardKind, CdiBus, SharedIn4Owner};
 use crate::mcd212::VideoMode;
 use crate::dvc::mpeg::{Buffer, Frame, Plane, Video};
 use crate::dvc::mpeg::video::Motion;
 
-const SAVESTATE_MAGIC: &[u8; 8] = b"OCDIST03";
+const SAVESTATE_MAGIC: &[u8; 8] = b"OCDIST04";
 
 struct StateWriter {
     buf: Vec<u8>,
@@ -581,6 +581,12 @@ pub fn save_state_to_file<P: AsRef<Path>>(
         None => w.write_bool(false),
     }
 
+    // 11. Mono-IV board chips
+    w.write_bool(bus.board == BoardKind::Mono4);
+    if let Some(m) = bus.mono4.as_deref() {
+        w.write_bytes(&m.save_blob(&bus.dvc));
+    }
+
     let p = path.as_ref();
     if let Some(parent) = p.parent() {
         if !parent.as_os_str().is_empty() {
@@ -1041,6 +1047,16 @@ pub fn load_state_from_file<P: AsRef<Path>>(
         });
     } else {
         bus.dvc.video_decoder = None;
+    }
+
+    // 11. Mono-IV board chips
+    let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+    if r.read_bool()? != (bus.board == BoardKind::Mono4) {
+        return Err(bad("save state is from a different board"));
+    }
+    if let Some(m) = bus.mono4.as_deref_mut() {
+        let blob = r.read_bytes()?;
+        m.load_blob(&blob, &mut bus.dvc).ok_or_else(|| bad("bad Mono-IV chip state"))?;
     }
 
     Ok(())

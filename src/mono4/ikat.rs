@@ -365,6 +365,32 @@ impl Ikat {
 }
 
 
+impl Ikat {
+    pub fn save(&self, w: &mut Vec<u8>) {
+        w.extend_from_slice(&[self.mode, self.imr, self.keyboard_enabled as u8, self.pal as u8, self.disc_present as u8, self.toc_reply as u8, self.reset_request as u8]);
+        for p in &self.ports {
+            super::put_vec(w, &p.cmd);
+            super::put_vec(w, &p.reply.iter().copied().collect::<Vec<u8>>());
+            w.extend_from_slice(&(p.len as u32).to_le_bytes());
+        }
+        w.extend_from_slice(&self.pointer.0.to_le_bytes());
+        w.extend_from_slice(&self.pointer.1.to_le_bytes());
+        w.push(self.pointer.2);
+    }
+
+    pub fn load(&mut self, r: &mut super::BlobReader) -> Option<()> {
+        (self.mode, self.imr) = (r.u8()?, r.u8()?);
+        (self.keyboard_enabled, self.pal, self.disc_present, self.toc_reply, self.reset_request) = (r.bool()?, r.bool()?, r.bool()?, r.bool()?, r.bool()?);
+        for p in self.ports.iter_mut() {
+            p.cmd = r.vec()?;
+            p.reply = r.vec()?.into();
+            p.len = r.u32()? as usize;
+        }
+        self.pointer = (r.u32()? as i32, r.u32()? as i32, r.u8()?);
+        Some(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
