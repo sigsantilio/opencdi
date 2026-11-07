@@ -515,7 +515,7 @@ pub extern "C" fn retro_run() {
         let mut core = lock(&CORE);
         let Core { machine, input, uart_line, .. } = &mut *core;
         let Some(m) = machine.as_mut() else { return };
-        input.apply(cb.input_state, &mut m.bus.slave);
+        input.apply(cb.input_state, &mut m.bus);
         m.run_frame();
         if let Some(buf) = m.bus.uart_capture.as_mut() {
             drain_uart(buf, uart_line);

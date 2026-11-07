@@ -334,7 +334,9 @@ pub fn inspect(mut data: Vec<u8>) -> BiosImage {
             msg += ": known good dump";
             Status::Ok
         };
-        if !k.board.emulated() {
+        if k.board == Board::Mono4 {
+            msg += "; the Mono-IV board is experimental";
+        } else if !k.board.emulated() {
             msg += &format!("; the {} board is not emulated yet, so it will not boot", k.board.name());
         }
         return BiosImage { report: report(status, Some(k), Some(k.board), swap, sha, msg), data };
@@ -383,6 +385,26 @@ pub fn inspect(mut data: Vec<u8>) -> BiosImage {
 
 /// Size of the Digital Video Cartridge ROM (256 KB).
 pub const DVC_ROM_SIZE: usize = 256 * 1024;
+
+/// Checks a cartridge ROM for the Mono-IV board: only the known IMPEG dump fits there.
+pub fn inspect_impeg(data: Vec<u8>) -> BiosImage {
+    let found = identify(&data);
+    impeg_verdict(found, data)
+}
+
+fn impeg_verdict(found: Option<(&'static KnownRom, bool)>, data: Vec<u8>) -> BiosImage {
+    let sha = sha1_hex(&data);
+    let (status, known, msg) = match found {
+        Some((k, false)) if k.kind == Dvc && k.board == Mono4 => (Status::Ok, Some(k), format!("{}, {}: known good dump", k.model, k.file)),
+        Some((k, true)) if k.kind == Dvc && k.board == Mono4 => (Status::Error, Some(k), format!("{} ({}): word-swapped dump; use the dump in CPU byte order", k.model, k.file)),
+        Some((k, _)) if k.kind == Dvc => (Status::Error, Some(k), format!("{} ({}): only the IMPEG cartridge fits the Mono-IV board", k.model, k.file)),
+        Some((k, _)) => (Status::Error, Some(k), format!("this is the {} ROM, not a cartridge ROM", k.model)),
+        None if data.len() == DVC_ROM_SIZE && data.starts_with(&[0x4A, 0xFC]) => (Status::Error, None, format!("unknown cartridge image (SHA-1 {}): an IMPEG ROM that differs from the known dump is not fitted", sha)),
+        None => (Status::Error, None, "unknown cartridge image: only the known IMPEG dump fits the Mono-IV board".into()),
+    };
+    let board = (status == Status::Ok).then_some(Mono4);
+    BiosImage { report: report(status, known, board, false, sha, msg), data }
+}
 
 /// Checks a would-be DVC cartridge ROM; only the known VMPEG dump comes back `Ok`, since only VMPEG is emulated.
 pub fn inspect_dvc(data: Vec<u8>) -> BiosImage {
@@ -643,6 +665,15 @@ mod tests {
         assert_eq!(find(swapped_row, &wswap), Some(true));
         assert_eq!(find(swapped_row, &cpu), Some(false));
         assert_eq!(find(cpu_row, &vec![0u8; SYSTEM_ROM_SIZE]), None);
+    }
+
+    #[test]
+    fn impeg_cartridge_in_word_swapped_order_is_refused() {
+        let data = vec![0x4A, 0xFC, 0, 0];
+        let row = Box::leak(Box::new(rom("test.rom", "Test IMPEG", Mono4, Dvc, 4, 0, "", Cpu, true, "")));
+        let img = impeg_verdict(Some((row, true)), data.clone());
+        assert!(img.report.status == Status::Error && img.report.message.contains("word-swapped"));
+        assert_eq!(impeg_verdict(Some((row, false)), data).report.status, Status::Ok);
     }
 
     #[test]
