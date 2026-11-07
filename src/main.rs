@@ -248,7 +248,7 @@ fn write_state_file(path: &Path, m: &Machine, frontend: &[u8]) -> std::io::Resul
     }
     let mut buf = Vec::new();
     m.save_state(frontend, &mut buf);
-    let tmp = path.with_extension("tmp");
+    let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
     std::fs::write(&tmp, &buf)?;
     std::fs::rename(&tmp, path)?;
     Ok(buf.len())
