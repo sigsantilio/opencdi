@@ -1,4 +1,4 @@
-// System ROM checks on byte buffers (no files): identify by hash, undo word swaps, flag truncated or foreign images; see doc/handover/bios-detection.md.
+// System ROM checks on byte buffers (no files): identify by hash, undo word swaps, flag truncated or foreign images.
 use std::fmt;
 use std::io::Read;
 
