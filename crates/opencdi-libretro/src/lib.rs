@@ -359,7 +359,7 @@ fn spill_to_temp(data: &[u8]) -> Result<PathBuf, String> {
 }
 
 fn fps(mode: VideoMode) -> f64 {
-    1.0 / mode.frame_duration().as_secs_f64()
+    opencdi::audio::frame_rate(mode)
 }
 
 fn region_of(mode: VideoMode) -> c_uint {
