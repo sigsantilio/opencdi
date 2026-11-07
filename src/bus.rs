@@ -3,6 +3,7 @@ use std::path::Path;
 use std::io::{self, Write};
 use log::trace;
 use m68k::AddressBus;
+use m68k::core::memory::{BusFault, BusFaultKind};
 
 use crate::cdic::{Cdic, CDIC_RAM_SIZE};
 use crate::cdrom::CdRom;
@@ -33,6 +34,7 @@ pub enum BoardKind {
 pub struct CdiBus {
     pub board: BoardKind,
     pub mono4: Option<Box<Mono4>>, // Some exactly when `board` is Mono4
+    pub mono4_bus_errors: bool, // Mono-IV: unmapped data accesses raise a bus error (default); CDI_MONO4_BUSERR=0 reads 0xFF instead
     pub rom: Box<[u8; 512 * 1024]>,
     pub sys_ram: Box<[u8; 512 * 1024]>,
     pub dvc: Dvc,
@@ -70,6 +72,7 @@ impl CdiBus {
         Self {
             board: BoardKind::Mono1,
             mono4: None,
+            mono4_bus_errors: std::env::var_os("CDI_MONO4_BUSERR").is_none_or(|v| v != "0"),
             rom: vec![0u8; 512 * 1024].into_boxed_slice().try_into().unwrap(),
             sys_ram: vec![0u8; 512 * 1024].into_boxed_slice().try_into().unwrap(),
             dvc: Dvc::new(),
@@ -1089,6 +1092,31 @@ impl CdiBus {
         self.wr8(address.wrapping_add(1), value as u8);
     }
 
+    /// Mono-IV address with no device behind it (the unconnected lanes of IKAT and NVRAM are mapped); the on-chip block is only at 0x80000000, its 24-bit alias at 0x800000 counts as unmapped.
+    fn mono4_unmapped_address(address: u32) -> bool {
+        if (address & 0xFFFF_0000) == 0x8000_0000 {
+            return false;
+        }
+        !matches!(address & 0x00FF_FFFF, 0x000000..=0x07FFFF | 0x200000..=0x27FFFF | 0x300000..=0x303FFF | 0x310000..=0x32FFFF | 0x400000..=0x47FFFF | 0x4FFFE0..=0x4FFFFF)
+    }
+
+    // A bus error for an unmapped Mono-IV access when that policy is on; counted and logged like other unmapped accesses.
+    #[inline]
+    fn bus_error(&mut self, kind: &str, address: u32, last: u32) -> Result<(), BusFault> {
+        if !self.mono4_bus_errors || self.board != BoardKind::Mono4 {
+            return Ok(());
+        }
+        let hit = (address..=address.wrapping_add(last)).step_by(2).find(|&a| Self::mono4_unmapped_address(a));
+        match hit {
+            None => Ok(()),
+            Some(a) => {
+                self.counters.bus_errors += 1;
+                self.mono4_unmapped(kind, a & 0x00FF_FFFF, 0xFF);
+                Err(BusFault { kind: BusFaultKind::BusError, address: a })
+            }
+        }
+    }
+
     #[cold]
     fn mono4_unmapped(&mut self, kind: &str, addr: u32, value: u32) {
         self.counters.unmapped += 1;
@@ -1308,6 +1336,39 @@ impl AddressBus for CdiBus {
         (hi << 16) | lo
     }
 
+    fn try_read_byte(&mut self, address: u32) -> Result<u8, BusFault> {
+        self.bus_error("BERR R8", address, 0)?;
+        Ok(self.read_byte(address))
+    }
+
+    fn try_read_word(&mut self, address: u32) -> Result<u16, BusFault> {
+        self.bus_error("BERR R16", address, 0)?;
+        Ok(self.read_word(address))
+    }
+
+    fn try_read_long(&mut self, address: u32) -> Result<u32, BusFault> {
+        self.bus_error("BERR R32", address, 2)?;
+        Ok(self.read_long(address))
+    }
+
+    fn try_write_byte(&mut self, address: u32, value: u8) -> Result<(), BusFault> {
+        self.bus_error("BERR W8", address, 0)?;
+        self.write_byte(address, value);
+        Ok(())
+    }
+
+    fn try_write_word(&mut self, address: u32, value: u16) -> Result<(), BusFault> {
+        self.bus_error("BERR W16", address, 0)?;
+        self.write_word(address, value);
+        Ok(())
+    }
+
+    fn try_write_long(&mut self, address: u32, value: u32) -> Result<(), BusFault> {
+        self.bus_error("BERR W32", address, 2)?;
+        self.write_long(address, value);
+        Ok(())
+    }
+
     fn write_byte(&mut self, address: u32, value: u8) {
         if self.taps.mmio && tap::in_mmio_window(address) {
             self.tap_mmio("W8", address, value as u32);
@@ -1374,5 +1435,10 @@ mod tests {
         assert_eq!(bus.read_byte(0x32FFFE), 0x00);
         assert_eq!(bus.read_byte(0x500000), 0xFF);
         assert_eq!(bus.counters.unmapped, 3);
+        bus.mono4_bus_errors = true;
+        assert!(bus.try_read_word(0x500000).is_err() && bus.try_read_word(0x800000).is_err());
+        assert!(bus.try_read_word(0x320011).is_ok() && bus.try_read_byte(0x8000_2011).is_ok());
+        assert_eq!(bus.counters.bus_errors, 2);
     }
 }
+

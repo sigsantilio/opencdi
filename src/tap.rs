@@ -31,6 +31,7 @@ pub struct Counters {
     pub iack_this_frame: u64,
     pub iack_max_frame: u64,
     pub unmapped: u64,
+    pub bus_errors: u64,
     pub frames: u64,
 }
 
