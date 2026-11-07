@@ -39,6 +39,7 @@ pub struct Ikat {
     pub pointer: (i32, i32, u8), // host pointer: x 0..767, y 0..559, buttons (1, 2, 4 = third button)
     pub loud: Loud,
     pub trace: bool,
+    reported: Option<(i32, i32)>, // position the driver last learned from a report; None until an absolute one
 }
 
 impl Default for Ikat {
@@ -57,6 +58,7 @@ impl Default for Ikat {
             pointer: (384, 280, 0),
             loud: Loud::default(),
             trace: false,
+            reported: None,
         }
     }
 }
@@ -105,19 +107,46 @@ impl Ikat {
         }
     }
 
-    // Absolute report: x and y scaled to 0..1023, second byte bit 4 always set (never read by the BIOS); the third button presses buttons 1 and 2.
+    // Moves up to 127 per axis go out as relative reports so a position the title set itself stays valid; larger jumps and the enable report are absolute: x and y scaled to 0..1023, second byte bit 4 always set (never read by the BIOS); the third button presses buttons 1 and 2.
     fn send_pointer(&mut self) {
         let (x, y, b) = self.pointer;
-        let (x, y) = ((x * 0x3FF / 0x2FF) as u16, (y * 0x3FF / 0x22F) as u16);
         let third = b & 4 != 0;
         let (b1, b2) = (b & 1 != 0 || third, b & 2 != 0 || third);
+        let btn = if b1 { 0x20 } else { 0 } | if b2 { 0x10 } else { 0 };
+        if let Some((rx, ry)) = self.reported {
+            let (dx, dy) = (x - rx, y - ry);
+            if dx.abs() <= 127 && dy.abs() <= 127 {
+                self.reported = Some((x, y));
+                self.send_relative(btn, dx, dy);
+                return;
+            }
+        }
+        self.reported = Some((x, y));
+        let (x, y) = ((x * 0x3FF / 0x2FF) as u16, (y * 0x3FF / 0x22F) as u16);
         let r = [
-            0x40 | if b1 { 0x20 } else { 0 } | if b2 { 0x10 } else { 0 } | ((x >> 6) & 0x0F) as u8,
+            0x40 | btn | ((x >> 6) & 0x0F) as u8,
             0x10 | ((y >> 6) & 0x0F) as u8,
             (x & 0x3F) as u8,
             (y & 0x3F) as u8 | 0x80,
         ];
         self.respond(1, &r);
+    }
+
+    fn send_relative(&mut self, btn: u8, dx: i32, dy: i32) {
+        let (dx, dy) = ((dx as i8) as u8, (dy as i8) as u8);
+        let r = [0x40 | btn | ((dy >> 6) & 3) << 2 | (dx >> 6) & 3, dx & 0x3F, dy & 0x3F, 0];
+        self.respond(1, &r);
+    }
+
+    /// A move the host position could not follow (held against its edge); the title's own position may be elsewhere, so it still goes out as a relative report.
+    pub fn push_pointer(&mut self, dx: i32, dy: i32) {
+        if (dx, dy) == (0, 0) || self.imr & pending_bit(1) == 0 || self.reported.is_none() {
+            return;
+        }
+        let b = self.pointer.2;
+        let third = b & 4 != 0;
+        let btn = if b & 1 != 0 || third { 0x20 } else { 0 } | if b & 2 != 0 || third { 0x10 } else { 0 };
+        self.send_relative(btn, dx.clamp(-127, 127), dy.clamp(-127, 127));
     }
 
     /// Ports holding an unread reply, as pending bits.
@@ -213,6 +242,7 @@ impl Ikat {
                 }
                 self.imr = value;
                 if value & pending_bit(1) != 0 {
+                    self.reported = None;
                     self.send_pointer();
                 }
                 self.trace_irq(irq);
@@ -413,6 +443,22 @@ mod tests {
         k.write(0x1B, 0x80, 0);
         k.update_pointer(10, 10, 0);
         assert_eq!(k.pending(), 0);
+    }
+
+    #[test]
+    fn small_pointer_moves_are_relative() {
+        let mut k = Ikat { pointer: (384, 280, 0), ..Ikat::default() };
+        k.write(0x1B, 0x08, 0);
+        (0..4).for_each(|_| { k.read(0x0B, 0); });
+        k.update_pointer(381, 283, 0);
+        let r: Vec<u8> = (0..4).map(|_| k.read(0x0B, 0)).collect();
+        assert_eq!(r, [0x43, 0x3D, 0x03, 0x00]);
+        k.update_pointer(382, 284, 0);
+        let r: Vec<u8> = (0..4).map(|_| k.read(0x0B, 0)).collect();
+        assert_eq!(r, [0x40, 0x01, 0x01, 0x00]);
+        k.push_pointer(0, -3);
+        let r: Vec<u8> = (0..4).map(|_| k.read(0x0B, 0)).collect();
+        assert_eq!(r, [0x4C, 0x00, 0x3D, 0x00]);
     }
 
     #[test]
