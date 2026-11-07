@@ -317,7 +317,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flag_value = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
     let rom_arg = flag_value("--rom").map(PathBuf::from);
     let max_frames: Option<u64> = flag_value("--frames").and_then(|s| s.parse().ok());
-    let monitor: Option<usize> = flag_value("--monitor").and_then(|s| s.parse().ok());
+    let monitor: Option<usize> = flag_value("--monitor").and_then(|s| {
+        let n = s.parse().ok();
+        if n.is_none() {
+            warn!("--monitor {:?} is not a number, using the current monitor", s);
+        }
+        n
+    });
 
     let mut m = Machine::new();
     m.bus.slave.debug_log = has_flag("--slave-debug");
@@ -697,8 +703,15 @@ impl App {
     }
 
     fn toggle_fullscreen(&mut self) {
+        let full = self.window.as_ref().is_some_and(|w| w.fullscreen().is_none());
+        self.set_fullscreen(full);
+    }
+
+    fn set_fullscreen(&mut self, full: bool) {
         if let Some(window) = &self.window {
-            let full = window.fullscreen().is_none();
+            if window.fullscreen().is_some() == full {
+                return;
+            }
             if full {
                 // A maximised window is restored by the platform itself
                 self.windowed = Some((window.outer_position().ok(), window.inner_size())).filter(|_| !window.is_maximized());
@@ -1530,7 +1543,7 @@ impl ApplicationHandler for App {
             }
         }
         if self.start_fullscreen {
-            self.toggle_fullscreen();
+            self.set_fullscreen(true);
         }
         let now = Instant::now();
         self.run_at = now;
