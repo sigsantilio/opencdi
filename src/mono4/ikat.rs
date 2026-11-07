@@ -14,6 +14,7 @@ const STATUS_REPLY: u8 = 0x01;
 pub struct Port {
     pub cmd: Vec<u8>,
     pub reply: VecDeque<u8>,
+    pub len: usize, // length of the frame collected in `cmd`, set by its first byte or by arming from another port
 }
 
 /// Drive request from a port D command, applied to the CIAP by the board.
@@ -23,18 +24,38 @@ pub enum DriveEvent {
     Stop,
 }
 
-#[derive(Default)]
 pub struct Ikat {
     pub mode: u8,
     pub imr: u8,
     pub ports: [Port; 4],
-    pub pointer_enabled: bool,
+    pub keyboard_enabled: bool, // port C 80: key events on port C (not modelled yet)
     pub pal: bool, // video standard reported by the identification reply; set by the bus before each write
     pub disc_present: bool,
     pub status_polls: u8, // drive status polls answered since the disc appeared
+    pub drive_busy: bool, // drive seeking or reading; set by the bus before each write
     pub drive_event: Option<DriveEvent>,
+    pub pointer: (i32, i32, u8), // host pointer: x 0..767, y 0..559, buttons (1, 2, 4 = third button)
     pub loud: Loud,
     pub trace: bool,
+}
+
+impl Default for Ikat {
+    fn default() -> Self {
+        Self {
+            mode: 0,
+            imr: 0,
+            ports: Default::default(),
+            keyboard_enabled: false,
+            pal: true,
+            disc_present: false,
+            status_polls: 0,
+            drive_busy: false,
+            drive_event: None,
+            pointer: (384, 280, 0),
+            loud: Loud::default(),
+            trace: false,
+        }
+    }
 }
 
 /// Pending bit of a port in the pending and enable registers: A 0x02, B 0x08, C 0x20, D 0x80.
@@ -49,15 +70,50 @@ fn hex(b: &[u8]) -> String {
 
 impl Ikat {
     pub fn reset(&mut self) {
-        let (pal, trace, disc_present) = (self.pal, self.trace, self.disc_present);
+        let (pal, trace, disc_present, pointer) = (self.pal, self.trace, self.disc_present, self.pointer);
         let loud = std::mem::take(&mut self.loud);
-        *self = Self { pal, trace, disc_present, loud, ..Self::default() };
+        *self = Self { pal, trace, disc_present, pointer, loud, ..Self::default() };
     }
 
     /// Disc inserted or removed; the status replies restart their spin-up sequence.
     pub fn set_disc_present(&mut self, present: bool) {
         self.disc_present = present;
         self.status_polls = 0;
+    }
+
+    /// Drive status reply: all zero without a disc, 0x215 with one.
+    pub fn drive_report(&mut self) {
+        let st: [u8; 2] = if self.disc_present { [0x02, 0x15] } else { [0x00, 0x00] };
+        if self.disc_present {
+            self.status_polls = self.status_polls.saturating_add(1);
+        }
+        self.respond(3, &[0xB0, 0x00, st[0], st[1]]);
+    }
+
+    /// Host pointer position and buttons; reported on port B on every change while pointer reports are enabled (enable bit 0x08).
+    pub fn update_pointer(&mut self, x: i32, y: i32, buttons: u8) {
+        let p = (x.clamp(0, 767), y.clamp(0, 559), buttons);
+        if p != self.pointer {
+            self.pointer = p;
+            if self.imr & pending_bit(1) != 0 {
+                self.send_pointer();
+            }
+        }
+    }
+
+    // Absolute report: x and y scaled to 0..1023, second byte bit 4 always set (never read by the BIOS); the third button presses buttons 1 and 2.
+    fn send_pointer(&mut self) {
+        let (x, y, b) = self.pointer;
+        let (x, y) = ((x * 0x3FF / 0x2FF) as u16, (y * 0x3FF / 0x22F) as u16);
+        let third = b & 4 != 0;
+        let (b1, b2) = (b & 1 != 0 || third, b & 2 != 0 || third);
+        let r = [
+            0x40 | if b1 { 0x20 } else { 0 } | if b2 { 0x10 } else { 0 } | ((x >> 6) & 0x0F) as u8,
+            0x10 | ((y >> 6) & 0x0F) as u8,
+            (x & 0x3F) as u8,
+            (y & 0x3F) as u8 | 0x80,
+        ];
+        self.respond(1, &r);
     }
 
     /// Ports holding an unread reply, as pending bits.
@@ -70,16 +126,28 @@ impl Ikat {
         self.pending() & self.imr != 0
     }
 
-    // Command length from the port and its first byte; unknown commands are one byte.
+    // Frame length from the port and its first byte; unknown commands are one byte.
     fn command_length(port: usize, first: u8) -> usize {
         match (port, first) {
-            (0, 0x80 | 0x81) => 3,
-            (1, 0x90) => 16,
-            (1, 0x96) => 8,
-            (1, 0x9A) => 6,
-            (3, b) if b & 0x80 != 0 => 4,
+            (0, 0x80 | 0x81) => 4,
+            (1, 0x8D) => 2,
+            (3, 0x91..=0x93 | 0xA1 | 0xA2 | 0xA4 | 0xA6 | 0xA7 | 0xB0..=0xB2 | 0xC0..=0xC5 | 0xE0 | 0xE1) => 4,
             _ => 1,
         }
+    }
+
+    // Port A 90/96/9A and port C 8D make port B collect a frame for that command; 8C and 8E end it.
+    fn arm_b(&mut self, c: u8) {
+        let data = match c {
+            0x90 => 16,
+            0x96 => 8,
+            0x9A => 6,
+            0x8D => 1,
+            _ => 0,
+        };
+        let b = &mut self.ports[1];
+        b.cmd = if data == 0 { Vec::new() } else { vec![c] };
+        b.len = 1 + data;
     }
 
     /// Side-effect-free register read for traces.
@@ -120,10 +188,13 @@ impl Ikat {
             0x01 | 0x03 | 0x05 | 0x07 => {
                 let p = ((reg - 0x01) >> 1) as usize;
                 let irq = self.irq();
-                self.ports[p].cmd.push(value);
-                let cmd = &self.ports[p].cmd;
-                if cmd.len() >= Self::command_length(p, cmd[0]) {
-                    let cmd = std::mem::take(&mut self.ports[p].cmd);
+                let port = &mut self.ports[p];
+                if port.cmd.is_empty() {
+                    port.len = Self::command_length(p, value);
+                }
+                port.cmd.push(value);
+                if port.cmd.len() >= port.len {
+                    let cmd = std::mem::take(&mut port.cmd);
                     if self.trace {
                         eprintln!("IKAT PORT {} <= {} pc~{:06X}", PORT_NAMES[p], hex(&cmd), pc);
                     }
@@ -137,6 +208,9 @@ impl Ikat {
                     eprintln!("IKAT ICTL <= {:02X} pc~{:06X}", value, pc);
                 }
                 self.imr = value;
+                if value & pending_bit(1) != 0 {
+                    self.send_pointer();
+                }
                 self.trace_irq(irq);
             }
             REG_MODE => self.mode = value,
@@ -163,21 +237,47 @@ impl Ikat {
     }
 
     fn execute(&mut self, port: usize, cmd: &[u8], pc: u32) {
-        match port {
-            2 => self.execute_c(cmd[0], pc),
-            3 => self.execute_d(cmd, pc),
-            _ => {}
+        match (port, cmd[0]) {
+            // Display set-up frames from the boot code; no reply.
+            (0, 0x80 | 0x81) => {}
+            (0, 0x90 | 0x96 | 0x9A) => self.arm_b(cmd[0]),
+            // Front-panel text (9A: three characters as 16-bit segment patterns, low byte first) and the other display frames.
+            (1, 0x90 | 0x96 | 0x9A) => {}
+            // Port B loopback test: echo the data byte and stay armed.
+            (1, 0x8D) => {
+                self.respond(1, &[cmd[1]]);
+                self.arm_b(0x8D);
+            }
+            (2, _) => self.execute_c(cmd[0], pc),
+            (3, _) => self.execute_d(cmd, pc),
+            _ => {
+                if self.loud.first(((port as u32 + 4) << 16) | cmd[0] as u32) {
+                    eprintln!("IKAT unmodelled port {} command {} pc~{:06X}", PORT_NAMES[port], hex(cmd), pc);
+                }
+            }
         }
     }
 
     // Port C: identification and set-up, single-byte commands.
     fn execute_c(&mut self, c: u8, pc: u32) {
         match c {
-            0xF0 | 0xF1 | 0xF2 | 0xF4 | 0xF8 => self.respond(2, &[0xA5, c, 0x00]),
+            // IKAT release 0x72.
+            0xF0 => self.respond(2, &[0xA5, 0xF0, 0x72]),
+            0xF1 | 0xF2 | 0xF4 => self.respond(2, &[0xA5, c, 0x00]),
             0xF3 => self.respond(2, &[0xA5, 0xF3, 0x4B, 0x4D]),
             0xF6 => self.respond(2, &[0xA5, 0xF6, if self.pal { 0x02 } else { 0x01 }, 0xFF]),
             0xF7 => self.respond(2, &[0xA5, 0xF7, 0x00, 0xFF]),
-            0x80 => self.pointer_enabled = true,
+            // No reply: the F9 query times out in the BIOS after 100 ticks and reads as "no I2C device".
+            0xF9 | 0xFA => {}
+            0x80 => self.keyboard_enabled = true,
+            // Set-up commands without a reply.
+            0x84..=0x86 | 0x8F => {}
+            0x8C..=0x8E => self.arm_b(c),
+            0x88 => {
+                if self.loud.first(0x2_0000 | c as u32) {
+                    eprintln!("IKAT system reset request (port C 88), not modelled pc~{:06X}", pc);
+                }
+            }
             _ => {
                 if self.loud.first(0x2_0000 | c as u32) {
                     eprintln!("IKAT unmodelled port C command {:02X} pc~{:06X}", c, pc);
@@ -189,19 +289,13 @@ impl Ikat {
     // Port D: drive commands, four bytes, command byte first with bit 7 set.
     fn execute_d(&mut self, cmd: &[u8], pc: u32) {
         match cmd[0] {
-            // Status: without a disc all zero; with one, two spin-up replies (0x610, 0x60E), then ready (0x215).
-            0xB0 | 0xA1 => {
-                let st: [u8; 2] = match (self.disc_present, self.status_polls) {
-                    (false, _) => [0x00, 0x00],
-                    (true, 0) => [0x06, 0x10],
-                    (true, 1) => [0x06, 0x0E],
-                    (true, _) => [0x02, 0x15],
-                };
-                if self.disc_present {
-                    self.status_polls = self.status_polls.saturating_add(1);
+            // Status: no reply while the drive seeks or reads.
+            0xB0 | 0xA1 if self.drive_busy => {
+                if self.trace {
+                    eprintln!("IKAT PORT D status request {} dropped, drive busy pc~{:06X}", hex(cmd), pc);
                 }
-                self.respond(3, &[0xB0, 0x00, st[0], st[1]]);
             }
+            0xB0 | 0xA1 => self.drive_report(),
             0xB1 => self.respond(3, &[0xB1, 0x00, 0x02, 0x00]),
             0xB2 => self.respond(3, if self.disc_present { &[0xB2, 0x20, 0x00, 0x01] } else { &[0xB2, 0x00, 0x00, 0x00] }),
             // Seek to a BCD time; the next sector delivered is that time minus 150 frames. No reply.
@@ -211,7 +305,12 @@ impl Ikat {
                 self.drive_event = Some(DriveEvent::Seek(frames.saturating_sub(150)));
             }
             0xC2 | 0xC3 => self.drive_event = Some(DriveEvent::Stop),
-            0xA2 | 0xA6 | 0xA7 | 0xC0 | 0xC1 | 0xC4 | 0xC5 => {}
+            // Accepted without reply or effect; logged once so a run shows they arrived.
+            0xA2 | 0xA6 | 0xA7 | 0xC0 | 0xC1 | 0xC4 | 0xC5 => {
+                if self.loud.first(0x3_0000 | cmd[0] as u32) {
+                    eprintln!("IKAT port D command {} accepted, no effect modelled pc~{:06X}", hex(cmd), pc);
+                }
+            }
             c => {
                 if self.loud.first(0x3_0000 | c as u32) {
                     eprintln!("IKAT unmodelled port D command {} pc~{:06X}", hex(cmd), pc);
@@ -237,12 +336,66 @@ mod tests {
         let r: Vec<u8> = (0..5).map(|_| k.read(0x0D, 0)).collect();
         assert_eq!(r, [0xA5, 0xF6, 0x02, 0xFF, 0xFF]);
         assert!(!k.irq());
-        for b in [0x80, 0x4E] {
+        k.write(0x05, 0xF0, 0);
+        let r: Vec<u8> = (0..3).map(|_| k.read(0x0D, 0)).collect();
+        assert_eq!(r, [0xA5, 0xF0, 0x72]);
+        for c in [0xF8, 0xF9, 0x84, 0x85, 0x86, 0x88, 0x8F, 0x91] {
+            k.write(0x05, c, 0);
+            assert_eq!(k.pending(), 0);
+        }
+        k.write(0x05, 0x80, 0);
+        assert!(k.keyboard_enabled);
+    }
+
+    #[test]
+    fn port_a_frames_and_port_b_arming() {
+        let mut k = Ikat::default();
+        for b in [0x80, 0x4E, 0x73] {
             k.write(0x01, b, 0);
         }
-        assert_eq!(k.ports[0].cmd, [0x80, 0x4E]);
-        k.write(0x01, 0x73, 0);
+        assert_eq!(k.ports[0].cmd, [0x80, 0x4E, 0x73]);
+        k.write(0x01, 0x00, 0);
         assert!(k.ports[0].cmd.is_empty());
+        k.write(0x01, 0x9A, 0);
+        assert_eq!(k.ports[1].cmd, [0x9A]);
+        for b in [0x0F, 0x50, 0x0B, 0x10, 0x00] {
+            k.write(0x03, b, 0);
+        }
+        assert_eq!(k.ports[1].cmd.len(), 6);
+        k.write(0x03, 0x00, 0);
+        assert!(k.ports[1].cmd.is_empty() && k.ports[1].reply.is_empty());
+        k.write(0x05, 0x8D, 0);
+        for b in [0x01, 0x80] {
+            k.write(0x03, b, 0);
+            assert_eq!(k.read(0x0B, 0), b);
+        }
+        k.write(0x05, 0x8E, 0);
+        assert!(k.ports[1].cmd.is_empty());
+        for b in [0x91, 0x00, 0x00] {
+            k.write(0x07, b, 0);
+        }
+        assert_eq!(k.ports[3].cmd.len(), 3);
+        k.write(0x07, 0x00, 0);
+        assert!(k.ports[3].cmd.is_empty());
+    }
+
+    #[test]
+    fn pointer_report_on_enable_and_change() {
+        let mut k = Ikat { pointer: (384, 280, 0), ..Ikat::default() };
+        k.write(0x1B, 0x08, 0);
+        let r: Vec<u8> = (0..4).map(|_| k.read(0x0B, 0)).collect();
+        assert_eq!(r, [0x48, 0x18, 0x00, 0x80]);
+        k.write(0x1B, 0x88, 0);
+        assert_eq!(k.pending(), 0x08);
+        k.update_pointer(0, 0, 1);
+        let r: Vec<u8> = (0..4).map(|_| k.read(0x0B, 0)).collect();
+        assert_eq!(r, [0x60, 0x10, 0x00, 0x80]);
+        k.update_pointer(767, 559, 4);
+        let r: Vec<u8> = (0..4).map(|_| k.read(0x0B, 0)).collect();
+        assert_eq!(r, [0x7F, 0x1F, 0x3F, 0xBF]);
+        k.write(0x1B, 0x80, 0);
+        k.update_pointer(10, 10, 0);
+        assert_eq!(k.pending(), 0);
     }
 
     #[test]
@@ -255,12 +408,18 @@ mod tests {
             }
             (0..4).map(|_| k.read(0x0F, 0)).collect::<Vec<u8>>()
         };
-        assert_eq!(status(), [0xB0, 0x00, 0x06, 0x10]);
-        assert_eq!(status(), [0xB0, 0x00, 0x06, 0x0E]);
+        assert_eq!(status(), [0xB0, 0x00, 0x02, 0x15]);
         assert_eq!(status(), [0xB0, 0x00, 0x02, 0x15]);
         for b in [0xE1, 0x00, 0x02, 0x13] {
             k.write(0x07, b, 0);
         }
         assert_eq!(k.drive_event, Some(DriveEvent::Seek(13)));
+        k.drive_busy = true;
+        for b in [0xB0, 0, 0, 0] {
+            k.write(0x07, b, 0);
+        }
+        assert!(k.ports[3].reply.is_empty());
+        k.drive_report();
+        assert_eq!(k.ports[3].reply.len(), 4);
     }
 }

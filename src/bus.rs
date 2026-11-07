@@ -335,6 +335,10 @@ impl CdiBus {
             BoardKind::Mono4 => {
                 if let Some(m) = self.mono4.as_deref_mut() {
                     m.ciap.tick(cycles, self.mcd212.video_mode.cycles_per_sector(), &mut self.cdrom);
+                    // A drive that stopped on its own sends one status report.
+                    if std::mem::take(&mut m.ciap.drive_stopped) {
+                        m.ikat.drive_report();
+                    }
                 }
             }
         }
@@ -464,32 +468,39 @@ impl CdiBus {
         let ch = self.dma.channels[0].clone();
         let (start, count) = (ch.memory_address_counter, ch.transfer_counter as u32);
         let to_mem = (ch.operation_control & 0x80) != 0;
-        let mut dev = (control as usize & 0x1FFF) * 2;
+        let word = (control & 0x1FFF) as u32;
+        // The copy stops at the end of CIAP RAM; the register block is never a DMA target.
+        let words = count.min((ciap::REG_BASE / 2).saturating_sub(word));
         if self.taps.ciap {
             eprintln!("CIAP DMA control {:04X} memory {:06X} words {} {}", control, start, count, if to_mem { "to memory" } else { "from memory" });
         }
-        for i in 0..count {
-            let mem = start.wrapping_add(i * 2);
+        if words < count {
+            if let Some(m) = self.mono4.as_deref_mut() {
+                if m.ciap.loud.first(0x3_0000) {
+                    eprintln!("CIAP DMA control {:04X} words {} runs past CIAP RAM, {} copied pc~{:06X}", control, count, words, self.current_pc);
+                }
+            }
+        }
+        for i in 0..words {
+            let (mem, dev) = (start.wrapping_add(i * 2), ((word + i) * 2) as usize);
             for k in 0..2 {
-                let d = (dev + k) % ciap::WINDOW_SIZE;
                 if to_mem {
-                    let b = self.mono4.as_deref().map_or(0xFF, |m| m.ciap.ram[d]);
-                    self.write_byte(mem + k as u32, b);
+                    let b = self.mono4.as_deref().map_or(0xFF, |m| m.ciap.ram[dev + k]);
+                    self.write_byte(mem.wrapping_add(k as u32), b);
                 } else {
-                    let b = self.read_byte(mem + k as u32);
+                    let b = self.read_byte(mem.wrapping_add(k as u32));
                     if let Some(m) = self.mono4.as_deref_mut() {
-                        m.ciap.ram[d] = b;
+                        m.ciap.ram[dev + k] = b;
                     }
                 }
             }
-            dev = (dev + 2) % ciap::WINDOW_SIZE;
         }
         let ch = &mut self.dma.channels[0];
         ch.memory_address_counter = start.wrapping_add(count * 2);
         ch.transfer_counter = 0;
         ch.channel_status |= 0x80;
         if let Some(m) = self.mono4.as_deref_mut() {
-            m.ciap.dmas += 1;
+            m.ciap.dma_done(control, words);
         }
     }
 
@@ -1097,8 +1108,7 @@ impl CdiBus {
             0x300000..=0x303FFF => {
                 let off = addr - 0x300000;
                 if ciap::Ciap::is_reg(off) {
-                    let w = m.ciap.read_reg(off - ciap::REG_BASE, pc);
-                    return if (addr & 1) == 0 { (w >> 8) as u8 } else { w as u8 };
+                    return m.ciap.read_reg_byte(off - ciap::REG_BASE, (addr & 1) == 0, pc);
                 }
                 return m.ciap.ram[off as usize];
             }
@@ -1121,6 +1131,10 @@ impl CdiBus {
                 return m.ciap.read_reg(off - ciap::REG_BASE, self.current_pc);
             }
         }
+        // IKAT drives only the low byte lane; the high byte of a word access floats high.
+        if let (0x310000..=0x31FFFE, Some(m)) = (addr, self.mono4.as_deref_mut()) {
+            return 0xFF00 | m.ikat.read(addr + 1 - 0x310000, self.current_pc) as u16;
+        }
         let hi = self.rd8(address) as u16;
         let lo = self.rd8(address.wrapping_add(1)) as u16;
         (hi << 8) | lo
@@ -1133,10 +1147,7 @@ impl CdiBus {
             0x300000..=0x303FFF => {
                 let off = addr - 0x300000;
                 if ciap::Ciap::is_reg(off) {
-                    let reg = off - ciap::REG_BASE;
-                    let cur = m.ciap.peek_reg(reg);
-                    let v = if (addr & 1) == 0 { (cur & 0x00FF) | ((value as u16) << 8) } else { (cur & 0xFF00) | value as u16 };
-                    m.ciap.write_reg(reg, v, pc);
+                    m.ciap.write_reg_byte(off - ciap::REG_BASE, (addr & 1) == 0, value, pc);
                     if let Some(c) = m.ciap.dma_request.take() {
                         self.perform_ciap_dma(c);
                     }
@@ -1147,6 +1158,7 @@ impl CdiBus {
             }
             0x310000..=0x31FFFF if (addr & 1) == 1 => {
                 m.ikat.pal = self.mcd212.video_mode == crate::mcd212::VideoMode::Pal;
+                m.ikat.drive_busy = m.ciap.drive_active;
                 m.ikat.write(addr - 0x310000, value, pc);
                 if let Some(ev) = m.ikat.drive_event.take() {
                     m.ciap.drive(ev);
@@ -1175,6 +1187,9 @@ impl CdiBus {
                 return;
             }
         }
+        if (0x310000..=0x31FFFE).contains(&addr) && self.mono4.is_some() {
+            return self.wr8(address.wrapping_add(1), value as u8);
+        }
         self.wr8(address, (value >> 8) as u8);
         self.wr8(address.wrapping_add(1), value as u8);
     }
@@ -1193,7 +1208,8 @@ impl CdiBus {
         if m.ciap.irq() && level == m.ciap.level() {
             return Some(m.ciap.vector());
         }
-        (level == 2).then_some(0x1A)
+        // Level 2 only for an IKAT request; anything else falls back to the spurious autovector.
+        (level == 2 && m.ikat.irq()).then_some(0x1A)
     }
 
     fn iack(&mut self, level: u8) -> u32 {
