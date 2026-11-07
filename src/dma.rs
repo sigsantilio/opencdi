@@ -52,8 +52,11 @@ impl SccDma {
 
         match ch_offset {
             0x00 => {
-                // Writing to status clears bits
+                // Writing to status clears bits; clearing ERR (bit 4) also clears the error register
                 ch.channel_status &= !((val >> 8) as u8 & 0xB0);
+                if (val >> 8) & 0x10 != 0 {
+                    ch.channel_error = 0;
+                }
             }
             0x04 => {
                 ch.device_control = (val >> 8) as u8;
@@ -101,5 +104,14 @@ mod tests {
         d.write_reg(0x14, 0x1234);
         d.write_reg(0x54, 0x1234);
         assert_eq!((d.read_reg(0x14), d.read_reg(0x54)), (0, 0x1234));
+    }
+
+    #[test]
+    fn clearing_err_clears_the_error_register() {
+        let mut d = SccDma::new();
+        d.channels[1].channel_status = 0x90;
+        d.channels[1].channel_error = 0x02;
+        d.write_reg(0x40, 0x1000);
+        assert_eq!(d.read_reg(0x40), 0x8000);
     }
 }
