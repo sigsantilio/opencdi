@@ -43,7 +43,7 @@ fn dump_ppm(fb: &[u32], path: &str) {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: harness <bios.rom> <disc|none> <frames> [--dvc <rom>] [--ppm <out.ppm>] [--ntsc] [--autoplay [--print-autoplay-script]] [--input <script|@file>] [--sample <n> [--sample-audio]] [--dump-every <n> <prefix>] [--audio-out <file.s16>]");
+    eprintln!("usage: harness <bios.rom> <disc|none> <frames> [--dvc <rom>] [--ppm <out.ppm>] [--ntsc] [--autoplay [--print-autoplay-script]] [--input <script|@file>] [--sample <n> [--sample-audio]] [--dump-every <n> <prefix>] [--counters] [--idle-pc <hex>] [--audio-out <file.s16>]");
     std::process::exit(2);
 }
 
@@ -63,6 +63,8 @@ fn main() {
     let mut sample = 0u64;
     let mut sample_audio = false;
     let mut dump: Option<(u64, String)> = None;
+    let mut counters = false;
+    let mut idle_pc: Option<u32> = None;
     let mut audio_out: Option<(String, Vec<u8>)> = None;
     let mut i = 4;
     while i < a.len() {
@@ -71,6 +73,8 @@ fn main() {
             "--ppm" => { i += 1; ppm = a.get(i); }
             "--audio-out" => { i += 1; audio_out = Some((a.get(i).cloned().unwrap_or_else(|| usage()), Vec::new())); }
             "--ntsc" => ntsc = true,
+            "--counters" => counters = true,
+            "--idle-pc" => { i += 1; idle_pc = Some(a.get(i).and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or_else(|| usage())); }
             "--autoplay" => autoplay = true,
             "--print-autoplay-script" => print_script = true,
             "--input" => { i += 1; input = Some(a.get(i).cloned().unwrap_or_else(|| usage())); }
@@ -116,6 +120,7 @@ fn main() {
     let mut shell_ready_count = 0u32;
     let mut audio_buf: Vec<(f32, f32)> = Vec::new();
     let (mut win_samples, mut win_nonzero) = (0u64, 0u64);
+    let mut idle_first: Option<u64> = None;
 
     {
         for frame in 0..frames {
@@ -157,6 +162,9 @@ fn main() {
             }
 
             m.run_frame();
+            if idle_first.is_none() && idle_pc == Some(m.cpu.pc) {
+                idle_first = Some(frame + 1);
+            }
 
             video_all = video_hash(video_all, m.framebuffer());
             drain_audio(&mut m, &mut audio_buf, &mut audio_all, &mut audio_samples, &mut audio_nonzero);
@@ -198,6 +206,10 @@ fn main() {
         "\nHARNESS frames={} pc={:08x} nonblack={} video_last={:016x} video_all={:016x} audio={:016x} audio_samples={} audio_nonzero={}",
         frames, m.cpu.pc, nonblack, video_last, video_all, audio_all, audio_samples, audio_nonzero
     );
+    if counters || idle_pc.is_some() {
+        let idle = idle_first.map_or("none".to_string(), |f| f.to_string());
+        println!("COUNTERS {} idle_first={}", m.bus.counters.summary(), idle);
+    }
     if print_script {
         println!("AUTOPLAY_SCRIPT {}", input_script::format(&recorded));
     }
