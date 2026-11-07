@@ -2,7 +2,9 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 use std::path::{Path, PathBuf};
 use log::{info, error};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -12,7 +14,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode as Key, ModifiersState, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
-use opencdi::audio::HostAudioOutput;
+use opencdi::audio::{self, Frame, HostAudioOutput};
 use opencdi::frontend::{pop_action, push_action, GuiAction, InputDeviceMode, KeyBindings};
 #[cfg(target_os = "windows")]
 use opencdi::gui;
@@ -442,13 +444,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input_device_mode = if has_flag("--mouse") { InputDeviceMode::Mouse } else { InputDeviceMode::Gamepad };
 
     // 6. Initialize Host Audio Playback
-    let host_audio = HostAudioOutput::try_start(
-        m.bus.cdic.audio.sample_queue.clone(),
-        m.bus.cdic.audio.sfx_queue.clone(),
-        m.bus.cdic.audio.dvc_queue.clone(),
-        m.bus.cdic.audio.source_rate.clone(),
-        m.bus.cdic.audio.dvc_rate.clone(),
-    );
+    let audio_ring: Arc<Mutex<VecDeque<Frame>>> = Arc::new(Mutex::new(VecDeque::with_capacity(audio::RING_CAP)));
+    let audio_gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+    let host_audio = HostAudioOutput::try_start(audio_ring.clone(), audio_gain.clone());
 
     // 7. Initialize USB Gamepad subsystem (Gilrs / XInput / DirectInput)
     let gilrs = gilrs::Gilrs::new().ok();
@@ -475,6 +473,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         windowed: None,
         restore_check: None,
         _host_audio: host_audio,
+        audio_ring,
+        audio_gain,
+        audio_buf: Vec::new(),
+        volume: 1.0,
+        muted: false,
         gilrs,
         keys: HashSet::new(),
         mods: ModifiersState::empty(),
@@ -615,6 +618,11 @@ struct App {
     windowed: Option<(Option<PhysicalPosition<i32>>, PhysicalSize<u32>)>,
     restore_check: Option<Instant>,
     _host_audio: Option<HostAudioOutput>,
+    audio_ring: Arc<Mutex<VecDeque<Frame>>>,
+    audio_gain: Arc<AtomicU32>,
+    audio_buf: Vec<Frame>,
+    volume: f32,
+    muted: bool,
     gilrs: Option<gilrs::Gilrs>,
     keys: HashSet<Key>,
     mods: ModifiersState,
@@ -792,8 +800,9 @@ impl App {
             Key::F8 => save_screenshot_ppm(self.frame_count, &self.m.bus.mcd212.framebuffer[..]),
             Key::F12 => save_screenshot(self.frame_count, &self.m.bus.mcd212.framebuffer[..]),
             Key::KeyM if !self.bound(code) => {
-                self.m.bus.cdic.audio.muted = !self.m.bus.cdic.audio.muted;
-                info!("Audio: {}", if self.m.bus.cdic.audio.muted { "MUTED" } else { "UNMUTED" });
+                self.muted = !self.muted;
+                self.publish_gain();
+                info!("Audio: {}", if self.muted { "MUTED" } else { "UNMUTED" });
             }
             _ => {}
         }
@@ -913,14 +922,17 @@ impl App {
                     info!("Mouse capture: {}", if self.mouse_captured { "CAPTURED" } else { "RELEASED" });
                 }
                 GuiAction::ToggleMute => {
-                    self.m.bus.cdic.audio.muted = !self.m.bus.cdic.audio.muted;
-                    info!("Audio: {}", if self.m.bus.cdic.audio.muted { "MUTED" } else { "UNMUTED" });
+                    self.muted = !self.muted;
+                    self.publish_gain();
+                    info!("Audio: {}", if self.muted { "MUTED" } else { "UNMUTED" });
                 }
                 GuiAction::VolumeUp => {
-                    self.m.bus.cdic.audio.volume = (self.m.bus.cdic.audio.volume + 0.05).min(2.0);
+                    self.volume = (self.volume + 0.05).min(2.0);
+                    self.publish_gain();
                 }
                 GuiAction::VolumeDown => {
-                    self.m.bus.cdic.audio.volume = (self.m.bus.cdic.audio.volume - 0.05).max(0.0);
+                    self.volume = (self.volume - 0.05).max(0.0);
+                    self.publish_gain();
                 }
                 GuiAction::ToggleFullscreen => {
                     self.toggle_fullscreen();
@@ -1245,13 +1257,20 @@ impl App {
         }
 
         // Audio hotkeys (+ / - = Volume, held)
-        let audio = &mut self.m.bus.cdic.audio;
         if self.keys.contains(&Key::Equal) || self.keys.contains(&Key::NumpadAdd) {
-            audio.volume = (audio.volume + 0.02).min(2.0);
+            self.volume = (self.volume + 0.02).min(2.0);
+            self.publish_gain();
         }
         if self.keys.contains(&Key::Minus) || self.keys.contains(&Key::NumpadSubtract) {
-            audio.volume = (audio.volume - 0.02).max(0.0);
+            self.volume = (self.volume - 0.02).max(0.0);
+            self.publish_gain();
         }
+    }
+
+    // Hands the volume (0 while muted) to the sound-card callback.
+    fn publish_gain(&self) {
+        let g = if self.muted { 0.0f32 } else { self.volume };
+        self.audio_gain.store(g.to_bits(), Ordering::Relaxed);
     }
 
     // Start a fresh speed window (pause, video mode switch, reset, fast-forward toggle)
@@ -1373,14 +1392,15 @@ impl App {
 
         self.update_input();
         // Emulation runs on the timer; only the picture is skipped while the window is hidden
+        self.audio_buf.clear();
+        self.m.drain_audio(&mut self.audio_buf);
         if self.fast_forward {
-            // Drop fast-forward audio so the queues never hold sped-up backlog
-            let audio = &self.m.bus.cdic.audio;
-            for q in [&audio.sample_queue, &audio.sfx_queue] {
-                if let Ok(mut q) = q.lock() {
-                    q.clear();
-                }
+            // Drop fast-forward audio so the ring never holds sped-up backlog
+            if let Ok(mut q) = self.audio_ring.lock() {
+                q.clear();
             }
+        } else {
+            audio::feed_ring(&self.audio_ring, &self.audio_buf);
         }
         // While fast-forwarding, present at most about 60 times a second
         let due = !self.in_modal_pump && (!self.fast_forward || self.last_present.elapsed() >= Duration::from_millis(16));

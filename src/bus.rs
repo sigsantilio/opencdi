@@ -260,6 +260,15 @@ impl CdiBus {
         }
     }
 
+    // Mixes the output frames due for `cycles` of board time; called after the line's peripherals ticked.
+    pub fn tick_audio(&mut self, cycles: u32) {
+        if std::mem::take(&mut self.dvc.audio_stopped) {
+            self.cdic.audio.stop_mpeg();
+        }
+        let dvc_gains = if self.dvc.is_fitted() { self.dvc.audio_gains() } else { None };
+        self.cdic.audio.advance(cycles, self.mcd212.video_mode.cycles_per_sector(), self.cdic.audio.slave_gains(), dvc_gains);
+    }
+
     pub fn tick_slave(&mut self, cycles: u32) {
         self.slave.tick(cycles);
     }
@@ -295,21 +304,7 @@ impl CdiBus {
             self.dvc.vsync_hz = if self.mcd212.video_mode == crate::mcd212::VideoMode::Pal { 50.0 } else { 60.0 };
             self.dvc.on_vsync();
         }
-        if line == 0 && self.dvc.is_fitted() && !self.dvc.audio_out.is_empty() {
-            if let Ok(mut dq) = self.cdic.audio.dvc_queue.lock() {
-                self.cdic.audio.dvc_rate.store(self.dvc.audio_sample_rate, std::sync::atomic::Ordering::Relaxed);
-                let max_samples = self.dvc.audio_sample_rate as usize;
-                let add_len = self.dvc.audio_out.len();
-                let current_len = dq.len();
-                if current_len + add_len > max_samples {
-                    let overflow = (current_len + add_len) - max_samples;
-                    let to_drain = overflow.min(current_len);
-                    dq.drain(0..to_drain);
-                }
-                let vol = if self.cdic.audio.muted { 0.0 } else { self.cdic.audio.volume };
-                dq.extend(self.dvc.audio_out.drain(..).map(|(l, r)| (l * vol, r * vol)));
-            }
-        }
+        self.cdic.audio.push_mpeg(&mut self.dvc.audio_out, self.dvc.audio_sample_rate);
         frame_done
     }
 

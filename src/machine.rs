@@ -2,7 +2,6 @@ use crate::bus::CdiBus;
 use crate::mcd212::VideoMode;
 use m68k::{CpuCore, CpuType};
 use std::path::Path;
-use std::sync::atomic::Ordering;
 
 pub struct Machine {
     pub bus: CdiBus,
@@ -41,13 +40,9 @@ impl Machine {
         &self.bus.mcd212.framebuffer[..]
     }
 
-    /// Appends the main then sfx queue to `out`; returns the source rate.
-    pub fn drain_audio(&mut self, out: &mut Vec<(f32, f32)>) -> u32 {
-        let audio = &self.bus.cdic.audio;
-        for q in [&audio.sample_queue, &audio.sfx_queue] {
-            out.extend(q.lock().unwrap().drain(..));
-        }
-        audio.source_rate.load(Ordering::Relaxed)
+    /// Appends the frames mixed since the last call at `audio::OUT_RATE`; returns how many.
+    pub fn drain_audio(&mut self, out: &mut Vec<(f32, f32)>) -> usize {
+        self.bus.cdic.audio.drain(out)
     }
 
     pub fn run_frame(&mut self) {
@@ -119,6 +114,7 @@ impl Machine {
             bus.tick_slave(cyc_per_line);
             bus.tick_cdic(cyc_per_line);
             bus.tick_dvc(cyc_per_line);
+            bus.tick_audio(cyc_per_line);
         }
     }
 }
