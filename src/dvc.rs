@@ -1698,3 +1698,290 @@ mod window_tests {
         assert!(!present.iter().any(|&p| p));
     }
 }
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    // Silent Layer II frame at 44.1 kHz, 192 kbit/s, stereo, no padding (626 bytes).
+    pub(super) fn silent_frame() -> Vec<u8> {
+        let mut f = vec![0u8; 626];
+        f[..4].copy_from_slice(&[0xFF, 0xFD, 0xA0, 0x00]);
+        f
+    }
+
+    // MPEG-1 pack header: SCR in 90 kHz ticks, mux rate in 50 byte/s units.
+    pub(super) fn pack(scr: u64, mux: u32) -> Vec<u8> {
+        vec![
+            0, 0, 1, 0xBA,
+            0x21 | (((scr >> 30) & 7) as u8) << 1,
+            (scr >> 22) as u8,
+            0x01 | (((scr >> 15) & 0x7F) as u8) << 1,
+            (scr >> 7) as u8,
+            0x01 | ((scr & 0x7F) as u8) << 1,
+            0x80 | ((mux >> 15) & 0x7F) as u8,
+            (mux >> 7) as u8,
+            0x01 | ((mux & 0x7F) as u8) << 1,
+        ]
+    }
+
+    // MPEG-1 audio packet with a PTS (90 kHz ticks).
+    pub(super) fn audio_packet(pts: Option<u64>, payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        match pts {
+            Some(t) => body.extend_from_slice(&[
+                0x21 | (((t >> 30) & 7) as u8) << 1,
+                (t >> 22) as u8,
+                0x01 | (((t >> 15) & 0x7F) as u8) << 1,
+                (t >> 7) as u8,
+                0x01 | ((t & 0x7F) as u8) << 1,
+            ]),
+            None => body.push(0x0F),
+        }
+        body.extend_from_slice(payload);
+        let mut p = vec![0, 0, 1, 0xC0];
+        p.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        p.extend_from_slice(&body);
+        p
+    }
+
+    #[test]
+    fn decode_one_equals_the_loop() {
+        let mut stream = VecDeque::new();
+        for _ in 0..3 {
+            stream.extend(silent_frame());
+        }
+        let mut a = Mp2Decoder::default();
+        let mut b = Mp2Decoder::default();
+        let mut sa = stream.clone();
+        let mut sb = stream;
+        assert_eq!(a.decode_available(&mut sa), 3);
+        let mut n = 0;
+        while let Some(f) = b.decode_one(&mut sb) {
+            assert_eq!((f.samples, f.rate), (1152, 44_100));
+            n += 1;
+        }
+        assert_eq!(n, 3);
+        assert_eq!(a.pcm, b.pcm);
+        assert!(sa.is_empty() && sb.is_empty());
+    }
+
+    #[test]
+    fn frame_interval_in_decode_units() {
+        let mut s = VecDeque::new();
+        s.extend(silent_frame());
+        assert_eq!(Mp2Decoder::peek_interval(&s), Some((1152, 44_100)));
+        assert_eq!(Mp2Decoder::interval_units(1152, 44_100), 588);
+        assert_eq!(Mp2Decoder::interval_units(384, 44_100), 196);
+    }
+
+    #[test]
+    fn clock_follows_scr_and_bytes_whatever_the_chunking() {
+        let mut data = pack(90_000, 3528);
+        data.extend(audio_packet(Some(90_000 + 9_000), &silent_frame()));
+        let mut whole = MpegSystemDemux::default();
+        whole.feed(&data);
+        let mut bytewise = MpegSystemDemux::default();
+        for b in &data {
+            bytewise.feed(&[*b]);
+        }
+        assert_eq!(whole.scr_base, Some(22_500));
+        assert_eq!(whole.mux_rate, 3528);
+        assert_eq!(whole.pack_bytes, 4 + (6 + 5 + 626) as u64);
+        assert_eq!((whole.scr_base, whole.mux_rate, whole.pack_bytes), (bytewise.scr_base, bytewise.mux_rate, bytewise.pack_bytes));
+        assert_eq!(whole.clock(), bytewise.clock());
+        assert_eq!(whole.clock(), Some(22_500 + 642 * 450 / 3528));
+    }
+
+    #[test]
+    fn tick_clock_waits_for_two_ticks_without_a_pack() {
+        let mut d = MpegSystemDemux::default();
+        d.feed(&pack(0, 3528));
+        assert_eq!(d.tick_clock(), None);
+        assert_eq!(d.tick_clock(), Some(2 * 2352 * 450 / 3528));
+        d.feed(&pack(900, 3528));
+        assert_eq!(d.tick_bytes, 0);
+    }
+
+    // Layer II frame with one non-silent subband (sample code 0 of a three-level quantiser).
+    pub(super) fn loud_frame() -> Vec<u8> {
+        let mut f = silent_frame();
+        f[4] = 0x10;
+        f[26] = 0x80;
+        f
+    }
+
+    fn dvc() -> Dvc {
+        let mut d = Dvc::new();
+        d.audio_enabled = true;
+        d.audio_armed = true;
+        d
+    }
+
+    fn feed(d: &mut Dvc, bytes: &[u8]) {
+        d.fma_stream_fifo.extend_from_slice(bytes);
+        d.process_stream();
+    }
+
+    fn stream(scr: u64, pts: Option<u64>, frames: usize) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for _ in 0..frames {
+            payload.extend(loud_frame());
+        }
+        let mut v = pack(scr, 3528);
+        v.extend(audio_packet(pts, &payload));
+        v
+    }
+
+    fn tick(d: &mut Dvc) {
+        d.tick((d.cpu_hz / 75) as u32);
+    }
+
+    #[test]
+    fn frame_waits_for_the_clock_and_chunking_does_not_matter() {
+        let mut whole = dvc();
+        feed(&mut whole, &stream(90_000, Some(99_000), 1));
+        assert!(whole.audio_out.is_empty() && whole.fma_demux.due.len() == 1);
+        feed(&mut whole, &pack(99_800, 3528));
+        assert_eq!(whole.audio_out.len(), 1152);
+        let mut bytewise = dvc();
+        for b in stream(90_000, Some(99_000), 1).iter().chain(pack(99_800, 3528).iter()) {
+            feed(&mut bytewise, &[*b]);
+        }
+        assert_eq!(whole.audio_out, bytewise.audio_out);
+    }
+
+    #[test]
+    fn first_frame_after_a_stop_is_silent_then_not() {
+        let mut d = dvc();
+        feed(&mut d, &stream(90_000, Some(99_000), 3));
+        feed(&mut d, &pack(99_800, 3528));
+        assert!(d.audio_out.iter().all(|&s| s == (0.0, 0.0)) && d.audio_out.len() == 1152);
+        feed(&mut d, &audio_packet(Some(99_000 + 2 * 2_352), &loud_frame()));
+        feed(&mut d, &pack(105_000, 3528));
+        assert!(d.audio_out.len() > 1152 && d.audio_out.iter().skip(1152).any(|&s| s != (0.0, 0.0)));
+        d.set_fma_word(FMA_CMD, 1);
+        d.handle_fma_write(FMA_CMD);
+        assert!(!d.fma_started && d.fma_demux.due.is_empty() && d.fma_demux.interval == 0 && d.audio_stopped);
+        d.audio_out.clear();
+        feed(&mut d, &stream(90_000, Some(99_000), 1));
+        feed(&mut d, &pack(99_800, 3528));
+        assert!(d.audio_out.iter().all(|&s| s == (0.0, 0.0)) && d.audio_out.len() == 1152);
+    }
+
+    #[test]
+    fn first_pes_after_a_reset_only_stores_its_pts() {
+        let mut d = dvc();
+        feed(&mut d, &stream(90_000, Some(99_000), 1));
+        assert_eq!(d.fma_demux.due.len(), 1);
+        assert_eq!(d.fma_demux.last_due, Some(99_000 >> 2));
+    }
+
+    #[test]
+    fn decode_events_reach_the_isr_at_the_next_tick() {
+        let mut d = dvc();
+        feed(&mut d, &stream(90_000, Some(99_000), 1));
+        feed(&mut d, &pack(99_800, 3528));
+        assert_eq!(d.get_fma_word(FMA_ISR) & 0x14, 0);
+        tick(&mut d);
+        assert_eq!(d.get_fma_word(FMA_ISR) & 0x14, 0x14);
+    }
+
+    #[test]
+    fn a_due_frame_without_data_raises_underflow_and_makes_no_sound() {
+        let mut d = dvc();
+        feed(&mut d, &stream(90_000, Some(99_000), 1));
+        feed(&mut d, &pack(99_800, 3528));
+        tick(&mut d);
+        d.acknowledge_fma_isr();
+        d.audio_out.clear();
+        feed(&mut d, &audio_packet(Some(99_000 + 2_352), &[]));
+        feed(&mut d, &pack(120_000, 3528));
+        feed(&mut d, &pack(140_000, 3528));
+        let before = d.audio_out.len();
+        tick(&mut d);
+        assert_eq!(before, 0);
+        assert_eq!(d.get_fma_word(FMA_ISR) & 0x08, 0x08);
+        assert!(d.fma_demux.due.is_empty());
+    }
+
+    #[test]
+    fn ticks_without_a_pack_header_keep_raising_underflow() {
+        let mut d = dvc();
+        feed(&mut d, &stream(90_000, Some(99_000), 1));
+        feed(&mut d, &pack(99_800, 3528));
+        let mut hits = 0;
+        for _ in 0..40 {
+            tick(&mut d);
+            if d.get_fma_word(FMA_ISR) & 0x08 != 0 {
+                hits += 1;
+                d.acknowledge_fma_isr();
+            }
+        }
+        assert!(hits >= 5, "underflow repeats while the clock runs: {hits}");
+    }
+
+    #[test]
+    fn addly_does_not_move_the_schedule() {
+        let mut d = dvc();
+        feed(&mut d, &stream(90_000, Some(99_000), 1));
+        let (due, last) = (d.fma_demux.due.clone(), d.fma_demux.last_due);
+        d.set_fma_word(0x18, 5);
+        d.handle_fma_write(0x18);
+        assert_eq!((d.fma_demux.due.clone(), d.fma_demux.last_due), (due, last));
+    }
+
+    #[test]
+    fn a_stream_without_pts_decodes_on_arrival() {
+        let mut d = dvc();
+        feed(&mut d, &stream(90_000, None, 2));
+        assert_eq!(d.audio_out.len(), 2 * 1152);
+    }
+
+    #[test]
+    fn schedule_survives_the_timestamp_wrap() {
+        let mut d = dvc();
+        let wrap = 1u64 << 33;
+        feed(&mut d, &stream(wrap - 9_000, Some(wrap - 1_000), 1));
+        assert!(d.audio_out.is_empty());
+        feed(&mut d, &pack(wrap - 300, 3528));
+        assert_eq!(d.audio_out.len(), 1152);
+        feed(&mut d, &pack(500, 3528));
+        feed(&mut d, &audio_packet(Some(5_000), &loud_frame()));
+        feed(&mut d, &pack(6_000, 3528));
+        assert_eq!(d.audio_out.len(), 2 * 1152);
+    }
+}
+
+#[cfg(test)]
+mod attenuation_tests {
+    use super::*;
+
+    fn dsp(d: &mut Dvc, index: u16, data: u16) {
+        d.write_word(0xE03022, index);
+        d.write_word(0xE03024, data);
+    }
+
+    #[test]
+    fn vmpeg_attenuation_powers_up_muted_and_follows_the_dsp_upload() {
+        let mut d = Dvc::new();
+        assert_eq!(d.audio_gains(), Some([0.0; 4]));
+        // Program words on other indexes are not attenuation.
+        for (i, v) in [(5, 0x0A), (6, 0xF0), (7, 0x80)] {
+            dsp(&mut d, i, v);
+        }
+        assert_eq!(d.audio_gains(), Some([0.0; 4]));
+        dsp(&mut d, 0, 0xF2);
+        dsp(&mut d, 1, 0x93);
+        for b in [0x00, 0x80, 0x80, 0x00] {
+            dsp(&mut d, 7, b);
+        }
+        assert_eq!(d.audio_gains(), None);
+        dsp(&mut d, 1, 0x93);
+        for b in [10, 0x80, 0x80, 0x00] {
+            dsp(&mut d, 7, b);
+        }
+        let g = d.audio_gains().unwrap();
+        assert!((g[0] - 0.316_227_77).abs() < 1e-4 && g[1] == 0.0 && g[2] == 1.0 && g[3] == 0.0);
+    }
+}
