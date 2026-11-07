@@ -30,6 +30,7 @@ pub struct Mono4 {
     pub ikat: ikat::Ikat,
     pub nvram: nvram::Nvram32,
     pub unmapped: Loud,
+    pub unmapped_w: Loud,
 }
 
 impl Mono4 {
