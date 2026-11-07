@@ -13,10 +13,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-// Looked up case-insensitively in the system directory, in this order; Mono-IV images are reported, not booted.
+// Looked up case-insensitively in the system directory, in this order; Mono-IV images boot only with the opencdi_mono4 option on.
 pub const BIOS_NAMES: &[&str] = &["cdi220b.rom", "cdi200.rom", "cdimono1.zip", "cdibios.zip", "cdi.rom", "cdi220.rom", "cdi490a.rom", "cdi490a.zip"];
-// Cartridge ROM, looked up the same way; the cdimono1.zip set carries vmpega.rom next to the system ROMs.
+// Cartridge ROM, looked up the same way; cdimono1.zip carries vmpega.rom next to the system ROMs.
 pub const DVC_NAMES: &[&str] = &["vmpega.rom", "cdimono1.zip", "cdibios.zip"];
+// The IMPEG cartridge ROM, fitted only on the CD-i 490 (Mono-IV) board.
+pub const IMPEG_NAMES: &[&str] = &["impega.rom"];
 const MESSAGE_FRAMES: c_uint = 360;
 const AUDIO_RATE: u32 = opencdi::audio::OUT_RATE;
 // Room above the size measured at the first serialize_size call, for buffers that grow later (DVC decoder, FIFOs).
@@ -42,6 +44,7 @@ struct LoadSpec {
 }
 
 const OPT_DVC: &CStr = c"opencdi_dvc";
+const OPT_MONO4: &CStr = c"opencdi_mono4";
 const NO_VALUE: retro_core_option_value = retro_core_option_value { value: std::ptr::null(), label: std::ptr::null() };
 
 const fn option_values(list: &[(&CStr, &CStr)]) -> [retro_core_option_value; RETRO_NUM_CORE_OPTION_VALUES_MAX] {
@@ -55,7 +58,7 @@ const fn option_values(list: &[(&CStr, &CStr)]) -> [retro_core_option_value; RET
 }
 
 // Core options v1, terminated by an empty entry; frontends without v1 get VARIABLES below.
-static OPTIONS: Table<[retro_core_option_definition; 2]> = Table([
+static OPTIONS: Table<[retro_core_option_definition; 3]> = Table([
     retro_core_option_definition {
         key: OPT_DVC.as_ptr(),
         desc: c"DVC cartridge (restart)".as_ptr(),
@@ -63,10 +66,18 @@ static OPTIONS: Table<[retro_core_option_definition; 2]> = Table([
         values: option_values(&[(c"auto", c"auto"), (c"off", c"off")]),
         default_value: c"auto".as_ptr(),
     },
+    retro_core_option_definition {
+        key: OPT_MONO4.as_ptr(),
+        desc: c"CD-i 490 BIOS, experimental (restart)".as_ptr(),
+        info: c"on also accepts the Mono-IV system ROM (cdi490a.rom) when no Mono-I ROM is found; with impega.rom present (and the DVC option on auto) the IMPEG Digital Video cartridge is fitted. The 490 board is experimental. Takes effect when content is loaded.".as_ptr(),
+        values: option_values(&[(c"off", c"off"), (c"on", c"on")]),
+        default_value: c"off".as_ptr(),
+    },
     retro_core_option_definition { key: std::ptr::null(), desc: std::ptr::null(), info: std::ptr::null(), values: [NO_VALUE; RETRO_NUM_CORE_OPTION_VALUES_MAX], default_value: std::ptr::null() },
 ]);
-static VARIABLES: Table<[retro_variable; 2]> = Table([
+static VARIABLES: Table<[retro_variable; 3]> = Table([
     retro_variable { key: OPT_DVC.as_ptr(), value: c"DVC cartridge (restart); auto|off".as_ptr() },
+    retro_variable { key: OPT_MONO4.as_ptr(), value: c"CD-i 490 BIOS, experimental (restart); off|on".as_ptr() },
     retro_variable { key: std::ptr::null(), value: std::ptr::null() },
 ]);
 
@@ -187,7 +198,9 @@ fn candidates(dir: &Path, names: &[&str]) -> Vec<PathBuf> {
 }
 
 // Checks candidates in order, logs each verdict, stops at the first good image and returns the best usable one.
-fn find_bios(dir: &Path) -> Result<PathBuf, String> {
+fn find_bios(dir: &Path, allow_mono4: bool) -> Result<PathBuf, String> {
+    // With the Mono-IV option on, a good 490 image counts as usable; Mono-I images still rank first.
+    let usable = |r: &bios::Report| r.usable() || (allow_mono4 && r.status != bios::Status::Error && r.board == Some(bios::Board::Mono4));
     let candidates = candidates(dir, BIOS_NAMES);
     if candidates.is_empty() {
         return Err(format!("no CD-i system ROM in {} (looked for {})", dir.display(), BIOS_NAMES.join(", ")));
@@ -217,7 +230,7 @@ fn find_bios(dir: &Path) -> Result<PathBuf, String> {
     }
     let file = |p: &Path| p.file_name().map_or_else(String::new, |f| f.to_string_lossy().into_owned());
     match bios::best(checked) {
-        Some((p, img)) if img.report.usable() => {
+        Some((p, img)) if usable(&img.report) => {
             if img.report.status != bios::Status::Ok {
                 show_message(&format!("CD-i BIOS {}: {}", file(&p), img.report.message));
             }
@@ -237,6 +250,26 @@ fn option_value(key: &CStr) -> Option<String> {
     (ok && !v.value.is_null()).then(|| unsafe { CStr::from_ptr(v.value) }.to_string_lossy().into_owned())
 }
 
+// The IMPEG cartridge for the 490 board; only the known dump is fitted.
+fn find_impeg(dir: &Path) -> Option<PathBuf> {
+    for p in candidates(dir, IMPEG_NAMES) {
+        match Machine::read_dvc_for(&p, opencdi::bus::BoardKind::Mono4) {
+            Ok((_, img)) if img.report.status == bios::Status::Ok => {
+                log(RETRO_LOG_INFO, &format!("IMPEG {}: {}", p.display(), img.report.message));
+                return Some(p);
+            }
+            Ok((_, img)) => log(RETRO_LOG_WARN, &format!("IMPEG {}: {}", p.display(), img.report.message)),
+            Err(e) => log(RETRO_LOG_WARN, &format!("IMPEG {}: {}", p.display(), e)),
+        }
+    }
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !candidates(dir, DVC_NAMES).is_empty() && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log(RETRO_LOG_WARN, "a VMPEG cartridge ROM is present but does not fit the CD-i 490; it needs impega.rom");
+    }
+    log(RETRO_LOG_INFO, "no IMPEG cartridge ROM (impega.rom); Digital Video titles will ask for the cartridge");
+    None
+}
+
 // Checks cartridge candidates in order and logs each verdict; only a known VMPEG dump is fitted.
 fn find_dvc(dir: &Path) -> Option<PathBuf> {
     let candidates = candidates(dir, DVC_NAMES);
@@ -250,7 +283,8 @@ fn find_dvc(dir: &Path) -> Option<PathBuf> {
                 let r = &img.report;
                 let level = if r.status == bios::Status::Ok { RETRO_LOG_INFO } else { RETRO_LOG_WARN };
                 let inside = entry.map_or_else(String::new, |e| format!(" ({})", e));
-                log(level, &format!("DVC {}{} [{}]: {}", p.display(), inside, r.status, r.message));
+                let skip = if r.status == bios::Status::Warning { "; not fitted, only the known VMPEG dump is used" } else { "" };
+                log(level, &format!("DVC {}{} [{}]: {}{}", p.display(), inside, r.status, r.message, skip));
                 if r.status == bios::Status::Ok {
                     return Some(p);
                 }
@@ -273,7 +307,7 @@ fn boot(spec: &LoadSpec) -> Result<Machine, String> {
     m.bus.nvram.persist = false;
     m.load_bios(&spec.bios).map_err(|e| format!("cannot load BIOS {}: {}", spec.bios.display(), e))?;
     if let Some(p) = &spec.dvc {
-        let (_, img) = Machine::read_dvc(p).map_err(|e| format!("cannot load DVC ROM {}: {}", p.display(), e))?;
+        let (_, img) = Machine::read_dvc_for(p, m.bus.board).map_err(|e| format!("cannot load DVC ROM {}: {}", p.display(), e))?;
         if img.report.status != bios::Status::Ok {
             return Err(format!("DVC ROM {} changed: {}", p.display(), img.report.message));
         }
@@ -616,7 +650,8 @@ pub extern "C" fn retro_cheat_set(_index: c_uint, _enabled: bool, _code: *const 
 fn load(game: *const retro_game_info) -> Result<(), String> {
     unload();
     let dir = system_directory().ok_or("frontend gave no system directory")?;
-    let bios = find_bios(&dir).inspect_err(|e| show_message(e))?;
+    let allow_mono4 = option_value(OPT_MONO4).as_deref() == Some("on");
+    let bios = find_bios(&dir, allow_mono4).inspect_err(|e| show_message(e))?;
     let mut temp = None;
     let disc = if game.is_null() {
         None
@@ -643,9 +678,12 @@ fn load(game: *const retro_game_info) -> Result<(), String> {
     }
     // SAFETY: SET_INPUT_DESCRIPTORS reads a NULL-terminated static descriptor array.
     unsafe { env_call(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, input::DESCRIPTORS.0.as_ptr() as *mut c_void) };
+    let mono4 = Machine::read_bios(&bios).is_ok_and(|(_, img)| img.report.board == Some(bios::Board::Mono4));
     let dvc = if option_value(OPT_DVC).as_deref() == Some("off") {
         log(RETRO_LOG_INFO, "DVC cartridge off (core option)");
         None
+    } else if mono4 {
+        find_impeg(&dir)
     } else {
         find_dvc(&dir)
     };
@@ -760,13 +798,13 @@ mod tests {
     #[test]
     fn find_bios_skips_bad_images_and_matches_names_case_insensitively() {
         let d = temp_dir("pick");
-        assert!(find_bios(&d).unwrap_err().contains("no CD-i system ROM"));
+        assert!(find_bios(&d, false).unwrap_err().contains("no CD-i system ROM"));
         std::fs::write(d.join("cdi220b.rom"), vec![0xFFu8; 1000]).unwrap();
-        assert!(find_bios(&d).unwrap_err().contains("no usable"));
+        assert!(find_bios(&d, false).unwrap_err().contains("no usable"));
         let mut swapped = synthetic_rom();
         bios::swap_words(&mut swapped);
         std::fs::write(d.join("CDI.ROM"), &swapped).unwrap();
-        assert_eq!(find_bios(&d).unwrap(), d.join("CDI.ROM"));
+        assert_eq!(find_bios(&d, false).unwrap(), d.join("CDI.ROM"));
         let mut m = Machine::new();
         let r = m.load_bios(d.join("CDI.ROM")).unwrap();
         assert!(r.word_swapped);
