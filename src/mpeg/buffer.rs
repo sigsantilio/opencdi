@@ -215,3 +215,5 @@ impl Buffer {
         false
     }
 }
+
+opencdi::impl_state!(Buffer { bytes, bit_index } skip {});

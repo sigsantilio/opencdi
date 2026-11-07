@@ -821,3 +821,14 @@ impl Cdic {
         }
     }
 }
+
+opencdi::impl_state!(Cdic {
+    ram, audio,
+    command, time, file, channel, audio_channel, audio_buffer, x_buffer, dma_control, z_buffer, interrupt_vector, data_buffer,
+    disc_command, disc_mode, disc_spinup_counter, curr_lba,
+    decoding_audio_map, decode_addr, audio_sector_counter, audio_map_counter, audio_format_sectors, audio_cycle_accumulator,
+    cycle_accumulator, irq_pending, dma_triggered,
+    cd_byteswap,
+} skip {
+    scramble_table,
+});

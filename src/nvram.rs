@@ -92,3 +92,4 @@ impl Timekeeper {
     }
 }
 
+opencdi::impl_state!(Timekeeper { ram } skip { dirty, dirty_frames, save_path });
