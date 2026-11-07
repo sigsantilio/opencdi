@@ -225,15 +225,14 @@ impl Ciap {
                 self.set(REG_CCR, value);
                 self.command(value, pc);
             }
-            // Play control: 0x140 starts CPU-fed playback; 0x20 ends it when nothing is queued, 0xA0 always.
+            // Play control: 0x140 starts CPU-fed playback, which ends by itself once nothing is queued.
             REG_APCR => {
                 self.set(REG_APCR, value);
                 let queued = self.reg(REG_BMAN) & 0x03 != 0;
                 match value {
                     0x0140 if !self.audio_playing => (self.audio_playing, self.audio_wait) = (true, 1),
-                    // 0xA0 ends playback now, queued buffers stay unplayed; 0x20 only once nothing is queued.
+                    // Audio event: 0xA0 at once (queued buffers still play out), 0x20 only when nothing is queued.
                     0x0020 | 0x00A0 if value == 0x00A0 || !queued => {
-                        self.audio_playing = false;
                         self.set(REG_ISR, self.reg(REG_ISR) | ISR_AUDIO_EVENT);
                         self.set(REG_ASTAT, self.reg(REG_ASTAT) | 0x80);
                     }
@@ -652,11 +651,17 @@ mod tests {
         c.write_reg(REG_APCR, 0x140, 0);
         c.tick(period, period, &mut None, &mut audio);
         assert_eq!(c.peek_reg(REG_BMAN) & 3, 2);
-        // 0xA0 stops with a buffer still queued; nothing more is played.
+        // 0xA0 raises the event at once; the queued buffer still plays and playback then ends.
         c.write_reg(REG_APCR, 0xA0, 0);
-        assert!(!c.audio_playing && c.peek_reg(REG_ISR) & ISR_AUDIO_EVENT != 0);
+        assert!(c.audio_playing && c.peek_reg(REG_ISR) & ISR_AUDIO_EVENT != 0);
         c.tick(period * 8, period, &mut None, &mut audio);
-        assert_eq!((c.peek_reg(REG_BMAN) & 3, c.audio_buffers), (2, 1));
+        assert_eq!((c.peek_reg(REG_BMAN) & 3, c.audio_buffers), (0, 2));
+        c.tick(period * 8, period, &mut None, &mut audio);
+        assert!(!c.audio_playing);
+        // With the queue drained, a later 0x20 raises the event.
+        c.read_reg(REG_ISR, 0);
+        c.write_reg(REG_APCR, 0x20, 0);
+        assert_ne!(c.peek_reg(REG_ISR) & ISR_AUDIO_EVENT, 0);
         // A buffer queued while playing is played in turn.
         c.write_reg(REG_APCR, 0x140, 0);
         c.write_reg(REG_BMAN, 0x01, 0);
