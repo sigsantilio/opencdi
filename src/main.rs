@@ -296,6 +296,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rom_arg = flag_value("--rom").map(PathBuf::from);
     let max_frames: Option<u64> = flag_value("--frames").and_then(|s| s.parse().ok());
 
+    if let Some(v) = flag_value("--video-levels") {
+        match v.as_str() {
+            "full" => opencdi::mcd212::set_studio_levels(false),
+            "studio" => opencdi::mcd212::set_studio_levels(true),
+            _ => {
+                eprintln!("--video-levels takes full or studio");
+                std::process::exit(2);
+            }
+        }
+    }
+
     let mut m = Machine::new();
     m.bus.slave.debug_log = has_flag("--slave-debug");
     if m.bus.slave.debug_log {
@@ -388,7 +399,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut disc_arg = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if a == "--rom" || a == "--frames" || a == "--dvc" || (a == "--recent" && recent_pick.is_some()) {
+        if a == "--rom" || a == "--frames" || a == "--dvc" || a == "--video-levels" || (a == "--recent" && recent_pick.is_some()) {
             it.next();
         } else if !a.starts_with("--") {
             disc_arg = Some(a.clone());

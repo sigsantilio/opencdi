@@ -1,3 +1,35 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static STUDIO_LEVELS: AtomicBool = AtomicBool::new(true);
+
+/// Selects studio levels (black 16, white 235, passed through) or full range (16..235 stretched to 0..255).
+pub fn set_studio_levels(on: bool) {
+    STUDIO_LEVELS.store(on, Ordering::Relaxed);
+}
+
+pub fn studio_levels() -> bool {
+    STUDIO_LEVELS.load(Ordering::Relaxed)
+}
+
+/// Maps one studio-level component to the selected output range.
+pub fn level_out(v: i32, studio: bool) -> u32 {
+    if studio { v.clamp(0, 255) as u32 } else { (((v - 16) * 298 + 128) >> 8).clamp(0, 255) as u32 }
+}
+
+/// Maps a full-range component (0..255) onto studio levels (16..235) for fixed display colours.
+pub fn full_to_studio(c: u32) -> u32 {
+    16 + (c * 219 + 127) / 255
+}
+
+/// Converts a fixed full-range ARGB colour (backdrop, cursor) to the selected output range.
+pub fn fixed_color_out(argb: u32) -> u32 {
+    if !studio_levels() {
+        return argb;
+    }
+    let ch = |s: u32| full_to_studio((argb >> s) & 0xFF) << s;
+    0xFF00_0000 | ch(16) | ch(8) | ch(0)
+}
+
 pub const SCREEN_WIDTH: usize = 768;
 pub const SCREEN_HEIGHT: usize = 560;
 pub const TOTAL_SCANLINES: usize = 312;
@@ -1076,9 +1108,9 @@ impl Mcd212 {
 
     fn get_backdrop_plane(&self) -> u32 {
         if (self.image_coding_method & ((1 << 4) | (1 << 12) | (1 << 18))) != 0 {
-            0xFF00_0000 // External Video Background
+            fixed_color_out(0xFF00_0000) // External Video Background
         } else {
-            S_4BPP_DISPLAY_COLOR[(self.backdrop_color & 0x0F) as usize]
+            fixed_color_out(S_4BPP_DISPLAY_COLOR[(self.backdrop_color & 0x0F) as usize])
         }
     }
 
@@ -1110,6 +1142,7 @@ impl Mcd212 {
 
         let order_ab = (self.plane_order & 1) == 0;
         let width = 768;
+        let studio = studio_levels();
 
         for x in 0..width {
             if transparent_a[x] && transparent_b[x] {
@@ -1159,9 +1192,9 @@ impl Mcd212 {
             let mixed_g = (weighted_a_g + weighted_b_g + 16).clamp(0, 255);
             let mixed_b = (weighted_a_b + weighted_b_b + 16).clamp(0, 255);
 
-            let out_r = (((mixed_r - 16) * 298 + 128) >> 8).clamp(0, 255) as u32;
-            let out_g = (((mixed_g - 16) * 298 + 128) >> 8).clamp(0, 255) as u32;
-            let out_b = (((mixed_b - 16) * 298 + 128) >> 8).clamp(0, 255) as u32;
+            let out_r = level_out(mixed_r, studio);
+            let out_g = level_out(mixed_g, studio);
+            let out_b = level_out(mixed_b, studio);
 
             out[x] = 0xFF00_0000 | (out_r << 16) | (out_g << 8) | out_b;
         }
@@ -1187,7 +1220,7 @@ impl Mcd212 {
         let y = (scanline as i32) - cursor_y;
 
         if y >= 0 && y < 16 {
-            let color = S_4BPP_DISPLAY_COLOR[color_index];
+            let color = fixed_color_out(S_4BPP_DISPLAY_COLOR[color_index]);
             let resolution = if (self.cursor_control & CURCNT_CUW) != 0 { 1 } else { 2 };
             let pattern = self.cursor_pattern[y as usize];
             for x in 0..16 {
@@ -1261,5 +1294,28 @@ impl Mcd212 {
             let start = (y_offset + active_lines * 2) * SCREEN_WIDTH;
             self.framebuffer[start..].fill(0xFF00_0000);
         }
+    }
+}
+
+#[cfg(test)]
+mod level_tests {
+    use super::*;
+
+    #[test]
+    fn full_stretches_black_and_white() {
+        assert_eq!(level_out(16, false), 0);
+        assert_eq!(level_out(235, false), 255);
+    }
+
+    #[test]
+    fn studio_passes_values_through() {
+        assert_eq!(level_out(16, true), 16);
+        assert_eq!(level_out(235, true), 235);
+    }
+
+    #[test]
+    fn fixed_colors_map_to_studio_range() {
+        assert_eq!(full_to_studio(0), 16);
+        assert_eq!(full_to_studio(255), 235);
     }
 }

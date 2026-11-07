@@ -1427,8 +1427,9 @@ impl Dvc {
         for i in 0..6 {
             self.window[i] = self.get_fmv_word(FMV_SCRPOS_Y + i * 2);
         }
-        // Border components are studio-range levels (16 = black); expand like the MCD212 output does.
-        let level = |off: usize| ((((self.get_fmv_word(off) & 0xFF) as i32 - 16) * 298 + 128) >> 8).clamp(0, 255) as u32;
+        // Border components are studio-range levels (16 = black); mapped like the MCD212 output.
+        let studio = crate::mcd212::studio_levels();
+        let level = |off: usize| crate::mcd212::level_out((self.get_fmv_word(off) & 0xFF) as i32, studio);
         self.border_color = 0xFF00_0000 | (level(FMV_BORDER_R) << 16) | (level(FMV_BORDER_R + 2) << 8) | level(FMV_BORDER_R + 4);
     }
 
@@ -1436,7 +1437,7 @@ impl Dvc {
     pub fn get_scanline(&self, active_line: usize, out: &mut [u32; 768], present: &mut [bool; 768]) {
         present.fill(false);
         if !self.has_valid_frame {
-            out.fill(0xFF00_0000);
+            out.fill(crate::mcd212::fixed_color_out(0xFF00_0000));
             return;
         }
         out.fill(self.border_color);

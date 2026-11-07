@@ -41,7 +41,7 @@ fn dump_ppm(fb: &[u32], path: &str) {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: harness <bios.rom> <disc|none> <frames> [--dvc <rom>] [--ppm <out.ppm>] [--ntsc] [--autoplay [--print-autoplay-script]] [--input <script|@file>] [--sample <n> [--sample-audio]] [--dump-every <n> <prefix>]");
+    eprintln!("usage: harness <bios.rom> <disc|none> <frames> [--dvc <rom>] [--video-levels full|studio] [--ppm <out.ppm>] [--ntsc] [--autoplay [--print-autoplay-script]] [--input <script|@file>] [--sample <n> [--sample-audio]] [--dump-every <n> <prefix>]");
     std::process::exit(2);
 }
 
@@ -65,6 +65,14 @@ fn main() {
     while i < a.len() {
         match a[i].as_str() {
             "--dvc" => { i += 1; dvc = a.get(i); }
+            "--video-levels" => {
+                i += 1;
+                match a.get(i).map(|s| s.as_str()) {
+                    Some("full") => opencdi::mcd212::set_studio_levels(false),
+                    Some("studio") => opencdi::mcd212::set_studio_levels(true),
+                    _ => usage(),
+                }
+            }
             "--ppm" => { i += 1; ppm = a.get(i); }
             "--ntsc" => ntsc = true,
             "--autoplay" => autoplay = true,
