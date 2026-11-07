@@ -353,6 +353,7 @@ impl CdiBus {
                         m.ikat.drive_report();
                     }
                 }
+                self.tick_dvc(cycles);
             }
         }
     }
@@ -369,7 +370,8 @@ impl CdiBus {
                 let Some(m) = self.mono4.as_deref() else { return 0 };
                 let ext2 = if m.ikat.irq() { 2 } else { 0 };
                 let ciap = if m.ciap.irq() { m.ciap.level() } else { 0 };
-                ciap.max(ext2)
+                let cart = if self.dvc.is_fitted() && self.dvc.irq_pending() { 4 } else { 0 };
+                ciap.max(ext2).max(cart)
             }
         }
     }
@@ -1128,6 +1130,11 @@ impl CdiBus {
         self.wr8(address.wrapping_add(1), value as u8);
     }
 
+    /// The digital video cartridge window, live on Mono-IV only when a cartridge is fitted.
+    fn cartridge_address(address: u32) -> bool {
+        (address & 0xFFFF_0000) != 0x8000_0000 && (0xD00000..=0xEFFFFF).contains(&(address & 0x00FF_FFFF))
+    }
+
     /// Mono-IV address with no device; the on-chip block is only at 0x80000000, not at its 0x800000 alias.
     fn mono4_unmapped_address(address: u32) -> bool {
         if (address & 0xFFFF_0000) == 0x8000_0000 {
@@ -1142,7 +1149,8 @@ impl CdiBus {
         if !self.mono4_bus_errors || self.board != BoardKind::Mono4 {
             return Ok(());
         }
-        let hit = (address..=address.wrapping_add(last)).step_by(2).find(|&a| Self::mono4_unmapped_address(a));
+        let cart = self.dvc.is_fitted();
+        let hit = (address..=address.wrapping_add(last)).step_by(2).find(|&a| Self::mono4_unmapped_address(a) && !(cart && Self::cartridge_address(a)));
         match hit {
             None => Ok(()),
             Some(a) => {
@@ -1166,6 +1174,14 @@ impl CdiBus {
     }
 
     fn mono4_rd8(&mut self, addr: u32) -> u8 {
+        if self.dvc.is_fitted() && Self::cartridge_address(addr) {
+            // A hole in the cartridge window reads open bus and is reported once.
+            if !crate::dvc::Dvc::impeg_mapped(addr) {
+                self.mono4_unmapped("R8", addr, 0xFF);
+                return 0xFF;
+            }
+            return self.mono1_rd8(addr);
+        }
         let pc = self.current_pc;
         let Some(m) = self.mono4.as_deref_mut() else { return 0xFF };
         match addr {
@@ -1189,6 +1205,14 @@ impl CdiBus {
     }
 
     fn mono4_rd16(&mut self, address: u32, addr: u32) -> u16 {
+        if self.dvc.is_fitted() && Self::cartridge_address(addr) {
+            // A hole in the cartridge window reads open bus and is reported once.
+            if !crate::dvc::Dvc::impeg_mapped(addr) {
+                self.mono4_unmapped("R16", addr, 0xFF);
+                return 0xFFFF;
+            }
+            return self.mono1_rd16(address, addr);
+        }
         if let (0x300000..=0x303FFE, Some(m)) = (addr, self.mono4.as_deref_mut()) {
             let off = addr - 0x300000;
             if ciap::Ciap::is_reg(off) {
@@ -1205,6 +1229,14 @@ impl CdiBus {
     }
 
     fn mono4_wr8(&mut self, addr: u32, value: u8) {
+        if self.dvc.is_fitted() && Self::cartridge_address(addr) {
+            // A hole in the cartridge window reads open bus and is reported once.
+            if !crate::dvc::Dvc::impeg_mapped(addr) {
+                self.mono4_unmapped("W8", addr, value as u32);
+                return ();
+            }
+            return self.mono1_wr8(addr, value);
+        }
         let pc = self.current_pc;
         let Some(m) = self.mono4.as_deref_mut() else { return };
         match addr {
@@ -1241,6 +1273,14 @@ impl CdiBus {
     }
 
     fn mono4_wr16(&mut self, address: u32, addr: u32, value: u16) {
+        if self.dvc.is_fitted() && Self::cartridge_address(addr) {
+            // A hole in the cartridge window reads open bus and is reported once.
+            if !crate::dvc::Dvc::impeg_mapped(addr) {
+                self.mono4_unmapped("W16", addr, value as u32);
+                return ();
+            }
+            return self.mono1_wr16(address, addr, value);
+        }
         if let (0x300000..=0x303FFE, Some(m)) = (addr, self.mono4.as_deref_mut()) {
             let off = addr - 0x300000;
             if ciap::Ciap::is_reg(off) {
@@ -1259,6 +1299,9 @@ impl CdiBus {
     }
 
     fn mono4_peek(&self, addr: u32) -> Option<u8> {
+        if self.dvc.is_fitted() && Self::cartridge_address(addr) {
+            return self.mono1_peek(addr);
+        }
         let m = self.mono4.as_deref()?;
         match addr {
             0x300000..=0x303FFF if !ciap::Ciap::is_reg(addr - 0x300000) => Some(m.ciap.ram[(addr - 0x300000) as usize]),
@@ -1269,6 +1312,10 @@ impl CdiBus {
 
     // External level 4 (CIAP) and level 2 (IKAT) acknowledges on the Mono-IV board.
     fn mono4_iack(&mut self, level: u8) -> Option<u32> {
+        // The cartridge request (IN4) is served before the CIAP at the same level.
+        if level == 4 && self.dvc.is_fitted() && self.dvc.irq_pending() {
+            return Some(self.dvc.intack_vector() as u32);
+        }
         let m = self.mono4.as_deref()?;
         if m.ciap.irq() && level == m.ciap.level() {
             return Some(m.ciap.vector());
@@ -1476,6 +1523,34 @@ mod tests {
         assert!(bus.try_read_word(0x500000).is_err() && bus.try_read_word(0x800000).is_err());
         assert!(bus.try_read_word(0x320011).is_ok() && bus.try_read_byte(0x8000_2011).is_ok());
         assert_eq!(bus.counters.bus_errors, 2);
+    }
+
+    #[test]
+    fn mono4_cartridge_window_and_interrupt_priority() {
+        let mut bus = CdiBus::new();
+        bus.set_board(BoardKind::Mono4);
+        bus.mono4_bus_errors = true;
+        assert!(bus.try_read_word(0xE40000).is_err());
+        bus.dvc.load_rom_bytes(&[0x4A, 0xFC, 0, 0]);
+        bus.dvc.impeg = true;
+        assert_eq!(bus.try_read_word(0xE40000), Ok(0x4AFC));
+        // A hole inside the window reads open bus without a bus error and is counted.
+        let n = bus.counters.unmapped;
+        assert_eq!(bus.try_read_byte(0xE03001), Ok(0xFF));
+        assert_eq!(bus.counters.unmapped, n + 1);
+        // Nothing pending: no vector from the cartridge or the CIAP.
+        assert_eq!(bus.mono4_iack(4), None);
+        bus.dvc.set_fmv_word(crate::dvc::FMV_IVEC, 0x5A << 3 | 4);
+        bus.dvc.set_fmv_word(crate::dvc::FMV_IER, 0x0001);
+        bus.dvc.set_fmv_word(crate::dvc::FMV_ISR, 0x0001);
+        if let Some(m) = bus.mono4.as_deref_mut() {
+            m.ciap.write_reg(ciap::REG_IER, 0x0001, 0);
+            m.ciap.regs[(ciap::REG_ISR >> 1) as usize] = 0x0001;
+        }
+        assert_eq!(bus.board_ipl(), 4);
+        assert_eq!(bus.mono4_iack(4), Some(0x5A));
+        bus.dvc.set_fmv_word(crate::dvc::FMV_ISR, 0);
+        assert_eq!(bus.mono4_iack(4), Some(0x3C));
     }
 
     #[test]
