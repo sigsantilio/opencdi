@@ -212,6 +212,7 @@ pub fn save_state_to_file<P: AsRef<Path>>(
 ) -> io::Result<()> {
     let mut w = StateWriter::new();
     w.write_fixed_bytes(SAVESTATE_MAGIC);
+    w.write_bool(bus.board == BoardKind::Mono4);
 
     // 1. Emulation frontend state
     w.write_bool(disc_launched);
@@ -577,7 +578,6 @@ pub fn save_state_to_file<P: AsRef<Path>>(
     }
 
     // 11. Mono-IV board chips
-    w.write_bool(bus.board == BoardKind::Mono4);
     if let Some(m) = bus.mono4.as_deref() {
         w.write_bytes(&m.save_blob(&bus.dvc));
     }
@@ -610,6 +610,12 @@ pub fn load_state_from_file<P: AsRef<Path>>(
             io::ErrorKind::InvalidData,
             "Invalid save state file header (not an OpenCDi save state)",
         ));
+    }
+
+    // The board is checked before anything is loaded so a state of the other board leaves the machine untouched
+    let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+    if r.read_bool()? != (bus.board == BoardKind::Mono4) {
+        return Err(bad("save state is from a different board"));
     }
 
     // 1. Emulation frontend state
@@ -1040,10 +1046,6 @@ pub fn load_state_from_file<P: AsRef<Path>>(
     }
 
     // 11. Mono-IV board chips
-    let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
-    if r.read_bool()? != (bus.board == BoardKind::Mono4) {
-        return Err(bad("save state is from a different board"));
-    }
     if let Some(m) = bus.mono4.as_deref_mut() {
         let blob = r.read_bytes()?;
         m.load_blob(&blob, &mut bus.dvc).ok_or_else(|| bad("bad Mono-IV chip state"))?;
