@@ -252,9 +252,8 @@ impl Cdic {
                     self.decode_addr = 0xFFFF;
                     self.decoding_audio_map = false;
                 } else {
-                    let req_addr = val & 0x3A00;
-                    if !self.decoding_audio_map || self.decode_addr == 0xFFFF || self.decode_addr != req_addr {
-                        self.decode_addr = req_addr;
+                    if !self.decoding_audio_map || self.decode_addr == 0xFFFF {
+                        self.decode_addr = val & 0x3A00;
                         self.audio_format_sectors = 0;
                         if self.audio_map_counter == 0 {
                             self.audio_map_counter = 1;
