@@ -317,8 +317,18 @@ impl Ciap {
                 if self.loud.first(0x400 | reg) {
                     eprintln!("CIAP byte write to command reg {:02X}{} <- {:02X} pc~{:06X}", reg, if hi { "H" } else { "L" }, value, pc);
                 }
-                let cur = self.reg(reg);
-                self.write_reg(reg, (cur & !mask) | v, pc);
+                let merged = (self.reg(reg) & !mask) | v;
+                match reg {
+                    // A byte write stores the lane only; the command runs on a word write, and a copy starts only when the written lane sets bit 14
+                    REG_CCR => self.set(reg, merged),
+                    REG_DMACTL => {
+                        self.set(reg, merged);
+                        if v & 0x4000 != 0 {
+                            self.dma_request = Some(merged);
+                        }
+                    }
+                    _ => self.write_reg(reg, merged, pc),
+                }
             }
             _ => {
                 let cur = self.peek_reg(reg);
