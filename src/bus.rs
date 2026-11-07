@@ -347,7 +347,7 @@ impl CdiBus {
             }
             BoardKind::Mono4 => {
                 if let Some(m) = self.mono4.as_deref_mut() {
-                    m.ciap.tick(cycles, self.mcd212.video_mode.cycles_per_sector(), &mut self.cdrom);
+                    m.ciap.tick(cycles, self.mcd212.video_mode.cycles_per_sector(), &mut self.cdrom, &mut self.cdic.audio);
                     // A drive that stopped on its own sends one status report.
                     if std::mem::take(&mut m.ciap.drive_stopped) {
                         m.ikat.drive_report();
