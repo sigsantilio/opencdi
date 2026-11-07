@@ -155,7 +155,7 @@ impl Os9Trace {
                     let name_off = bus.peek_long(a + 0x0C).unwrap_or(0);
                     let name = read_text(bus, a.wrapping_add(name_off), 32);
                     self.modules.retain(|(b, _, _)| *b != a);
-                    self.modules.push((a, a + size, name.clone()));
+                    self.modules.push((a, a.saturating_add(size), name.clone()));
                     return format!("{}+{:X}", name, pc - a);
                 }
             }
