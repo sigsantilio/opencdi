@@ -333,7 +333,6 @@ impl CdiBus {
     pub fn render_scanline(&mut self, line: usize) {
         self.mcd212.render_line(line);
     }
-    }
 
     pub fn perform_dvc_dma(&mut self) {
         let fmv_req = (self.dvc.get_fmv_word(crate::dvc::FMV_SYSCMD) & 0x8000) != 0;
@@ -375,7 +374,6 @@ impl CdiBus {
             }
         }
         self.dvc.process_stream();
-        self.flush_dvc_audio();
         trace!("After DVC DMA: demux_video_len={}, demux_audio_len={}, fma_audio_len={}, has_decoder={}, decoded_count={}",
             self.dvc.demux.video.len(), self.dvc.demux.audio.len(), self.dvc.fma_demux.audio.len(), self.dvc.video_decoder.is_some(), self.dvc.frames_decoded_count);
         self.dma.channels[1].memory_address_counter = start.wrapping_add(count * 2);
