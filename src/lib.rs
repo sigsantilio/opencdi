@@ -12,6 +12,7 @@ pub mod input_script;
 pub mod machine;
 pub mod mcd212;
 pub mod nvram;
+pub mod os9_trace;
 pub mod savestate;
 pub mod scc_timer;
 pub mod slave;
