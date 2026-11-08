@@ -9,7 +9,7 @@ L'obiettivo del progetto è preservare e rendere fruibile l'intera libreria soft
 
 ---
 
-## Novità Versione 0.2.0
+## Novità Versione 0.3.0
 
 - **Libretro Core (`crates/opencdi-libretro`)**: OpenCDi è ora disponibile come core per **RetroArch** (`opencdi_libretro.dll`) e frontend compatibili, con supporto nativo a Runahead a zero latenza e Rewind deterministico.
 - **Supporto Architettura Mono-IV**: Emulazione sperimentale della scheda **Philips CD-i 490 (Mono-IV)** con controller CIAP (CD-i Audio/Packet), coprocessore I/O IKAT e RTC Dallas DS1216.

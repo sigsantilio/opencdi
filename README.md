@@ -12,7 +12,7 @@ The goal of the project is to accurately preserve and run the complete software 
 
 ---
 
-## What's New in Version 0.2.0
+## What's New in Version 0.3.0
 
 - **Libretro Core (`crates/opencdi-libretro`)**: OpenCDi can now be built as a native core for **RetroArch** (`opencdi_libretro.dll` / `.so`), featuring zero-lag Runahead and deterministic Rewind support.
 - **Mono-IV Board Architecture**: Experimental emulation of the **Philips CD-i 490 (Mono-IV)** board, including CIAP (CD-i Audio/Packet), IKAT I/O co-processor, and Dallas DS1216 real-time clock.
