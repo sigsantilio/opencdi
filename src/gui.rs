@@ -25,6 +25,11 @@ pub const ID_CONTROLS_INFO: usize = 1013;
 pub const ID_CONTROLS_RELEASE_MOUSE: usize = 1014;
 pub const ID_INPUT_DEVICE_GAMEPAD: usize = 1060;
 pub const ID_INPUT_DEVICE_MOUSE: usize = 1061;
+pub const ID_MOUSE_SENS_25: usize = 1090;
+pub const ID_MOUSE_SENS_50: usize = 1091;
+pub const ID_MOUSE_SENS_75: usize = 1092;
+pub const ID_MOUSE_SENS_100: usize = 1093;
+pub const ID_MOUSE_SENS_150: usize = 1094;
 
 pub const ID_AUDIO_MUTE: usize = 1020;
 pub const ID_AUDIO_VOL_UP: usize = 1021;
@@ -327,6 +332,22 @@ pub fn update_input_device_menu(mode: InputDeviceMode) {
     }
 }
 
+pub fn update_mouse_sensitivity_menu(sens: f32) {
+    unsafe {
+        if !MENU_HANDLE.is_null() {
+            let is_close = |target: f32| (sens - target).abs() < 0.08;
+            CheckMenuItem(MENU_HANDLE, ID_MOUSE_SENS_25 as u32, MF_BYCOMMAND | if is_close(0.25) { MF_CHECKED } else { MF_UNCHECKED });
+            CheckMenuItem(MENU_HANDLE, ID_MOUSE_SENS_50 as u32, MF_BYCOMMAND | if is_close(0.50) { MF_CHECKED } else { MF_UNCHECKED });
+            CheckMenuItem(MENU_HANDLE, ID_MOUSE_SENS_75 as u32, MF_BYCOMMAND | if is_close(0.75) { MF_CHECKED } else { MF_UNCHECKED });
+            CheckMenuItem(MENU_HANDLE, ID_MOUSE_SENS_100 as u32, MF_BYCOMMAND | if is_close(1.00) { MF_CHECKED } else { MF_UNCHECKED });
+            CheckMenuItem(MENU_HANDLE, ID_MOUSE_SENS_150 as u32, MF_BYCOMMAND | if is_close(1.50) { MF_CHECKED } else { MF_UNCHECKED });
+            if !OWNER_HWND.is_null() {
+                DrawMenuBar(OWNER_HWND);
+            }
+        }
+    }
+}
+
 pub fn update_profile_menu(profile: InputProfile) {
     unsafe {
         if !MENU_HANDLE.is_null() {
@@ -517,6 +538,26 @@ unsafe extern "system" fn custom_wndproc(
                 push_action(GuiAction::SetInputDevice(InputDeviceMode::Mouse));
                 return 0;
             }
+            ID_MOUSE_SENS_25 => {
+                push_action(GuiAction::SetMouseSensitivity(0.25));
+                return 0;
+            }
+            ID_MOUSE_SENS_50 => {
+                push_action(GuiAction::SetMouseSensitivity(0.50));
+                return 0;
+            }
+            ID_MOUSE_SENS_75 => {
+                push_action(GuiAction::SetMouseSensitivity(0.75));
+                return 0;
+            }
+            ID_MOUSE_SENS_100 => {
+                push_action(GuiAction::SetMouseSensitivity(1.00));
+                return 0;
+            }
+            ID_MOUSE_SENS_150 => {
+                push_action(GuiAction::SetMouseSensitivity(1.50));
+                return 0;
+            }
             ID_CONTROLS_EDIT_INI => {
                 let _ = std::process::Command::new("notepad.exe").arg("opencdi_controls.ini").spawn();
                 push_action(GuiAction::SetProfile(InputProfile::Custom));
@@ -623,6 +664,8 @@ pub fn attach_gui_menu(
     current_profile: InputProfile,
     current_device_mode: InputDeviceMode,
     current_video_mode: crate::mcd212::VideoMode,
+    current_mouse_sensitivity: f32,
+    show_menu: bool,
 ) {
     if hwnd.is_null() {
         return;
@@ -719,6 +762,14 @@ pub fn attach_gui_menu(
         AppendMenuW(device_menu, MF_STRING, ID_INPUT_DEVICE_GAMEPAD, to_wide("CD-i Gamepad (USB Controller / Keyboard)\tF9").as_ptr());
         AppendMenuW(device_menu, MF_STRING, ID_INPUT_DEVICE_MOUSE, to_wide("Philips CD-i Mouse (Host Cursor)\tF9").as_ptr());
         AppendMenuW(controls_menu, MF_POPUP, device_menu as usize, to_wide("Input Device (Exclusive)").as_ptr());
+
+        let sens_menu = CreatePopupMenu();
+        AppendMenuW(sens_menu, MF_STRING, ID_MOUSE_SENS_25, to_wide("Very Low (25%)").as_ptr());
+        AppendMenuW(sens_menu, MF_STRING, ID_MOUSE_SENS_50, to_wide("Low (50% - Recommended)").as_ptr());
+        AppendMenuW(sens_menu, MF_STRING, ID_MOUSE_SENS_75, to_wide("Medium (75%)").as_ptr());
+        AppendMenuW(sens_menu, MF_STRING, ID_MOUSE_SENS_100, to_wide("Normal (100% Raw)").as_ptr());
+        AppendMenuW(sens_menu, MF_STRING, ID_MOUSE_SENS_150, to_wide("High (150%)").as_ptr());
+        AppendMenuW(controls_menu, MF_POPUP, sens_menu as usize, to_wide("Mouse Sensitivity").as_ptr());
         AppendMenuW(controls_menu, MF_SEPARATOR, 0, std::ptr::null());
 
         AppendMenuW(controls_menu, MF_STRING, ID_PROFILE_STANDARD, to_wide("Key Profile: Standard (Arrow Keys + Z / X)").as_ptr());
@@ -743,7 +794,7 @@ pub fn attach_gui_menu(
         // 4. Video Menu
         let video_menu = CreatePopupMenu();
         AppendMenuW(video_menu, MF_STRING, ID_VIDEO_FULLSCREEN, to_wide("Fullscreen\tF11 / Alt+Enter").as_ptr());
-        AppendMenuW(video_menu, MF_STRING, ID_VIDEO_SCREENSHOT, to_wide("Save Screenshot\tF12").as_ptr());
+        AppendMenuW(video_menu, MF_STRING, ID_VIDEO_SCREENSHOT, to_wide("Save Screenshot (PNG)\tF12").as_ptr());
         AppendMenuW(video_menu, MF_SEPARATOR, 0, std::ptr::null());
         AppendMenuW(video_menu, MF_STRING, ID_VIDEO_PAL, to_wide("PAL (50 Hz) [CD-i 220 Standard]").as_ptr());
         AppendMenuW(video_menu, MF_STRING, ID_VIDEO_NTSC, to_wide("NTSC (60 Hz)").as_ptr());
@@ -761,18 +812,39 @@ pub fn attach_gui_menu(
         // 6. Prominent Top-Level Send Feedback Button
         AppendMenuW(main_menu, MF_STRING, ID_HELP_FEEDBACK, to_wide("Send Feedback (F1)").as_ptr());
 
-        SetMenu(hwnd, main_menu);
-        DrawMenuBar(hwnd);
+        if show_menu {
+            SetMenu(hwnd, main_menu);
+            DrawMenuBar(hwnd);
+        } else {
+            SetMenu(hwnd, std::ptr::null_mut());
+        }
         set_window_icon(hwnd);
 
         update_input_device_menu(current_device_mode);
         update_profile_menu(current_profile);
         update_video_menu(current_video_mode);
+        update_mouse_sensitivity_menu(current_mouse_sensitivity);
 
         // Subclass window procedure
         let prev = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, custom_wndproc as *const () as usize as isize);
         PREV_WNDPROC = prev;
-        info!("Win32 Native Menu attached and window subclassed successfully.");
+        info!("Win32 Native Menu attached (visible={}) and window subclassed successfully.", show_menu);
+    }
+}
+
+pub fn set_menu_visible(hwnd: *mut std::ffi::c_void, visible: bool) {
+    if hwnd.is_null() {
+        return;
+    }
+    unsafe {
+        if visible {
+            if !MENU_HANDLE.is_null() {
+                SetMenu(hwnd, MENU_HANDLE);
+            }
+        } else {
+            SetMenu(hwnd, std::ptr::null_mut());
+        }
+        DrawMenuBar(hwnd);
     }
 }
 
@@ -833,8 +905,10 @@ pub fn show_controls_dialog(owner: *mut std::ffi::c_void) {
            • Map any key (e.g. Space, Enter, Shift, etc.) in opencdi_controls.ini\n\n\
         MOUSE & TOUCH:\n\
            • Move host mouse to move the on-screen pointer or cursor.\n\
-           • Left Click = Button 1  |  Right Click = Button 2\n\
-           • Middle Click: Lock / release host mouse cursor to/from the window.\n\n\
+           • Left Click = Button 1 (also locks / captures mouse if released).\n\
+           • Right Click = Button 2\n\
+           • Middle Click: Lock / release host mouse cursor to/from the window.\n\
+           • Controls -> Mouse Sensitivity: adjust speed multiplier (25% - 150%).\n\n\
         USB GAMEPAD / XBOX / PLAYSTATION:\n\
            • D-Pad or Left Analog Stick = Movement\n\
            • Button A / Cross = Button 1\n\
@@ -846,7 +920,7 @@ pub fn show_controls_dialog(owner: *mut std::ffi::c_void) {
            • F6: Quick Save State (Slot 1)  |  F7: Quick Load State (Slot 1)\n\
            • F9: Switch Active Input Device (Gamepad <-> Mouse)\n\
            • P: Pause  |  Space (hold): Fast-forward\n\
-           • F8: Screenshot (PPM)  |  F12: Screenshot (BMP)\n\
+           • F8: Screenshot (BMP)  |  F12: Screenshot (PNG)\n\
            • Ctrl+I: Insert disc  |  Ctrl+O: Open disc image and restart\n\
            • M: Mute / Unmute audio  |  + / - : Adjust volume\n\
            • Esc: Quit"

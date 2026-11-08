@@ -159,6 +159,9 @@ pub struct CdRom {
     pub total_sectors: u32,
     pub tracks: Vec<CdTrack>,
     pub disc_type: u8, // 0x10 = CD-i, 0x20 = CD-ROM XA / CD-i Bridge / Video CD, 0x00 = CD-DA
+    pub volume_id: String,
+    pub volume_set: String,
+    pub publisher: String,
 }
 
 fn parse_msf(s: &str) -> Option<u32> {
@@ -334,6 +337,9 @@ impl CdRom {
                 total_sectors,
                 tracks,
                 disc_type: 0x10,
+                volume_id: String::new(),
+                volume_set: String::new(),
+                publisher: String::new(),
             };
             cdrom.detect_disc_type();
             return Ok(cdrom);
@@ -383,6 +389,9 @@ impl CdRom {
                 total_sectors,
                 tracks,
                 disc_type: 0x10,
+                volume_id: String::new(),
+                volume_set: String::new(),
+                publisher: String::new(),
             };
             cdrom.detect_disc_type();
             Ok(cdrom)
@@ -412,6 +421,9 @@ impl CdRom {
                 total_sectors,
                 tracks,
                 disc_type: 0x10,
+                volume_id: String::new(),
+                volume_set: String::new(),
+                publisher: String::new(),
             };
             cdrom.detect_disc_type();
             Ok(cdrom)
@@ -558,6 +570,9 @@ impl CdRom {
                 total_sectors,
                 tracks,
                 disc_type: 0x10,
+                volume_id: String::new(),
+                volume_set: String::new(),
+                publisher: String::new(),
             };
 
             cdrom.detect_disc_type();
@@ -569,14 +584,17 @@ impl CdRom {
         let mut s16 = [0u8; CD_SECTOR_RAW_SIZE];
         if self.read_sector(16, &mut s16) {
             let sys_id = &s16[24 + 8..24 + 40];
+            self.volume_id = String::from_utf8_lossy(&s16[24 + 40..24 + 72]).trim().to_string();
+            self.volume_set = String::from_utf8_lossy(&s16[24 + 318..24 + 446]).trim().to_string();
+            self.publisher = String::from_utf8_lossy(&s16[24 + 446..24 + 574]).trim().to_string();
             if sys_id.starts_with(b"CD-RTOS CD-BRIDGE") {
                 info!("CD-ROM: Riconosciuto disco CD-RTOS CD-BRIDGE (Video CD / White Book), disc_type = 0x20");
                 self.disc_type = 0x20;
             } else if sys_id.starts_with(b"CD-RTOS") || sys_id.starts_with(b"CD-I") {
-                info!("CD-ROM: Riconosciuto disco CD-i standard, disc_type = 0x10");
+                info!("CD-ROM: Riconosciuto disco CD-i standard, disc_type = 0x10, volume = {:?}", self.volume_id);
                 self.disc_type = 0x10;
             } else {
-                info!("CD-ROM: Disc system ID: {:?}, disc_type = 0x10", String::from_utf8_lossy(sys_id).trim());
+                info!("CD-ROM: Disc system ID: {:?}, disc_type = 0x10, volume = {:?}", String::from_utf8_lossy(sys_id).trim(), self.volume_id);
                 self.disc_type = 0x10;
             }
         } else {
@@ -586,6 +604,24 @@ impl CdRom {
                 self.disc_type = 0x00;
             }
         }
+    }
+
+    /// Evaluates whether this disc should run in NTSC (60 Hz) mode based on filename and Sector 16 metadata.
+    pub fn is_ntsc_hint(&self, disc_name: &str) -> Option<bool> {
+        let name_upper = disc_name.to_uppercase();
+        if name_upper.contains("(USA)") || name_upper.contains("(JAPAN)") || name_upper.contains("(US)") || name_upper.contains("NTSC") {
+            return Some(true);
+        }
+        if name_upper.contains("(EUROPE)") || name_upper.contains("(PAL)") || name_upper.contains("(GERMANY)")
+            || name_upper.contains("(FRANCE)") || name_upper.contains("(UK)") || name_upper.contains("(ITALY)")
+            || name_upper.contains("(SPAIN)") || name_upper.contains("(NETHERLANDS)") {
+            return Some(false);
+        }
+        let vol_upper = self.volume_id.to_uppercase();
+        if vol_upper.contains("EARTH COMMAND") {
+            return Some(true);
+        }
+        None
     }
 
     pub fn read_sector(&mut self, lba: u32, out_sector: &mut [u8; CD_SECTOR_RAW_SIZE]) -> bool {

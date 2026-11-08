@@ -64,6 +64,7 @@ pub struct SlaveHle {
 
     pub irq_pending: bool,
     pub has_disc: bool,
+    pub is_data: bool,
     pub disc_state: u8,
     pub disc_timer: u32,
     pub xbus_interrupt_enable: bool,
@@ -93,6 +94,7 @@ impl SlaveHle {
 
             irq_pending: false,
             has_disc: false,
+            is_data: true,
             disc_state: 0x00,
             disc_timer: 0,
             xbus_interrupt_enable: false,
@@ -120,20 +122,23 @@ impl SlaveHle {
         self.disc_state = if self.has_disc { 0x41 } else { 0x00 };
     }
 
-    pub fn set_disc_inserted(&mut self, inserted: bool) {
+    pub fn set_disc_inserted(&mut self, inserted: bool, is_data: bool) {
         self.has_disc = inserted;
+        self.is_data = is_data;
         self.disc_timer = 0;
         self.disc_state = if inserted { 0x41 } else { 0x00 };
         let disc_byte = self.disc_state;
-        info!("Slave: set_disc_inserted({}) -> state 0x{:02X}, pushing to Ch3 with IRQ2", inserted, disc_byte);
+        info!("Slave: set_disc_inserted({}, is_data={}) -> state 0x{:02X}, pushing to Ch3 with IRQ2", inserted, is_data, disc_byte);
         self.prepare_readback(3, &[0xB0, 0x00, disc_byte, 0x15], 0xB0, true);
     }
 
-    pub fn notify_disc_swapped(&mut self) {
+    pub fn notify_disc_swapped(&mut self, is_data: bool) {
         self.has_disc = true;
+        self.is_data = is_data;
         self.disc_timer = 0;
         self.disc_state = 0x41;
-        info!("Slave: notify_disc_swapped -> sending tray open (0x00) then spinup (0x41 -> 0x44)");
+        let final_state = if is_data { 0x02 } else { 0x01 };
+        info!("Slave: notify_disc_swapped (is_data={}) -> sending tray open (0x00) then spinup (0x41 -> 0x{:02X})", is_data, final_state);
         self.prepare_readback(3, &[0xB0, 0x00, 0x00, 0x15], 0xB0, true);
     }
 
@@ -141,9 +146,10 @@ impl SlaveHle {
         if self.has_disc && self.disc_state == 0x41 {
             self.disc_timer += cycles;
             if self.disc_timer >= 4_500_000 {
-                self.disc_state = 0x44;
-                info!("Slave: disc TOC ready (0x41 -> 0x44) -> pushing status packet to Ch3 with IRQ2");
-                self.prepare_readback(3, &[0xB0, 0x00, 0x44, 0x15], 0xB0, true);
+                self.disc_state = if self.is_data { 0x02 } else { 0x01 };
+                let state = self.disc_state;
+                info!("Slave: disc TOC ready (0x41 -> 0x{:02X}) -> pushing status packet to Ch3 with IRQ2", state);
+                self.prepare_readback(3, &[0xB0, 0x00, state, 0x15], 0xB0, true);
             }
         }
     }
@@ -375,32 +381,44 @@ impl SlaveHle {
 
     pub fn prepare_readback(&mut self, ch_idx: usize, data: &[u8], cmd: u8, assert_irq: bool) {
         let ch = &mut self.channels[ch_idx];
-        // CH0 (Pointing Device): se c'è già un pacchetto attivo in out_buf (anche se out_index == 0),
-        // non sovrascrivere out_buf per evitare la perdita di click/spari o la corruzione di letture in corso.
-        if ch_idx == 0 && ch.out_count > 0 {
+        if ch_idx == 0 {
+            let in_flight_read = ch.out_index > 0 && ch.out_count > 0;
+            let old_has_btn = ch.out_count > 0 && (ch.out_buf[0] & 0x38) != 0x08;
             let new_has_btn = (data[0] & 0x38) != 0x08;
-            let pending_has_btn = ch.pending_count > 0 && (ch.pending_buf[0] & 0x38) != 0x08;
 
-            if !pending_has_btn || new_has_btn {
-                ch.pending_count = data.len().min(ch.pending_buf.len());
-                ch.pending_cmd = cmd;
-                for (i, &b) in data.iter().take(ch.pending_count).enumerate() {
-                    ch.pending_buf[i] = b;
+            // Se una lettura è ATTIVAMENTE in corso (out_index > 0), non sovrascrivere out_buf
+            // per evitare di corrompere la lettura multi-byte in transito.
+            // Oppure, se out_buf contiene già un click (old_has_btn) non ancora letto (out_index == 0)
+            // e il nuovo pacchetto è un rilascio (!new_has_btn), accoda il rilascio in pending_buf
+            // per non cancellare il click prima che la CPU lo legga.
+            if in_flight_read || (old_has_btn && !new_has_btn) {
+                let pending_has_btn = ch.pending_count > 0 && (ch.pending_buf[0] & 0x38) != 0x08;
+
+                if !pending_has_btn || new_has_btn {
+                    ch.pending_count = data.len().min(ch.pending_buf.len());
+                    ch.pending_cmd = cmd;
+                    for (i, &b) in data.iter().take(ch.pending_count).enumerate() {
+                        ch.pending_buf[i] = b;
+                    }
+                } else {
+                    // Preserva il bottone già in attesa in pending_buf, aggiornando solo le coordinate di puntamento
+                    ch.pending_buf[0] = (ch.pending_buf[0] & 0x38) | (data[0] & !0x38);
+                    ch.pending_buf[1] = data[1];
+                    ch.pending_buf[2] = data[2];
+                    ch.pending_buf[3] = data[3];
                 }
-            } else {
-                // Preserva il bottone già in attesa in pending_buf, aggiornando solo le coordinate di puntamento
-                ch.pending_buf[0] = (ch.pending_buf[0] & 0x38) | (data[0] & !0x38);
-                ch.pending_buf[1] = data[1];
-                ch.pending_buf[2] = data[2];
-                ch.pending_buf[3] = data[3];
+                return;
             }
-            return;
         }
         ch.out_index = 0;
         ch.out_count = data.len().min(ch.out_buf.len());
         ch.out_cmd = cmd;
         for (i, &b) in data.iter().take(ch.out_count).enumerate() {
             ch.out_buf[i] = b;
+        }
+        if ch_idx == 0 {
+            ch.pending_count = 0;
+            ch.pending_cmd = 0;
         }
         if assert_irq {
             self.irq_pending = true;

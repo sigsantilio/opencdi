@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut disc_launched = false;
     let mut shell_ready_count = 0;
 
-    for frame in 0..2005 {
+    for frame in 0..4500 {
         if bus.cdrom.is_some() && !disc_launched {
             let (_effective_shell_base, shell_state) = if bus.dvc.is_fitted() {
                 let s_dvc = bus.read_long(0x00D08090u32.wrapping_add(0xFFFF9172));
@@ -108,8 +108,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cyc_per_line = bus.mcd212.video_mode.cycles_per_scanline();
 
         for line in 0..total_lines {
-
-
             bus.tick_scanline(line);
             if bus.mcd212.vblank_irq {
                 bus.scc_timer.lir |= 0x80;
@@ -186,7 +184,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        if frame == 1000 || frame == 2000 || frame == 2400 || frame == 3000 || frame == 4000 || frame == 5000 || frame == 6000 {
+        if frame == 1000 || frame == 1500 || frame == 2000 || frame == 2500 || frame == 3000 || frame == 3500 || frame == 4000 {
             let path = format!("albero_{}.bmp", frame);
             save_bmp(&bus.mcd212.framebuffer[..], &path);
             println!("Saved {}", path);

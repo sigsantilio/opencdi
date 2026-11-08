@@ -766,7 +766,7 @@ impl Dvc {
         self.set_fmv_word(0x5E, if fifo_ready { 0x2000 } else { 0 }); // SYS_STS bit 13
         self.set_fmv_word(0x98, ((self.dclk >> 6) & 0x7FFF) as u16);  // GEN_SYSCR (22.5kHz >> 5 = 45kHz >> 6)
         let queue_len: u16 = if self.video_decoder.is_some() {
-            if self.video_playing { 1 } else { 3 }
+            3
         } else {
             0
         };
@@ -995,8 +995,8 @@ impl Dvc {
                 }
                 self.or_fmv_word(FMV_ISR, FMV_IRQ_DCL);
                 if value & 0x0080 != 0 { // STOP
-                    self.has_valid_frame = false;
-                    self.framebuffer.fill(0xFF00_0000);
+                    // NOTE: Real DVC hardware keeps the last decoded picture in DRAM.
+                    // Retaining has_valid_frame prevents black flash during scene transitions.
                     self.video_armed = false;
                     self.video_playing = false;
                     self.decoder_enabled = false;
@@ -1018,8 +1018,6 @@ impl Dvc {
                     self.set_fmv_word(0x5C, 0x0000);
                 }
                 if value & 0x0100 != 0 { // RESET
-                    self.has_valid_frame = false;
-                    self.framebuffer.fill(0xFF00_0000);
                     self.video_playing = false;
                     self.video_armed = false;
                     self.reset_stream();
@@ -1029,8 +1027,7 @@ impl Dvc {
                     self.decoder_enabled = true;
                 }
                 if value & 0x2000 != 0 { // DEC_OFF
-                    self.has_valid_frame = false;
-                    self.framebuffer.fill(0xFF00_0000);
+                    // NOTE: Real DVC hardware keeps the last decoded picture in DRAM.
                     self.decoder_enabled = false;
                     self.video_playing = false;
                     self.underflow_count = 0;
@@ -1440,13 +1437,27 @@ impl Dvc {
             return;
         }
         out.fill(self.border_color);
-        let [pos_y, pos_x, win_h, win_w, off_y, off_x] = self.window.map(usize::from);
+        let [pos_y, pos_x, raw_win_h, raw_win_w, off_y, off_x] = self.window.map(usize::from);
         let (pic_w, pic_h) = (self.video_width, self.video_height);
         // The window is clipped to the decoded picture (mv_window adapts its size the same way).
         let off_x = off_x.min(pic_w);
         let off_y = off_y.min(pic_h);
-        let win_w = win_w.min(pic_w - off_x);
-        let win_h = win_h.min(pic_h - off_y);
+        let win_w = raw_win_w.min(pic_w.saturating_sub(off_x));
+        let win_h = raw_win_h.min(pic_h.saturating_sub(off_y));
+
+        // When WIN_W/WIN_H are unconstrained (0x7FFF sentinel) or when an origin position would
+        // push the video off-screen (such as Brain Dead 13's (384, 240) centering formula on -1 dimensions),
+        // fallback to standard centered full-screen placement.
+        let mut pos_x = pos_x;
+        let mut pos_y = pos_y;
+        if raw_win_w >= 0x7FFF || pos_x + win_w > 384 {
+            pos_x = (384usize.saturating_sub(pic_w)) / 2;
+        }
+        let total_active = if self.vsync_hz < 55.0 { 280 } else { 240 };
+        if raw_win_h >= 0x7FFF || pos_y + win_h > total_active {
+            pos_y = (total_active.saturating_sub(pic_h)) / 2;
+        }
+
         if active_line < pos_y || active_line >= pos_y + win_h {
             return;
         }

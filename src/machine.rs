@@ -1,4 +1,5 @@
 use crate::bus::CdiBus;
+use m68k::AddressBus;
 use crate::mcd212::VideoMode;
 use m68k::{CpuCore, CpuType};
 use std::path::Path;
@@ -44,7 +45,7 @@ impl Machine {
     /// Appends the main then sfx queue to `out`; returns the source rate.
     pub fn drain_audio(&mut self, out: &mut Vec<(f32, f32)>) -> u32 {
         let audio = &self.bus.cdic.audio;
-        for q in [&audio.sample_queue, &audio.sfx_queue] {
+        for q in [&audio.sample_queue, &audio.sfx_queue, &audio.dvc_queue] {
             out.extend(q.lock().unwrap().drain(..));
         }
         audio.source_rate.load(Ordering::Relaxed)
@@ -129,7 +130,7 @@ impl Default for Machine {
     }
 }
 
-fn highest_ipl(bus: &mut CdiBus) -> u8 {
+pub fn highest_ipl(bus: &mut CdiBus) -> u8 {
     let int1_lvl = if (bus.scc_timer.lir & 0x80) != 0 {
         let lvl = (bus.scc_timer.lir >> 4) & 7;
         if lvl != 0 { lvl } else { 5 }

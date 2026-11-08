@@ -3,7 +3,7 @@
 //! ASL, ASR, LSL, LSR, ROL, ROR, ROXL, ROXR
 
 use crate::core::cpu::{CFLAG_SET, CpuCore};
-use crate::core::types::{CpuType, Size};
+use crate::core::types::Size;
 
 impl CpuCore {
     /// MC68000 register shift/rotate timing: a base cost plus 2 cycles per
@@ -16,7 +16,7 @@ impl CpuCore {
         // 68020+ shifts go through the barrel shifter: cost is independent
         // of the count. 6 here lands on 4 cycles after the per-type cycle
         // scaling, matching the cycle-exact A1200 reference measurement.
-        if !matches!(self.cpu_type, CpuType::M68000 | CpuType::M68010) {
+        if !self.is_pre_68020 {
             return 6;
         }
         let base = if size == Size::Long { 8 } else { 6 };

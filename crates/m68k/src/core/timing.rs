@@ -396,6 +396,14 @@ pub(crate) fn lea_ea_cycles_68000(mode: AddressingMode) -> i32 {
 }
 
 impl super::cpu::CpuCore {
+    #[inline]
+    pub(crate) fn uses_m68000_timing(&self) -> bool {
+        matches!(
+            self.cpu_type,
+            super::types::CpuType::M68000 | super::types::CpuType::SCC68070
+        )
+    }
+
     /// Standard-operand EA time (M68000UM Table 8-2) on 68000/68010;
     /// 0 on later types, which keep the legacy flat timings.
     #[inline]

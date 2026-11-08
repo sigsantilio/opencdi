@@ -4486,7 +4486,7 @@ fn decode_mul_word_immediate_trace_op<B: AddressBus>(
             immediate: extension,
             dst: ((opcode >> 9) & 7) as u8,
             signed: op_mode == 7,
-            m68000_timing: cpu_type == CpuType::M68000,
+            m68000_timing: matches!(cpu_type, CpuType::M68000 | CpuType::SCC68070),
         },
     })
 }
@@ -5481,7 +5481,7 @@ fn decode_bit_imm_reg_trace_op<B: AddressBus>(
     // fetch on top of the dynamic-form base (bitop_cycles), while the other
     // CPUs use the dynamic-form legacy cost. The modifying ops add 2 clocks
     // pre-68020 when the bit lives in the upper register half; BTST does not.
-    let m68000 = cpu.cpu_type == CpuType::M68000;
+    let m68000 = cpu.uses_m68000_timing();
     let hi = if cpu.is_pre_68020 && bit >= 16 { 2 } else { 0 };
     let raw_cycles = match op {
         JitBitOp::Test => {

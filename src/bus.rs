@@ -91,8 +91,9 @@ impl CdiBus {
         self.sys_ram.fill(0);
         self.dvc.reset();
         let has_disc = self.cdrom.is_some();
+        let is_data = self.cdrom.as_ref().map_or(false, |c| c.tracks.iter().any(|t| (t.control & 0x40) != 0));
         self.slave.reset();
-        self.slave.set_disc_inserted(has_disc);
+        self.slave.set_disc_inserted(has_disc, is_data);
         self.scc_timer = SccTimer::new();
         self.dma = SccDma::new();
         self.scc_uart_cmd = 0;
@@ -131,6 +132,24 @@ impl CdiBus {
             let wait = self.mcd212.rom_dtack_cycles();
             self.wait_cycles += wait;
             self.current_line_cycle = self.current_line_cycle.wrapping_add(wait);
+        }
+    }
+
+    #[inline(always)]
+    pub fn add_sys_ram_wait(&mut self) {
+        if self.emulate_wait_states {
+            let wait = self.mcd212.ram_dtack_cycles::<0>(self.current_line_cycle);
+            self.wait_cycles += wait;
+            self.current_line_cycle = self.current_line_cycle.wrapping_add(wait);
+        }
+    }
+
+    #[inline(always)]
+    pub fn add_dvc_wait(&mut self) {
+        if self.emulate_wait_states {
+            // Expansion bus DRAM / ROM access: 2 wait cycles (4 clock cycles)
+            self.wait_cycles += 2;
+            self.current_line_cycle = self.current_line_cycle.wrapping_add(2);
         }
     }
 
@@ -194,18 +213,20 @@ impl CdiBus {
 
     pub fn load_cdrom<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Box<dyn std::error::Error>> {
         let cd = CdRom::open(path)?;
+        let is_data = cd.tracks.iter().any(|t| (t.control & 0x40) != 0);
         self.cdrom = Some(cd);
-        self.slave.set_disc_inserted(true);
+        self.slave.set_disc_inserted(true, is_data);
         Ok(())
     }
 
     pub fn change_disc<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Box<dyn std::error::Error>> {
         let cd = CdRom::open(path)?;
+        let is_data = cd.tracks.iter().any(|t| (t.control & 0x40) != 0);
         self.cdrom = Some(cd);
         self.cdic.curr_lba = 0;
         self.cdic.command = 0;
         self.cdic.disc_command = 0;
-        self.slave.notify_disc_swapped();
+        self.slave.notify_disc_swapped(is_data);
         Ok(())
     }
 
@@ -293,11 +314,21 @@ impl CdiBus {
         if line == 0 && self.dvc.is_fitted() {
             self.dvc.vsync_hz = if self.mcd212.video_mode == crate::mcd212::VideoMode::Pal { 50.0 } else { 60.0 };
             self.dvc.on_vsync();
+            self.flush_dvc_audio();
         }
-        if line == 0 && self.dvc.is_fitted() && !self.dvc.audio_out.is_empty() {
+        frame_done
+    }
+
+    #[inline(always)]
+    pub fn render_scanline(&mut self, line: usize) {
+        self.mcd212.render_line(line);
+    }
+
+    pub fn flush_dvc_audio(&mut self) {
+        if self.dvc.is_fitted() && !self.dvc.audio_out.is_empty() {
             if let Ok(mut dq) = self.cdic.audio.dvc_queue.lock() {
                 self.cdic.audio.dvc_rate.store(self.dvc.audio_sample_rate, std::sync::atomic::Ordering::Relaxed);
-                let max_samples = self.dvc.audio_sample_rate as usize;
+                let max_samples = (self.dvc.audio_sample_rate as usize) * 2;
                 let add_len = self.dvc.audio_out.len();
                 let current_len = dq.len();
                 if current_len + add_len > max_samples {
@@ -309,12 +340,6 @@ impl CdiBus {
                 dq.extend(self.dvc.audio_out.drain(..).map(|(l, r)| (l * vol, r * vol)));
             }
         }
-        frame_done
-    }
-
-    #[inline(always)]
-    pub fn render_scanline(&mut self, line: usize) {
-        self.mcd212.render_line(line);
     }
 
     pub fn perform_dvc_dma(&mut self) {
@@ -357,6 +382,7 @@ impl CdiBus {
             }
         }
         self.dvc.process_stream();
+        self.flush_dvc_audio();
         trace!("After DVC DMA: demux_video_len={}, demux_audio_len={}, fma_audio_len={}, has_decoder={}, decoded_count={}",
             self.dvc.demux.video.len(), self.dvc.demux.audio.len(), self.dvc.fma_demux.audio.len(), self.dvc.video_decoder.is_some(), self.dvc.frames_decoded_count);
         self.dma.channels[1].memory_address_counter = start.wrapping_add(count * 2);
@@ -501,10 +527,14 @@ impl AddressBus for CdiBus {
             }
 
             // System RAM (512 KB)
-            0x500000..=0x57FFFF => self.sys_ram[(addr - 0x500000) as usize],
+            0x500000..=0x57FFFF => {
+                self.add_sys_ram_wait();
+                self.sys_ram[(addr - 0x500000) as usize]
+            }
 
             // DVC RAM Block 1 (1 MB)
             0xD00000..=0xDFFFFF => {
+                self.add_dvc_wait();
                 if self.dvc.is_fitted() {
                     self.dvc.read_ram1((addr - 0xD00000) as usize)
                 } else {
@@ -514,6 +544,7 @@ impl AddressBus for CdiBus {
 
             // DVC Registers Window (0xE00000..0xE3FFFF)
             0xE00000..=0xE3FFFF => {
+                self.add_dvc_wait();
                 if self.dvc.is_fitted() {
                     self.dvc.read_byte(addr)
                 } else {
@@ -523,6 +554,7 @@ impl AddressBus for CdiBus {
 
             // DVC ROM (vmpega.rom, 256 KB)
             0xE40000..=0xE7FFFF => {
+                self.add_dvc_wait();
                 if self.dvc.is_fitted() {
                     self.dvc.read_rom((addr - 0xE40000) as usize)
                 } else {
@@ -532,6 +564,7 @@ impl AddressBus for CdiBus {
 
             // DVC Picture DRAM (512 KB, gated)
             0xE80000..=0xEFFFFF => {
+                self.add_dvc_wait();
                 if self.dvc.is_fitted() && self.dvc.ram2_enabled {
                     self.dvc.read_ram2((addr - 0xE80000) as usize)
                 } else {
@@ -581,6 +614,7 @@ impl AddressBus for CdiBus {
                 ((self.rom[idx] as u16) << 8) | (self.rom[idx + 1] as u16)
             }
             0x500000..=0x57FFFE => {
+                self.add_sys_ram_wait();
                 let idx = (addr - 0x500000) as usize;
                 ((self.sys_ram[idx] as u16) << 8) | (self.sys_ram[idx + 1] as u16)
             }
@@ -607,6 +641,7 @@ impl AddressBus for CdiBus {
                 word
             }
             0xD00000..=0xDFFFFE => {
+                self.add_dvc_wait();
                 if self.dvc.is_fitted() {
                     let idx = (addr - 0xD00000) as usize;
                     ((self.dvc.read_ram1(idx) as u16) << 8) | (self.dvc.read_ram1(idx + 1) as u16)
@@ -615,6 +650,7 @@ impl AddressBus for CdiBus {
                 }
             }
             0xE00000..=0xE3FFFE => {
+                self.add_dvc_wait();
                 if self.dvc.is_fitted() {
                     let word_offset = (addr - 0xE00000) >> 1;
                     let val = self.dvc.read_reg(word_offset);
@@ -627,6 +663,7 @@ impl AddressBus for CdiBus {
                 }
             }
             0xE40000..=0xE7FFFE => {
+                self.add_dvc_wait();
                 if self.dvc.is_fitted() {
                     let idx = (addr - 0xE40000) as usize;
                     ((self.dvc.read_rom(idx) as u16) << 8) | (self.dvc.read_rom(idx + 1) as u16)
@@ -635,6 +672,7 @@ impl AddressBus for CdiBus {
                 }
             }
             0xE80000..=0xEFFFFE => {
+                self.add_dvc_wait();
                 if self.dvc.is_fitted() && self.dvc.ram2_enabled {
                     let idx = (addr - 0xE80000) as usize;
                     ((self.dvc.read_ram2(idx) as u16) << 8) | (self.dvc.read_ram2(idx + 1) as u16)
@@ -774,10 +812,14 @@ impl AddressBus for CdiBus {
             }
 
             // System RAM (512 KB)
-            0x500000..=0x57FFFF => self.sys_ram[(addr - 0x500000) as usize] = value,
+            0x500000..=0x57FFFF => {
+                self.add_sys_ram_wait();
+                self.sys_ram[(addr - 0x500000) as usize] = value;
+            }
 
             // DVC RAM Block 1 (1 MB)
             0xD00000..=0xDFFFFF => {
+                self.add_dvc_wait();
                 if self.dvc.is_fitted() {
                     self.dvc.write_ram1((addr - 0xD00000) as usize, value);
                 }
@@ -785,6 +827,7 @@ impl AddressBus for CdiBus {
 
             // DVC Registers (0xE00000..0xE3FFFF)
             0xE00000..=0xE3FFFF => {
+                self.add_dvc_wait();
                 if self.dvc.is_fitted() {
                     self.dvc.write_byte(addr, value);
                     if self.dvc_dma_requested() {
@@ -795,6 +838,7 @@ impl AddressBus for CdiBus {
 
             // DVC Picture DRAM (512 KB, gated)
             0xE80000..=0xEFFFFF => {
+                self.add_dvc_wait();
                 if self.dvc.is_fitted() {
                     self.dvc.write_ram2((addr - 0xE80000) as usize, value);
                 }
@@ -832,6 +876,7 @@ impl AddressBus for CdiBus {
         if ((addr <= self.watch_addr1 && self.watch_addr1 < addr + 2) || (addr <= self.watch_addr2 && self.watch_addr2 < addr + 2)) && self.watch_enabled {
             println!("[WATCH WRITE WORD F{}] addr=0x{:08X}, val=0x{:04X} at PC=0x{:08X} line={} cyc={}", self.current_frame, addr, value, self.current_pc, self.mcd212.scanline, self.current_line_cycle);
         }
+
         match addr {
             0x000000..=0x07FFFE => {
                 self.add_ram_wait::<0>();
@@ -848,6 +893,7 @@ impl AddressBus for CdiBus {
                 return;
             }
             0x500000..=0x57FFFE => {
+                self.add_sys_ram_wait();
                 let idx = (addr - 0x500000) as usize;
                 self.sys_ram[idx] = (value >> 8) as u8;
                 self.sys_ram[idx + 1] = value as u8;
@@ -882,6 +928,7 @@ impl AddressBus for CdiBus {
                 return;
             }
             0xD00000..=0xDFFFFE => {
+                self.add_dvc_wait();
                 if self.dvc.is_fitted() {
                     let idx = (addr - 0xD00000) as usize;
                     self.dvc.write_ram1(idx, (value >> 8) as u8);
@@ -890,6 +937,7 @@ impl AddressBus for CdiBus {
                 return;
             }
             0xE00000..=0xE3FFFE => {
+                self.add_dvc_wait();
                 if self.dvc.is_fitted() {
                     let word_offset = (addr - 0xE00000) >> 1;
                     if self.trace_fmv {
@@ -904,6 +952,7 @@ impl AddressBus for CdiBus {
                 return;
             }
             0xE80000..=0xEFFFFE => {
+                self.add_dvc_wait();
                 if self.dvc.is_fitted() {
                     let idx = (addr - 0xE80000) as usize;
                     self.dvc.write_ram2(idx, (value >> 8) as u8);

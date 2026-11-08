@@ -640,6 +640,24 @@ impl Mcd212 {
         }
     }
 
+    #[inline(always)]
+    pub fn get_screen_width(&self) -> usize {
+        if (self.dcr[0] & DCR_CF_BIT) == 0 || (self.csrw[0] & CSR1W_ST_BIT) != 0 {
+            720
+        } else {
+            768
+        }
+    }
+
+    #[inline(always)]
+    pub fn get_border_width(&self) -> usize {
+        if (self.dcr[0] & DCR_CF_BIT) == 0 || (self.csrw[0] & CSR1W_ST_BIT) != 0 {
+            24
+        } else {
+            0
+        }
+    }
+
     pub fn tick_scanline(&mut self, line: usize) -> bool {
         self.scanline = line;
         let mut frame_completed = false;
@@ -917,7 +935,7 @@ impl Mcd212 {
     pub fn process_vsr<const PATH: usize>(&mut self, pixels: &mut [u32; 768], transparent: &mut [bool; 768]) {
         let icm = self.get_icm::<PATH>();
         let tp_ctrl = self.get_transparency_control::<PATH>();
-        let width = 768;
+        let width = self.get_screen_width();
 
         let mut vsr = self.get_vsr::<PATH>();
         let _other_path = if PATH == 0 { 1 } else { 0 };
@@ -1109,12 +1127,19 @@ impl Mcd212 {
         }
 
         let order_ab = (self.plane_order & 1) == 0;
-        let width = 768;
+        let width = self.get_screen_width();
+        let border_width = self.get_border_width();
+
+        if border_width > 0 {
+            out[..border_width].fill(0xFF00_0000);
+            out[border_width + width..].fill(0xFF00_0000);
+        }
 
         for x in 0..width {
+            let dest_x = border_width + x;
             if transparent_a[x] && transparent_b[x] {
-                out[x] = if (self.image_coding_method & ((1 << 4) | (1 << 12) | (1 << 18))) != 0 {
-                    self.external_video_line[x]
+                out[dest_x] = if (self.image_coding_method & ((1 << 4) | (1 << 12) | (1 << 18))) != 0 {
+                    self.external_video_line[dest_x]
                 } else {
                     self.get_backdrop_plane()
                 };
@@ -1163,7 +1188,7 @@ impl Mcd212 {
             let out_g = (((mixed_g - 16) * 298 + 128) >> 8).clamp(0, 255) as u32;
             let out_b = (((mixed_b - 16) * 298 + 128) >> 8).clamp(0, 255) as u32;
 
-            out[x] = 0xFF00_0000 | (out_r << 16) | (out_g << 8) | out_b;
+            out[dest_x] = 0xFF00_0000 | (out_r << 16) | (out_g << 8) | out_b;
         }
     }
 
@@ -1204,16 +1229,31 @@ impl Mcd212 {
     }
 
     pub fn render_scanline(&mut self, active_line: usize) {
-        let mut plane_a = [0u32; 768];
-        let mut plane_b = [0u32; 768];
-        let mut transparent_a = [false; 768];
-        let mut transparent_b = [false; 768];
-        let mut mixed_line = [0u32; 768];
+        let is_pal = self.video_mode == VideoMode::Pal && (self.dcr[0] & DCR_FD_BIT) == 0;
+        let mut draw_line = true;
+        if is_pal && (self.csrw[0] & CSR1W_ST_BIT) != 0 {
+            // In PAL with Standard Screen enabled, top 20 lines and bottom 20 lines are blank borders
+            if active_line < 20 || active_line >= (280 - 20) {
+                draw_line = false;
+            }
+        }
 
-        self.process_vsr::<0>(&mut plane_a, &mut transparent_a);
-        self.process_vsr::<1>(&mut plane_b, &mut transparent_b);
-        self.mix_lines(&plane_a, &transparent_a, &plane_b, &transparent_b, &mut mixed_line);
-        self.draw_cursor(self.scanline, &mut mixed_line);
+        self.csrr[0] |= CSR1R_DA;
+
+        let mut mixed_line = [0u32; 768];
+        if draw_line {
+            let mut plane_a = [0u32; 768];
+            let mut plane_b = [0u32; 768];
+            let mut transparent_a = [false; 768];
+            let mut transparent_b = [false; 768];
+
+            self.process_vsr::<0>(&mut plane_a, &mut transparent_a);
+            self.process_vsr::<1>(&mut plane_b, &mut transparent_b);
+            self.mix_lines(&plane_a, &transparent_a, &plane_b, &transparent_b, &mut mixed_line);
+            self.draw_cursor(self.scanline, &mut mixed_line);
+        } else {
+            mixed_line.fill(0xFF00_0000);
+        }
 
 
         let active_lines = self.effective_active_scanlines();

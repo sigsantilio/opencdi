@@ -129,7 +129,7 @@ impl CpuCore {
         self.set_logic_flags(value, size);
 
         // MC68000: base 4 + source-fetch EA + destination-write EA.
-        if self.cpu_type == CpuType::M68000 {
+        if self.uses_m68000_timing() {
             4 + self.ea_source_cycles(src_mode, size) + self.ea_dest_cycles(dst_mode, size)
         } else {
             // 020+: the flat 4 made every MOVE cost the same regardless of
@@ -196,7 +196,7 @@ impl CpuCore {
         }
         self.set_a(dst_reg, value);
         // MC68000: MOVEA base 4 + source-fetch EA (destination An is free).
-        if self.cpu_type == CpuType::M68000 {
+        if self.uses_m68000_timing() {
             4 + self.ea_source_cycles(src_mode, size)
         } else {
             4
@@ -469,7 +469,7 @@ impl CpuCore {
 
         {
             let base = 8 + count * if size == Size::Long { 8 } else { 4 };
-            if self.cpu_type == CpuType::M68000 {
+            if self.uses_m68000_timing() {
                 base + self.movem_ea_calc_cycles(mode)
             } else {
                 base
@@ -549,7 +549,7 @@ impl CpuCore {
 
         {
             let base = 12 + count * if size == Size::Long { 8 } else { 4 };
-            if self.cpu_type == CpuType::M68000 {
+            if self.uses_m68000_timing() {
                 base + self.movem_ea_calc_cycles(mode)
             } else {
                 base

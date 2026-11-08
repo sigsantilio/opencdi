@@ -78,19 +78,24 @@ fn attach_console() {
 const USAGE: &str = "\
 Usage: opencdi [options] [disc image (cue, chd, iso, bin)]
 
-  --rom <path>        System BIOS (default: search bios/, the current and the program directory)
-  --frames <n>        Quit after n emulated frames
-  --mouse             Start in mouse mode (host mouse drives the CD-i pointer)
-  --recent [n]        List the recent disc images, or boot recent image number n
-  --no-host-input     Ignore host keyboard, mouse and gamepads; never grab the cursor
-  --bios, --standalone  Boot the BIOS shell without a disc
-  --dvc <path>        Digital Video Cartridge ROM (default: search dvc/, bios/, the current and the program directory)
-  --no-dvc, --nodvc   Boot without the Digital Video Cartridge
-  --slave-debug       Log slave (mouse channel) bytes
-  --nvram <path>      Console NVRAM save file (default: bios/nvram_mk48t08.bin or nvram_mk48t08.bin)
-  --run-in-menu       Windows: keep emulating while a menu or dialog is open, or the window is moved (default: paused)
-  --console           Windows: show the log in the parent console or a new console window
-  --help, -h          Show this text
+  --rom <path>             System BIOS (default: search bios/, the current and the program directory)
+  --frames <n>             Quit after n emulated frames
+  --mouse                  Start in mouse mode (host mouse drives the CD-i pointer)
+  --mouse-sensitivity <v>  Mouse sensitivity multiplier (e.g. 0.5, default: 0.5)
+  --recent [n]             List the recent disc images, or boot recent image number n
+  --no-host-input          Ignore host keyboard, mouse and gamepads; never grab the cursor
+  --bios, --standalone     Boot the BIOS shell without a disc
+  --dvc <path>             Digital Video Cartridge ROM (default: search dvc/, bios/, the current and the program directory)
+  --no-dvc, --nodvc        Boot without the Digital Video Cartridge
+  --slave-debug            Log slave (mouse channel) bytes
+  --nvram <path>           Console NVRAM save file (default: bios/nvram_mk48t08.bin or nvram_mk48t08.bin)
+  --fullscreen, -f         Start directly in borderless fullscreen
+  --no-menu, --nomenu      Start without the top menu bar (useful for frontends)
+  --monitor <n>            Monitor index to display on in fullscreen
+  --screenshot-dir <path>  Directory to save screenshots (default: screenshots/)
+  --run-in-menu            Windows: keep emulating while a menu or dialog is open, or the window is moved (default: paused)
+  --console                Windows: show the log in the parent console or a new console window
+  --help, -h               Show this text
 ";
 
 
@@ -203,9 +208,56 @@ fn find_nvram_file() -> Option<PathBuf> {
     None
 }
 
-fn save_screenshot(frame_count: u64, framebuffer: &[u32]) {
-    let _ = std::fs::create_dir_all("screenshots_hotel_mario");
-    let filename = format!("screenshots_hotel_mario/screenshot_frame_{}.bmp", frame_count);
+fn save_screenshot_png(dir: &Path, frame_count: u64, framebuffer: &[u32]) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        error!("Cannot create screenshot directory {:?}: {}", dir, e);
+        return;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = dir.join(format!("opencdi_{}_frame{}.png", stamp, frame_count));
+    let file = match std::fs::File::create(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            error!("Cannot create screenshot file {:?}: {}", path, e);
+            return;
+        }
+    };
+    let mut w = std::io::BufWriter::new(file);
+    let mut encoder = png::Encoder::new(&mut w, SCREEN_WIDTH as u32, SCREEN_HEIGHT as u32);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = match encoder.write_header() {
+        Ok(w) => w,
+        Err(e) => {
+            error!("Cannot write PNG header {:?}: {}", path, e);
+            return;
+        }
+    };
+    let mut rgb = Vec::with_capacity(SCREEN_WIDTH * SCREEN_HEIGHT * 3);
+    for &pixel in &framebuffer[..SCREEN_WIDTH * SCREEN_HEIGHT] {
+        rgb.push(((pixel >> 16) & 0xFF) as u8);
+        rgb.push(((pixel >> 8) & 0xFF) as u8);
+        rgb.push((pixel & 0xFF) as u8);
+    }
+    match writer.write_image_data(&rgb) {
+        Ok(_) => info!("Screenshot (PNG) salvato in {:?}", path),
+        Err(e) => error!("Cannot write PNG data {:?}: {}", path, e),
+    }
+}
+
+fn save_screenshot_bmp(dir: &Path, frame_count: u64, framebuffer: &[u32]) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        error!("Cannot create screenshot directory {:?}: {}", dir, e);
+        return;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = dir.join(format!("opencdi_{}_frame{}.bmp", stamp, frame_count));
     let width = SCREEN_WIDTH as i32;
     let height = SCREEN_HEIGHT as i32;
     let file_size = 54 + (width * height * 4) as u32;
@@ -225,36 +277,14 @@ fn save_screenshot(frame_count: u64, framebuffer: &[u32]) {
     bmp.extend_from_slice(&2835u32.to_le_bytes());
     bmp.extend_from_slice(&0u32.to_le_bytes());
     bmp.extend_from_slice(&0u32.to_le_bytes());
-    for &pixel in framebuffer {
+    for &pixel in &framebuffer[..SCREEN_WIDTH * SCREEN_HEIGHT] {
         bmp.push((pixel & 0xFF) as u8);
         bmp.push(((pixel >> 8) & 0xFF) as u8);
         bmp.push(((pixel >> 16) & 0xFF) as u8);
         bmp.push(0xFF);
     }
-    if let Ok(_) = std::fs::write(&filename, &bmp) {
-        info!("Screenshot salvato in {}", filename);
-    }
-}
-
-// F8: binary PPM (no image crate needed) into screenshots/ next to the binary
-fn save_screenshot_ppm(frame_count: u64, framebuffer: &[u32]) {
-    let dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("screenshots")))
-        .unwrap_or_else(|| PathBuf::from("screenshots"));
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        error!("Cannot create screenshot directory {:?}: {}", dir, e);
-        return;
-    }
-    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let path = dir.join(format!("opencdi_{}_frame{}.ppm", stamp, frame_count));
-    let mut ppm = format!("P6\n{} {}\n255\n", SCREEN_WIDTH, SCREEN_HEIGHT).into_bytes();
-    ppm.reserve(SCREEN_WIDTH * SCREEN_HEIGHT * 3);
-    for &pixel in &framebuffer[..SCREEN_WIDTH * SCREEN_HEIGHT] {
-        ppm.extend_from_slice(&[(pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8]);
-    }
-    match std::fs::write(&path, &ppm) {
-        Ok(_) => info!("Screenshot saved to {:?}", path),
+    match std::fs::write(&path, &bmp) {
+        Ok(_) => info!("Screenshot (BMP) salvato in {:?}", path),
         Err(e) => error!("Cannot write screenshot {:?}: {}", path, e),
     }
 }
@@ -356,14 +386,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 2. Load NVRAM if present
-    let nvram_arg = args.iter().position(|a| a == "--nvram").and_then(|i| args.get(i + 1)).map(PathBuf::from);
-    let resolved_nvram_path = nvram_arg.unwrap_or_else(default_nvram_save_path);
+    let nvram_arg = flag_value("--nvram").map(PathBuf::from);
+    let resolved_nvram_path = nvram_arg.clone().unwrap_or_else(default_nvram_save_path);
+    m.bus.nvram.save_path = resolved_nvram_path.clone();
     if resolved_nvram_path.is_file() {
         if let Err(e) = m.bus.nvram.load_from_file(&resolved_nvram_path) {
             log::warn!("Impossibile caricare NVRAM da {:?}: {:?}", resolved_nvram_path, e);
         } else {
             info!("NVRAM caricata da {:?}", resolved_nvram_path);
         }
+    } else if nvram_arg.is_some() {
+        if let Err(e) = m.bus.nvram.save_to_file() {
+            log::warn!("Impossibile creare file iniziale NVRAM in {:?}: {:?}", resolved_nvram_path, e);
+        } else {
+            info!("Inizializzato nuovo file NVRAM in {:?}", resolved_nvram_path);
+        }
+    } else {
+        info!("File NVRAM {:?} non presente: verrà creato automaticamente al salvataggio", resolved_nvram_path);
     }
 
     // 2b. Load DVC ROM (Digital Video Cartridge) by default if present
@@ -388,7 +427,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut disc_arg = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if a == "--rom" || a == "--frames" || a == "--dvc" || (a == "--recent" && recent_pick.is_some()) {
+        if a == "--rom"
+            || a == "--frames"
+            || a == "--dvc"
+            || a == "--nvram"
+            || a == "--screenshot-dir"
+            || a == "--monitor"
+            || a == "--mouse-sensitivity"
+            || (a == "--recent" && recent_pick.is_some())
+        {
             it.next();
         } else if !a.starts_with("--") {
             disc_arg = Some(a.clone());
@@ -416,8 +463,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!("Loaded game disc at startup: {}", current_game_name);
 
                 let name_upper = current_game_name.to_uppercase();
-                let is_ntsc = (name_upper.contains("(USA)") || name_upper.contains("(JAPAN)") || name_upper.contains("NTSC"))
-                    && m.bus.cdrom.as_ref().map_or(true, |cd| cd.disc_type != 0x20);
+                let is_ntsc = m.bus.cdrom.as_ref().and_then(|cd| cd.is_ntsc_hint(&current_game_name))
+                    .unwrap_or_else(|| {
+                        (name_upper.contains("(USA)") || name_upper.contains("(JAPAN)") || name_upper.contains("NTSC"))
+                            && m.bus.cdrom.as_ref().map_or(true, |cd| cd.disc_type != 0x20)
+                    });
                 if is_ntsc {
                     info!("Detected NTSC disc (USA/Japan): auto-configured NTSC 60 Hz video mode");
                     m.bus.set_video_mode(VideoMode::Ntsc);
@@ -438,8 +488,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("CPU SCC68070 reset - PC: 0x{:08X}", m.cpu.pc);
 
     // 5. Initialize Controls Configuration
-    let bindings = KeyBindings::new();
-    let input_device_mode = if has_flag("--mouse") { InputDeviceMode::Mouse } else { InputDeviceMode::Gamepad };
+    let mut bindings = KeyBindings::new();
+    let mouse_sens_cli = flag_value("--mouse-sensitivity").and_then(|s| {
+        let clean = s.trim_end_matches('%');
+        clean.parse::<f32>().ok().map(|v| if v > 5.0 { v / 100.0 } else { v })
+    });
+    if let Some(sens) = mouse_sens_cli {
+        bindings.mouse_sensitivity = sens.clamp(0.05, 10.0);
+    }
+    let input_device_mode = if has_flag("--mouse") {
+        InputDeviceMode::Mouse
+    } else {
+        bindings.input_device
+    };
 
     // 6. Initialize Host Audio Playback
     let host_audio = HostAudioOutput::try_start(
@@ -457,9 +518,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     m.bus.emulate_wait_states = true; // Authentic hardware wait-states (15.5 MHz)
+    let start_fullscreen = has_flag("--fullscreen") || has_flag("-f");
+    let no_menu = has_flag("--no-menu") || has_flag("--nomenu");
+    let monitor_index: Option<usize> = flag_value("--monitor").and_then(|s| s.parse().ok());
+    let screenshot_dir = flag_value("--screenshot-dir")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("screenshots")))
+                .unwrap_or_else(|| PathBuf::from("screenshots"))
+        });
+
     let (pad_x, pad_y) = if m.bus.cdrom.is_some() { (575, 335) } else { (384, 280) };
     let prev_vsr = (m.bus.mcd212.get_vsr::<0>(), m.bus.mcd212.get_vsr::<1>());
     let now = Instant::now();
+    let frame_duration = m.bus.mcd212.video_mode.frame_duration();
     let mut app = App {
         m,
         bindings,
@@ -469,6 +543,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_frames,
         current_game_name,
         nvram_path: Some(resolved_nvram_path),
+        start_fullscreen,
+        no_menu,
+        monitor_index,
+        screenshot_dir,
         window: None,
         surface: None,
         image_rect: (0, 0, SCREEN_WIDTH, SCREEN_HEIGHT),
@@ -482,10 +560,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cursor: None,
         rel_pointer: None,
         mouse_left: false,
+        mouse_left_latched: false,
         mouse_right: false,
+        mouse_right_latched: false,
         mouse_middle: false,
         prev_middle: false,
-        mouse_captured: true,
+        mouse_captured: start_fullscreen && no_menu,
         host_input: !has_flag("--no-host-input"),
         run_in_menu: has_flag("--run-in-menu"),
         in_modal_pump: false,
@@ -504,7 +584,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pad_y_f: pad_y as f32,
         prev_key_btn: 0,
         run_at: now,
-        next_frame_time: now,
+        next_frame_time: now + frame_duration,
         fps_timer: now,
         telemetry_frames: 0,
         paused_ticks: 0,
@@ -518,7 +598,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         measured_cd_rate: 0.0,
     };
 
-    info!("Emulation loop started. Shortcuts: [F11]/[Alt+Enter] Fullscreen, [F5]/[H] Reset, [P] Pause, [Space] hold Fast-forward, [F8] Screenshot (PPM), [F12] Screenshot (BMP), [M] Mute, [+]/[-] Volume, [Ctrl+I] Insert Disc, [Ctrl+O] Open & Reset, [Middle Click] Capture/Release Mouse, [Esc] Quit");
+    info!("Emulation loop started. Shortcuts: [F11]/[Alt+Enter] Fullscreen, [F5]/[H] Reset, [P] Pause, [Space] hold Fast-forward, [F8] Screenshot (BMP), [F12] Screenshot (PNG), [M] Mute, [+]/[-] Volume, [Ctrl+I] Insert Disc, [Ctrl+O] Open & Reset, [Middle Click] Capture/Release Mouse, [Esc] Quit");
 
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut app)?;
@@ -609,6 +689,10 @@ struct App {
     max_frames: Option<u64>,
     current_game_name: String,
     nvram_path: Option<PathBuf>,
+    start_fullscreen: bool,
+    no_menu: bool,
+    monitor_index: Option<usize>,
+    screenshot_dir: PathBuf,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     image_rect: (usize, usize, usize, usize),
@@ -622,7 +706,9 @@ struct App {
     cursor: Option<PhysicalPosition<f64>>,
     rel_pointer: Option<(f64, f64)>,
     mouse_left: bool,
+    mouse_left_latched: bool,
     mouse_right: bool,
+    mouse_right_latched: bool,
     mouse_middle: bool,
     prev_middle: bool,
     mouse_captured: bool,
@@ -677,21 +763,47 @@ impl App {
             .unwrap_or(std::ptr::null_mut())
     }
 
+    fn set_fullscreen(&mut self, full: bool) {
+        if let Some(window) = &self.window {
+            if full {
+                // A maximised window is restored by the platform itself
+                if self.windowed.is_none() {
+                    self.windowed = Some((window.outer_position().ok(), window.inner_size())).filter(|_| !window.is_maximized());
+                }
+                let target_monitor = self.monitor_index.and_then(|idx| {
+                    let monitors: Vec<_> = window.available_monitors().collect();
+                    if idx > 0 && idx <= monitors.len() {
+                        Some(monitors[idx - 1].clone())
+                    } else if idx < monitors.len() {
+                        Some(monitors[idx].clone())
+                    } else {
+                        None
+                    }
+                });
+                window.set_fullscreen(Some(Fullscreen::Borderless(target_monitor)));
+                #[cfg(target_os = "windows")]
+                gui::set_menu_visible(self.hwnd(), false);
+            } else {
+                window.set_fullscreen(None);
+                #[cfg(target_os = "windows")]
+                if !self.no_menu {
+                    gui::set_menu_visible(self.hwnd(), true);
+                }
+                self.restore_check = None;
+                if self.windowed.is_some() {
+                    self.restore_windowed();
+                    // Window managers may apply their own geometry after the switch (seen under WINE): check once more
+                    self.restore_check = Some(Instant::now() + Duration::from_millis(300));
+                }
+            }
+            info!("Schermo intero: {}", if full { "SCHERMO INTERO" } else { "FINESTRA" });
+        }
+    }
+
     fn toggle_fullscreen(&mut self) {
         if let Some(window) = &self.window {
             let full = window.fullscreen().is_none();
-            if full {
-                // A maximised window is restored by the platform itself
-                self.windowed = Some((window.outer_position().ok(), window.inner_size())).filter(|_| !window.is_maximized());
-            }
-            window.set_fullscreen(if full { Some(Fullscreen::Borderless(None)) } else { None });
-            self.restore_check = None;
-            if !full && self.windowed.is_some() {
-                self.restore_windowed();
-                // Window managers may apply their own geometry after the switch (seen under WINE): check once more
-                self.restore_check = Some(Instant::now() + Duration::from_millis(300));
-            }
-            info!("Schermo intero: {}", if full { "SCHERMO INTERO" } else { "FINESTRA" });
+            self.set_fullscreen(full);
         }
     }
 
@@ -789,8 +901,8 @@ impl App {
             }
             Key::F11 => self.toggle_fullscreen(),
             Key::Enter | Key::NumpadEnter if alt => self.toggle_fullscreen(),
-            Key::F8 => save_screenshot_ppm(self.frame_count, &self.m.bus.mcd212.framebuffer[..]),
-            Key::F12 => save_screenshot(self.frame_count, &self.m.bus.mcd212.framebuffer[..]),
+            Key::F8 => save_screenshot_bmp(&self.screenshot_dir, self.frame_count, &self.m.bus.mcd212.framebuffer[..]),
+            Key::F12 => save_screenshot_png(&self.screenshot_dir, self.frame_count, &self.m.bus.mcd212.framebuffer[..]),
             Key::KeyM if !self.bound(code) => {
                 self.m.bus.cdic.audio.muted = !self.m.bus.cdic.audio.muted;
                 info!("Audio: {}", if self.m.bus.cdic.audio.muted { "MUTED" } else { "UNMUTED" });
@@ -810,6 +922,22 @@ impl App {
                             self.current_game_name = opencdi::frontend::disc_display_name(&path);
                             self.add_recent(&path);
                             info!("New disc inserted successfully: {}", self.current_game_name);
+
+                            let name_upper = self.current_game_name.to_uppercase();
+                            let is_ntsc = self.m.bus.cdrom.as_ref().and_then(|cd| cd.is_ntsc_hint(&self.current_game_name))
+                                .unwrap_or_else(|| {
+                                    (name_upper.contains("(USA)") || name_upper.contains("(JAPAN)") || name_upper.contains("NTSC"))
+                                        && self.m.bus.cdrom.as_ref().map_or(true, |cd| cd.disc_type != 0x20)
+                                });
+                            let mode = if is_ntsc {
+                                info!("Detected NTSC disc: auto-configured NTSC 60 Hz video mode");
+                                VideoMode::Ntsc
+                            } else {
+                                VideoMode::Pal
+                            };
+                            self.m.bus.set_video_mode(mode);
+                            #[cfg(target_os = "windows")]
+                            gui::update_video_menu(mode);
                         }
                         Err(e) => {
                             error!("Failed to hot-swap disc {:?}: {:?}", path, e);
@@ -837,8 +965,11 @@ impl App {
                             }
 
                             let name_upper = self.current_game_name.to_uppercase();
-                            let is_ntsc = (name_upper.contains("(USA)") || name_upper.contains("(JAPAN)") || name_upper.contains("NTSC"))
-                                && self.m.bus.cdrom.as_ref().map_or(true, |cd| cd.disc_type != 0x20);
+                            let is_ntsc = self.m.bus.cdrom.as_ref().and_then(|cd| cd.is_ntsc_hint(&self.current_game_name))
+                                .unwrap_or_else(|| {
+                                    (name_upper.contains("(USA)") || name_upper.contains("(JAPAN)") || name_upper.contains("NTSC"))
+                                        && self.m.bus.cdrom.as_ref().map_or(true, |cd| cd.disc_type != 0x20)
+                                });
                             let mode = if is_ntsc {
                                 info!("Detected NTSC disc (USA/Japan): auto-configured NTSC 60 Hz video mode");
                                 VideoMode::Ntsc
@@ -852,9 +983,11 @@ impl App {
                             self.m.bus.reset_system();
                             self.m.cpu.reset(&mut self.m.bus);
                             self.reset_state();
-                            self.mouse_captured = true;
+                            self.mouse_captured = false;
+                            self.apply_grab();
                             self.m.bus.emulate_wait_states = true;
-                            self.next_frame_time = Instant::now();
+                            self.next_frame_time = Instant::now() + self.m.bus.mcd212.video_mode.frame_duration();
+                            self.run_at = Instant::now();
                             self.reset_telemetry();
                         }
                         Err(e) => {
@@ -866,7 +999,7 @@ impl App {
                 }
                 GuiAction::EjectDisc => {
                     info!("Ejecting disc from CD-i drive");
-                    self.m.bus.slave.set_disc_inserted(false);
+                    self.m.bus.slave.set_disc_inserted(false, false);
                     self.m.bus.cdrom = None;
                     self.disc_launched = false;
                     self.shell_ready_count = 0;
@@ -875,15 +1008,19 @@ impl App {
                     self.pad_y = 280;
                     self.pad_x_f = 384.0;
                     self.pad_y_f = 280.0;
+                    self.mouse_captured = false;
+                    self.apply_grab();
                 }
                 GuiAction::Reset => {
                     info!("Console reset requested");
                     self.m.bus.reset_system();
                     self.m.cpu.reset(&mut self.m.bus);
                     self.reset_state();
-                    self.mouse_captured = true;
+                    self.mouse_captured = false;
+                    self.apply_grab();
                     self.m.bus.emulate_wait_states = true;
-                    self.next_frame_time = Instant::now();
+                    self.next_frame_time = Instant::now() + self.m.bus.mcd212.video_mode.frame_duration();
+                    self.run_at = Instant::now();
                     self.reset_telemetry();
                 }
                 GuiAction::Exit => {
@@ -898,18 +1035,33 @@ impl App {
                 }
                 GuiAction::SetInputDevice(mode) => {
                     self.input_device_mode = mode;
+                    self.bindings.input_device = mode;
+                    self.bindings.save_to_ini();
                     #[cfg(target_os = "windows")]
                     gui::update_input_device_menu(mode);
                     info!("Input device mode set to: {:?}", mode);
+                }
+                GuiAction::SetMouseSensitivity(sens) => {
+                    self.bindings.mouse_sensitivity = sens;
+                    self.bindings.save_to_ini();
+                    #[cfg(target_os = "windows")]
+                    gui::update_mouse_sensitivity_menu(sens);
+                    info!("Sensibilità mouse impostata su: {:.0}% ({:.2})", sens * 100.0, sens);
                 }
                 GuiAction::ReloadControls => {
                     self.bindings.load_from_ini();
                     #[cfg(target_os = "windows")]
                     gui::update_profile_menu(self.bindings.profile);
-                    info!("Controls reloaded from INI file. Profile: {:?}", self.bindings.profile);
+                    #[cfg(target_os = "windows")]
+                    gui::update_input_device_menu(self.bindings.input_device);
+                    #[cfg(target_os = "windows")]
+                    gui::update_mouse_sensitivity_menu(self.bindings.mouse_sensitivity);
+                    self.input_device_mode = self.bindings.input_device;
+                    info!("Controls reloaded from INI file. Profile: {:?}, Device: {:?}, Sensitivity: {:.2}", self.bindings.profile, self.bindings.input_device, self.bindings.mouse_sensitivity);
                 }
                 GuiAction::ToggleReleaseMouse => {
                     self.mouse_captured = !self.mouse_captured;
+                    self.apply_grab();
                     info!("Mouse capture: {}", if self.mouse_captured { "CAPTURED" } else { "RELEASED" });
                 }
                 GuiAction::ToggleMute => {
@@ -926,7 +1078,7 @@ impl App {
                     self.toggle_fullscreen();
                 }
                 GuiAction::TakeScreenshot => {
-                    save_screenshot(self.frame_count, &self.m.bus.mcd212.framebuffer[..]);
+                    save_screenshot_png(&self.screenshot_dir, self.frame_count, &self.m.bus.mcd212.framebuffer[..]);
                 }
                 GuiAction::SetVideoMode(mode) => {
                     self.m.bus.set_video_mode(mode);
@@ -1031,8 +1183,9 @@ impl App {
 
     fn autoplay(&mut self) {
         // Se un disco è presente, avvia automaticamente la riproduzione una sola volta quando la shell del BIOS è pronta
-        let m = &mut self.m;
-        if m.bus.cdrom.is_some() && !self.disc_launched {
+        let mut just_launched = false;
+        if self.m.bus.cdrom.is_some() && !self.disc_launched {
+            let m = &mut self.m;
             let (_effective_shell_base, shell_state) = if m.bus.dvc.is_fitted() {
                 let s_dvc = m.bus.peek_long(0x00D08090u32.wrapping_add(0xFFFF9172)).unwrap_or(0);
                 if s_dvc >= 2 {
@@ -1044,20 +1197,21 @@ impl App {
                 (0x0000C000u32, m.bus.peek_long(0x0000C000u32.wrapping_add(0xFFFF9172)).unwrap_or(0))
             };
 
-            if shell_state >= 2 {
+            if shell_state == 2 {
                 self.shell_ready_count += 1;
-                if self.shell_ready_count == 1 || self.shell_ready_count == 150 {
-                    m.bus.slave.update_mouse(575, 335, 0);
-                } else if self.shell_ready_count == 30 || self.shell_ready_count == 180 {
-                    info!("Shell BIOS pronta (stato {}): avvio automatico disco CD-i (click PLAY CD-I)...", shell_state);
+                let phase = self.shell_ready_count % 60;
+                if phase == 1 {
+                    info!("Shell BIOS pronta (stato 2): avvio automatico disco CD-i (click PLAY CD-I)...");
                     m.bus.slave.update_mouse(575, 335, 1);
-                } else if self.shell_ready_count == 50 || self.shell_ready_count == 200 {
+                } else if phase == 26 {
                     m.bus.slave.update_mouse(575, 335, 0);
                 }
             }
             if ((m.cpu.pc >= 0x00010000 && m.cpu.pc < 0x00300000) || (m.cpu.pc >= 0x00D00000 && m.cpu.pc < 0x00E00000)) && self.frame_count > 250 {
                 info!("Applicazione disco in esecuzione in RAM (PC=0x{:06X}), controllo passato all'utente.", m.cpu.pc);
                 self.disc_launched = true;
+                self.mouse_captured = true;
+                just_launched = true;
                 m.bus.emulate_wait_states = true;
                 self.pad_x = 384;
                 self.pad_y = 280;
@@ -1066,11 +1220,19 @@ impl App {
                 m.bus.slave.update_mouse(384, 280, 0);
             }
         }
+        if just_launched {
+            self.apply_grab();
+        }
     }
 
     // Keyboard, gamepad and host mouse into the slave controller, once per emulated frame
     fn update_input(&mut self) {
         let is_active = self.focused && self.host_input;
+
+        let left_clicked = self.mouse_left || self.mouse_left_latched;
+        self.mouse_left_latched = false;
+        let right_clicked = self.mouse_right || self.mouse_right_latched;
+        self.mouse_right_latched = false;
 
         // Middle mouse button (rotellina/tasto centrale): toggle mouse capture / release focus
         if is_active && self.mouse_middle && !self.prev_middle {
@@ -1080,7 +1242,7 @@ impl App {
         self.prev_middle = self.mouse_middle;
 
         // Left click inside window re-captures mouse if released
-        if is_active && !self.mouse_captured && self.mouse_left && self.cursor.is_some() {
+        if is_active && !self.mouse_captured && left_clicked && self.cursor.is_some() {
             self.mouse_captured = true;
             info!("Controllo mouse: CATTURATO (focus console, puntatore host nascosto)");
         }
@@ -1195,8 +1357,8 @@ impl App {
                 (mouse_x, mouse_y) = cursor_to_cdi(pos, self.image_rect);
             }
             if self.rel_pointer.is_some() || self.cursor.is_some() {
-                if self.mouse_left { mouse_btn |= 1; }
-                if self.mouse_right { mouse_btn |= 2; }
+                if left_clicked { mouse_btn |= 1; }
+                if right_clicked { mouse_btn |= 2; }
             }
         }
 
@@ -1212,8 +1374,8 @@ impl App {
             }
         }
 
-        if !self.disc_launched && m.bus.cdrom.is_some() {
-            // During automatic boot sequence, do not let host mouse drift override PLAY CD-I auto-click
+        if !self.disc_launched && m.bus.cdrom.is_some() && self.shell_ready_count < 240 {
+            // During automatic boot sequence, let autoplay pulse click PLAY CD-I until launched or timeout
         } else {
             match self.input_device_mode {
                 InputDeviceMode::Gamepad => {
@@ -1229,10 +1391,20 @@ impl App {
                         self.pad_y = self.pad_y_f.round() as i32;
                         moved = true;
                     }
-                    if moved || key_btn != self.prev_key_btn {
-                        m.bus.slave.update_mouse(self.pad_x, self.pad_y, key_btn);
+                    if is_active && self.mouse_captured {
+                        if mouse_x != self.pad_x || mouse_y != self.pad_y {
+                            self.pad_x = mouse_x;
+                            self.pad_y = mouse_y;
+                            self.pad_x_f = mouse_x as f32;
+                            self.pad_y_f = mouse_y as f32;
+                            moved = true;
+                        }
                     }
-                    self.prev_key_btn = key_btn;
+                    let combined_btn = key_btn | mouse_btn;
+                    if moved || combined_btn != self.prev_key_btn {
+                        m.bus.slave.update_mouse(self.pad_x, self.pad_y, combined_btn);
+                    }
+                    self.prev_key_btn = combined_btn;
                 }
                 InputDeviceMode::Mouse => {
                     self.pad_x = mouse_x;
@@ -1360,6 +1532,7 @@ impl App {
             return true;
         }
         self.autoplay();
+        self.update_input();
         self.m.run_frame();
         if self.frame_count % 300 == 0 {
             self.m.bus.nvram.flush_if_dirty();
@@ -1370,13 +1543,11 @@ impl App {
             self.prev_vsr = curr_vsr;
             self.buffer_flips_interval += 1;
         }
-
-        self.update_input();
         // Emulation runs on the timer; only the picture is skipped while the window is hidden
         if self.fast_forward {
             // Drop fast-forward audio so the queues never hold sped-up backlog
             let audio = &self.m.bus.cdic.audio;
-            for q in [&audio.sample_queue, &audio.sfx_queue] {
+            for q in [&audio.sample_queue, &audio.sfx_queue, &audio.dvc_queue] {
                 if let Ok(mut q) = q.lock() {
                     q.clear();
                 }
@@ -1399,7 +1570,8 @@ impl App {
         true
     }
 
-    // Precision host frame pacing: frames start on a fixed schedule, a late frame drops the backlog
+    // Precision host frame pacing: frames start on a fixed schedule.
+    // If a frame completes late, advance to the next future target so the emulator NEVER bursts at host CPU speed.
     fn schedule_next(&mut self) {
         let target_frame_duration = self.m.bus.mcd212.video_mode.frame_duration();
         let now = Instant::now();
@@ -1407,9 +1579,15 @@ impl App {
             self.run_at = self.next_frame_time;
             self.next_frame_time += target_frame_duration;
         } else {
-            // Drop backlog immediately so emulation never bursts at host CPU speed
-            self.run_at = now;
-            self.next_frame_time = now + target_frame_duration;
+            // Late: if lag was large (>2 frames backlog e.g. window dragging/menu), resync cleanly
+            if now.duration_since(self.next_frame_time) > target_frame_duration * 2 {
+                self.next_frame_time = now + target_frame_duration;
+            } else {
+                while self.next_frame_time <= now {
+                    self.next_frame_time += target_frame_duration;
+                }
+            }
+            self.run_at = self.next_frame_time;
         }
     }
 
@@ -1490,16 +1668,22 @@ impl ApplicationHandler for App {
         #[cfg(target_os = "windows")]
         {
             gui::set_run_in_modal(self.run_in_menu);
-            gui::attach_gui_menu(self.hwnd(), self.bindings.profile, self.input_device_mode, self.m.bus.mcd212.video_mode);
+            let show_menu = !self.no_menu && !self.start_fullscreen;
+            gui::attach_gui_menu(self.hwnd(), self.bindings.profile, self.input_device_mode, self.m.bus.mcd212.video_mode, self.bindings.mouse_sensitivity, show_menu);
             gui::update_dvc_menu(self.m.bus.dvc.is_fitted());
             // SetMenu takes the menu bar out of the client area; winit adds it back when sizing
-            if let Some(window) = &self.window {
-                let _ = window.request_inner_size(LogicalSize::new(SCREEN_WIDTH as f64, SCREEN_HEIGHT as f64));
+            if show_menu {
+                if let Some(window) = &self.window {
+                    let _ = window.request_inner_size(LogicalSize::new(SCREEN_WIDTH as f64, SCREEN_HEIGHT as f64));
+                }
             }
+        }
+        if self.start_fullscreen {
+            self.set_fullscreen(true);
         }
         let now = Instant::now();
         self.run_at = now;
-        self.next_frame_time = now;
+        self.next_frame_time = now + self.m.bus.mcd212.video_mode.frame_duration();
         self.fps_timer = now;
     }
 
@@ -1553,8 +1737,18 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
                 match button {
-                    MouseButton::Left => self.mouse_left = down,
-                    MouseButton::Right => self.mouse_right = down,
+                    MouseButton::Left => {
+                        self.mouse_left = down;
+                        if down {
+                            self.mouse_left_latched = true;
+                        }
+                    }
+                    MouseButton::Right => {
+                        self.mouse_right = down;
+                        if down {
+                            self.mouse_right_latched = true;
+                        }
+                    }
                     MouseButton::Middle => self.mouse_middle = down,
                     _ => {}
                 }
@@ -1564,12 +1758,13 @@ impl ApplicationHandler for App {
     }
 
     fn device_event(&mut self, _el: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
-        // Relative motion in host pixels, scaled like the letterboxed picture
+        // Relative motion in host pixels, scaled like the letterboxed picture and mouse sensitivity
         if let (DeviceEvent::MouseMotion { delta: (dx, dy) }, Some((x, y))) = (event, self.rel_pointer) {
             let (_, _, w, h) = self.image_rect;
             if w > 0 && h > 0 {
-                let x = (x + dx * SCREEN_WIDTH as f64 / w as f64).clamp(0.0, (SCREEN_WIDTH - 1) as f64);
-                let y = (y + dy * SCREEN_HEIGHT as f64 / h as f64).clamp(0.0, (SCREEN_HEIGHT - 1) as f64);
+                let sens = self.bindings.mouse_sensitivity as f64;
+                let x = (x + dx * sens * SCREEN_WIDTH as f64 / w as f64).clamp(0.0, (SCREEN_WIDTH - 1) as f64);
+                let y = (y + dy * sens * SCREEN_HEIGHT as f64 / h as f64).clamp(0.0, (SCREEN_HEIGHT - 1) as f64);
                 self.rel_pointer = Some((x, y));
             }
         }
@@ -1584,6 +1779,11 @@ impl ApplicationHandler for App {
             self.fast_forward = ff;
             info!("Fast-forward: {}", if ff { "ON" } else { "OFF" });
             self.reset_telemetry();
+            if !ff {
+                let now = Instant::now();
+                self.run_at = now;
+                self.next_frame_time = now + self.m.bus.mcd212.video_mode.frame_duration();
+            }
         }
         let now = Instant::now();
         if !ff && now < self.run_at {

@@ -926,7 +926,7 @@ fn decode_group_alu_reg(cpu_type: CpuType, opcode: u16) -> Option<DecodedSimpleO
                     src: ea_reg,
                     dst: reg,
                     signed: op_mode == 7,
-                    m68000_timing: cpu_type == CpuType::M68000,
+                    m68000_timing: matches!(cpu_type, CpuType::M68000 | CpuType::SCC68070),
                 });
             }
 

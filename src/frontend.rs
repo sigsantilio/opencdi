@@ -146,6 +146,8 @@ pub fn string_to_key(s: &str) -> Option<Key> {
 #[derive(Debug, Clone)]
 pub struct KeyBindings {
     pub profile: InputProfile,
+    pub input_device: InputDeviceMode,
+    pub mouse_sensitivity: f32,
     pub up: Key,
     pub down: Key,
     pub left: Key,
@@ -158,6 +160,8 @@ impl KeyBindings {
     pub fn new() -> Self {
         let mut bindings = Self {
             profile: InputProfile::Standard,
+            input_device: InputDeviceMode::Gamepad,
+            mouse_sensitivity: 0.50,
             up: Key::ArrowUp,
             down: Key::ArrowDown,
             left: Key::ArrowLeft,
@@ -215,8 +219,16 @@ impl KeyBindings {
             InputProfile::Numpad => "Numpad",
             InputProfile::Custom => "Custom",
         };
+        let dev_str = match self.input_device {
+            InputDeviceMode::Gamepad => "Gamepad",
+            InputDeviceMode::Mouse => "Mouse",
+        };
         let content = format!(
             "# OpenCDi Controls Configuration\n\
+             # Input Device: Gamepad | Mouse (Exclusive active input device)\n\
+             input_device={}\n\
+             # Mouse sensitivity multiplier (0.50 = 50% recommended for modern high-DPI mice)\n\
+             mouse_sensitivity={:.2}\n\
              # Profile: Standard | WASD | Numpad | Custom\n\
              profile={}\n\n\
              # Custom key bindings (active with profile=Custom or as overrides):\n\
@@ -226,6 +238,8 @@ impl KeyBindings {
              right={}\n\
              btn1={}\n\
              btn2={}\n",
+            dev_str,
+            self.mouse_sensitivity,
             prof_str,
             key_to_string(self.up),
             key_to_string(self.down),
@@ -248,6 +262,17 @@ impl KeyBindings {
                 let parts: Vec<&str> = trimmed.split('=').map(|s| s.trim()).collect();
                 if parts.len() == 2 {
                     match parts[0].to_lowercase().as_str() {
+                        "input_device" => match parts[1].to_lowercase().as_str() {
+                            "mouse" => self.input_device = InputDeviceMode::Mouse,
+                            _ => self.input_device = InputDeviceMode::Gamepad,
+                        },
+                        "mouse_sensitivity" | "sensitivity" => {
+                            let clean = parts[1].trim_end_matches('%');
+                            if let Ok(val) = clean.parse::<f32>() {
+                                let factor = if val > 5.0 { val / 100.0 } else { val };
+                                self.mouse_sensitivity = factor.clamp(0.05, 10.0);
+                            }
+                        },
                         "profile" => match parts[1].to_lowercase().as_str() {
                             "wasd" => self.apply_profile(InputProfile::Wasd),
                             "numpad" => self.apply_profile(InputProfile::Numpad),
@@ -285,6 +310,7 @@ pub enum GuiAction {
     Exit,
     SetProfile(InputProfile),
     SetInputDevice(InputDeviceMode),
+    SetMouseSensitivity(f32),
     ReloadControls,
     ToggleReleaseMouse,
     ToggleMute,

@@ -720,7 +720,7 @@ fn dispatch_group_0<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             if let Some(mode) = AddressingMode::decode(ea_mode, ea_reg) {
                 let size = decode_size_00((opcode >> 6) & 3);
                 let legacy = cpu.exec_ori(bus, size, mode);
-                if cpu.cpu_type == CpuType::M68000 {
+                if cpu.uses_m68000_timing() {
                     cpu.immediate_alu_cycles(mode, size)
                 } else {
                     legacy
@@ -741,7 +741,7 @@ fn dispatch_group_0<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             if let Some(mode) = AddressingMode::decode(ea_mode, ea_reg) {
                 let size = decode_size_00((opcode >> 6) & 3);
                 let legacy = cpu.exec_andi(bus, size, mode);
-                if cpu.cpu_type == CpuType::M68000 {
+                if cpu.uses_m68000_timing() {
                     cpu.immediate_alu_cycles(mode, size)
                 } else {
                     legacy
@@ -778,7 +778,7 @@ fn dispatch_group_0<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 let (result, _) = cpu.exec_sub(bus, size, imm, dst);
                 cpu.write_resolved_ea(bus, ea, size, result);
             }
-            if cpu.cpu_type == CpuType::M68000 {
+            if cpu.uses_m68000_timing() {
                 cpu.immediate_alu_cycles(mode, size)
             } else if size == Size::Long {
                 16
@@ -817,7 +817,7 @@ fn dispatch_group_0<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             } else {
                 cpu.write_resolved_ea(bus, ea, size, result);
             }
-            if cpu.cpu_type == CpuType::M68000 {
+            if cpu.uses_m68000_timing() {
                 cpu.immediate_alu_cycles(mode, size)
             } else {
                 _cycles + if size == Size::Long { 8 } else { 4 }
@@ -834,7 +834,7 @@ fn dispatch_group_0<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
             let size = decode_size_00((opcode >> 6) & 3);
             let legacy = cpu.exec_eori(bus, size, mode);
-            if cpu.cpu_type == CpuType::M68000 {
+            if cpu.uses_m68000_timing() {
                 cpu.immediate_alu_cycles(mode, size)
             } else {
                 legacy
@@ -868,7 +868,7 @@ fn dispatch_group_0<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 }
             }
             let legacy = cpu.exec_cmp(size, imm, dst);
-            if cpu.cpu_type == CpuType::M68000 {
+            if cpu.uses_m68000_timing() {
                 cpu.cmpi_cycles(mode, size)
             } else {
                 legacy
@@ -913,7 +913,7 @@ fn dispatch_group_0<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     3 => cpu.exec_bset(bus, bit_num, ea),
                     _ => return illegal_instruction(cpu, bus),
                 };
-                if cpu.cpu_type == CpuType::M68000 {
+                if cpu.uses_m68000_timing() {
                     cpu.bitop_cycles(ea, bit_op, opcode & 0x100 == 0, bit_num)
                 } else {
                     legacy
@@ -1103,7 +1103,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             let cycles = cpu.exec_chk(bus, size, bound, dst_reg);
             // MC68000: the bound fetch pays the source EA cost on top of
             // the base (whether or not the check traps).
-            return if cpu.cpu_type == CpuType::M68000 {
+            return if cpu.uses_m68000_timing() {
                 cycles + cpu.ea_source_cycles(mode, size)
             } else {
                 cycles
@@ -1506,7 +1506,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     let size = decode_size_00((opcode >> 6) & 3);
                     let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
                     let legacy = cpu.exec_negx(bus, size, mode);
-                    if cpu.cpu_type == CpuType::M68000 {
+                    if cpu.uses_m68000_timing() {
                         cpu.unary_rmw_cycles(mode, size)
                     } else {
                         legacy
@@ -1517,7 +1517,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     let size = decode_size_00((opcode >> 6) & 3);
                     let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
                     let legacy = cpu.exec_clr(bus, size, mode);
-                    if cpu.cpu_type == CpuType::M68000 {
+                    if cpu.uses_m68000_timing() {
                         cpu.unary_rmw_cycles(mode, size)
                     } else {
                         legacy
@@ -1543,7 +1543,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     }
                     cpu.set_ccr(value);
                     cpu.full_prefetch(bus);
-                    if cpu.cpu_type == CpuType::M68000 {
+                    if cpu.uses_m68000_timing() {
                         12 + cpu.ea_source_cycles(mode, Size::Word)
                     } else {
                         12
@@ -1554,7 +1554,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     let size = decode_size_00((opcode >> 6) & 3);
                     let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
                     let legacy = cpu.exec_neg(bus, size, mode);
-                    if cpu.cpu_type == CpuType::M68000 {
+                    if cpu.uses_m68000_timing() {
                         cpu.unary_rmw_cycles(mode, size)
                     } else {
                         legacy
@@ -1585,7 +1585,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     cpu.trace_t0_sr_write();
                     cpu.set_sr(value as u16);
                     cpu.full_prefetch(bus);
-                    if cpu.cpu_type == CpuType::M68000 {
+                    if cpu.uses_m68000_timing() {
                         12 + cpu.ea_source_cycles(mode, Size::Word)
                     } else {
                         12
@@ -1596,7 +1596,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     let size = decode_size_00((opcode >> 6) & 3);
                     let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
                     let legacy = cpu.exec_not(bus, size, mode);
-                    if cpu.cpu_type == CpuType::M68000 {
+                    if cpu.uses_m68000_timing() {
                         cpu.unary_rmw_cycles(mode, size)
                     } else {
                         legacy
@@ -1619,7 +1619,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     }
                     let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
                     let legacy = cpu.exec_nbcd(bus, mode);
-                    if cpu.cpu_type == CpuType::M68000 {
+                    if cpu.uses_m68000_timing() {
                         if mode.is_register_direct() {
                             6
                         } else {
@@ -1656,7 +1656,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     }
                     let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
                     let legacy = cpu.exec_tas(bus, mode);
-                    if cpu.cpu_type == CpuType::M68000 {
+                    if cpu.uses_m68000_timing() {
                         if mode.is_register_direct() {
                             4
                         } else {
@@ -1682,7 +1682,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     }
                     let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
                     let legacy = cpu.exec_tst(bus, size, mode);
-                    if cpu.cpu_type == CpuType::M68000 {
+                    if cpu.uses_m68000_timing() {
                         cpu.tst_cycles(mode, size)
                     } else {
                         legacy
@@ -1774,7 +1774,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     cpu.push_32(bus, return_pc);
                     cpu.pc = addr;
                     cpu.full_prefetch(bus);
-                    if cpu.cpu_type == CpuType::M68000 {
+                    if cpu.uses_m68000_timing() {
                         16 + cpu.jump_addr_calc_cycles(mode)
                     } else {
                         16
@@ -1802,7 +1802,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                         _ => 0,
                     });
                     cpu.full_prefetch(bus);
-                    if cpu.cpu_type == CpuType::M68000 {
+                    if cpu.uses_m68000_timing() {
                         8 + cpu.jump_addr_calc_cycles(mode)
                     } else {
                         8
@@ -1817,7 +1817,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
                     {
                         let legacy = cpu.exec_lea(bus, mode, reg);
-                        if cpu.cpu_type == CpuType::M68000 {
+                        if cpu.uses_m68000_timing() {
                             4 + cpu.control_addr_calc_cycles(mode)
                         } else {
                             legacy
@@ -1832,7 +1832,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
                     {
                         let legacy = cpu.exec_pea(bus, mode);
-                        if cpu.cpu_type == CpuType::M68000 {
+                        if cpu.uses_m68000_timing() {
                             12 + cpu.control_addr_calc_cycles(mode)
                         } else {
                             legacy
@@ -2141,7 +2141,7 @@ fn dispatch_group_5<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             }
             // Scc to memory polls IPL during the pre-writeback prefetch.
             cpu.write_resolved_ea_np_poll(bus, ea, Size::Byte, value);
-            if cpu.cpu_type == CpuType::M68000 {
+            if cpu.uses_m68000_timing() {
                 if mode.is_register_direct() {
                     // Data register: 4 if condition false, 6 if true.
                     if value != 0 { 6 } else { 4 }
@@ -2176,7 +2176,7 @@ fn dispatch_group_5<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         } else {
             cpu.exec_subq(bus, size, data, mode)
         };
-        if cpu.cpu_type == CpuType::M68000 {
+        if cpu.uses_m68000_timing() {
             cpu.addq_subq_cycles(mode, size)
         } else {
             legacy
@@ -2276,7 +2276,7 @@ fn dispatch_group_8<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             }
             let (result, _) = cpu.exec_or(bus, size, src, cpu.d(reg));
             cpu.set_d(reg, (cpu.d(reg) & !size.mask()) | result);
-            if cpu.cpu_type == CpuType::M68000 {
+            if cpu.uses_m68000_timing() {
                 if !finish_m68000_alu_ea_dn_long_tail(cpu, bus, mode, size) {
                     return 50;
                 }
@@ -2331,7 +2331,7 @@ fn dispatch_group_8<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 let (result, _) = cpu.exec_or(bus, size, cpu.d(reg), dst);
                 // OR Dn,<ea> polls IPL during the pre-writeback prefetch.
                 cpu.write_resolved_ea_np_poll(bus, ea, size, result);
-                if cpu.cpu_type == CpuType::M68000 {
+                if cpu.uses_m68000_timing() {
                     cpu.alu_dn_ea_cycles(mode, size)
                 } else {
                     8
@@ -2376,7 +2376,7 @@ fn dispatch_group_9<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             let dst = cpu.d(reg) & size.mask(); // Mask to operation size
             let (result, _) = cpu.exec_sub(bus, size, src, dst);
             cpu.set_d(reg, (cpu.d(reg) & !size.mask()) | result);
-            if cpu.cpu_type == CpuType::M68000 {
+            if cpu.uses_m68000_timing() {
                 if !finish_m68000_alu_ea_dn_long_tail(cpu, bus, mode, size) {
                     return 50;
                 }
@@ -2395,8 +2395,10 @@ fn dispatch_group_9<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
             let src = cpu.read_ea(bus, mode, size);
             let legacy = cpu.exec_suba(bus, size, src, reg);
-            if cpu.cpu_type == CpuType::M68000 {
-                if !finish_m68000_adda_suba_tail(cpu, bus, mode, size) {
+            if cpu.uses_m68000_timing() {
+                if cpu.cpu_type == CpuType::M68000
+                    && !finish_m68000_adda_suba_tail(cpu, bus, mode, size)
+                {
                     return 50;
                 }
                 cpu.adda_suba_cycles(mode, size)
@@ -2418,7 +2420,7 @@ fn dispatch_group_9<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     return 50;
                 }
                 cpu.set_d(reg, (cpu.d(reg) & !size.mask()) | result);
-                if cpu.cpu_type == CpuType::M68000 && size == Size::Long {
+                if cpu.uses_m68000_timing() && size == Size::Long {
                     8
                 } else {
                     4
@@ -2484,7 +2486,7 @@ fn dispatch_group_9<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
                     return 50;
                 }
-                if cpu.cpu_type == CpuType::M68000 && size == Size::Long {
+                if cpu.uses_m68000_timing() && size == Size::Long {
                     30
                 } else {
                     18
@@ -2501,7 +2503,7 @@ fn dispatch_group_9<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 let (result, _) = cpu.exec_sub(bus, size, src, dst);
                 // SUB Dn,<ea> polls IPL during the pre-writeback prefetch.
                 cpu.write_resolved_ea_np_poll(bus, ea, size, result);
-                if cpu.cpu_type == CpuType::M68000 {
+                if cpu.uses_m68000_timing() {
                     cpu.alu_dn_ea_cycles(mode, size)
                 } else {
                     8
@@ -2531,8 +2533,8 @@ fn dispatch_group_b<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 return 50;
             }
             let legacy = cpu.exec_cmp(size, src, cpu.d(reg));
-            if cpu.cpu_type == CpuType::M68000 {
-                if size == Size::Long {
+            if cpu.uses_m68000_timing() {
+                if cpu.cpu_type == CpuType::M68000 && size == Size::Long {
                     cpu.top_up_prefetch(bus);
                     cpu.ipl_poll_point(bus);
                     if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
@@ -2559,8 +2561,10 @@ fn dispatch_group_b<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 return 50;
             }
             let legacy = cpu.exec_cmpa(size, src, reg);
-            if cpu.cpu_type == CpuType::M68000 {
-                if !finish_m68000_tail_after_final_prefetch(cpu, bus, 2) {
+            if cpu.uses_m68000_timing() {
+                if cpu.cpu_type == CpuType::M68000
+                    && !finish_m68000_tail_after_final_prefetch(cpu, bus, 2)
+                {
                     return 50;
                 }
                 cpu.cmpa_cycles(mode, size)
@@ -2593,7 +2597,7 @@ fn dispatch_group_b<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     cpu.ipl_poll_point(bus);
                 }
                 let legacy = cpu.exec_cmp(size, src_val, dst_val);
-                if cpu.cpu_type == CpuType::M68000 {
+                if cpu.uses_m68000_timing() {
                     // CMPM (An)+,(Am)+: 12 byte/word, 20 long.
                     if size == Size::Long { 20 } else { 12 }
                 } else {
@@ -2638,7 +2642,7 @@ fn dispatch_group_b<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                         return 50;
                     }
                     cpu.set_logic_flags(result, size);
-                    if cpu.cpu_type == CpuType::M68000 {
+                    if cpu.uses_m68000_timing() {
                         cpu.eor_cycles(mode, size)
                     } else {
                         8
@@ -2667,7 +2671,7 @@ fn dispatch_group_c<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             let src = cpu.read_ea(bus, mode, size);
             let (result, _) = cpu.exec_and(bus, size, src, cpu.d(reg));
             cpu.set_d(reg, (cpu.d(reg) & !size.mask()) | result);
-            if cpu.cpu_type == CpuType::M68000 {
+            if cpu.uses_m68000_timing() {
                 if !finish_m68000_alu_ea_dn_long_tail(cpu, bus, mode, size) {
                     return 50;
                 }
@@ -2705,7 +2709,7 @@ fn dispatch_group_c<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     let (result, _) = cpu.exec_and(bus, size, cpu.d(reg), dst);
                     // AND Dn,<ea> polls IPL during the pre-writeback prefetch.
                     cpu.write_resolved_ea_np_poll(bus, ea, size, result);
-                    if cpu.cpu_type == CpuType::M68000 {
+                    if cpu.uses_m68000_timing() {
                         cpu.alu_dn_ea_cycles(mode, size)
                     } else {
                         8
@@ -2751,7 +2755,7 @@ fn dispatch_group_d<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             let dst = cpu.d(reg) & size.mask(); // Mask to operation size
             let (result, _) = cpu.exec_add(bus, size, src, dst);
             cpu.set_d(reg, (cpu.d(reg) & !size.mask()) | result);
-            if cpu.cpu_type == CpuType::M68000 {
+            if cpu.uses_m68000_timing() {
                 if !finish_m68000_alu_ea_dn_long_tail(cpu, bus, mode, size) {
                     return 50;
                 }
@@ -2770,8 +2774,10 @@ fn dispatch_group_d<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
             let src = cpu.read_ea(bus, mode, size);
             let legacy = cpu.exec_adda(bus, size, src, reg);
-            if cpu.cpu_type == CpuType::M68000 {
-                if !finish_m68000_adda_suba_tail(cpu, bus, mode, size) {
+            if cpu.uses_m68000_timing() {
+                if cpu.cpu_type == CpuType::M68000
+                    && !finish_m68000_adda_suba_tail(cpu, bus, mode, size)
+                {
                     return 50;
                 }
                 cpu.adda_suba_cycles(mode, size)
@@ -2793,7 +2799,7 @@ fn dispatch_group_d<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     return 50;
                 }
                 cpu.set_d(reg, (cpu.d(reg) & !size.mask()) | result);
-                if cpu.cpu_type == CpuType::M68000 && size == Size::Long {
+                if cpu.uses_m68000_timing() && size == Size::Long {
                     8
                 } else {
                     4
@@ -2859,7 +2865,7 @@ fn dispatch_group_d<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
                     return 50;
                 }
-                if cpu.cpu_type == CpuType::M68000 && size == Size::Long {
+                if cpu.uses_m68000_timing() && size == Size::Long {
                     30
                 } else {
                     18
@@ -2876,7 +2882,7 @@ fn dispatch_group_d<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 let (result, _) = cpu.exec_add(bus, size, src, dst);
                 // ADD Dn,<ea> polls IPL during the pre-writeback prefetch.
                 cpu.write_resolved_ea_np_poll(bus, ea, size, result);
-                if cpu.cpu_type == CpuType::M68000 {
+                if cpu.uses_m68000_timing() {
                     cpu.alu_dn_ea_cycles(mode, size)
                 } else {
                     8
@@ -2946,7 +2952,7 @@ fn dispatch_group_e<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         // Memory shifts poll IPL during the pre-writeback prefetch.
         cpu.write_resolved_ea_np_poll(bus, ea, Size::Word, result);
         // MC68000 memory shift/rotate (always 1 bit, word): 8 + EA.
-        if cpu.cpu_type == CpuType::M68000 {
+        if cpu.uses_m68000_timing() {
             8 + cpu.ea_source_cycles(mode, Size::Word)
         } else {
             cycles + 4

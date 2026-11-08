@@ -488,7 +488,7 @@ impl CpuCore {
     pub(crate) fn scale_cycles_for_cpu_type(&self, cycles: i32) -> i32 {
         use crate::core::types::CpuType;
         match self.cpu_type {
-            CpuType::M68000 | CpuType::M68010 | CpuType::Invalid => cycles,
+            CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070 | CpuType::Invalid => cycles,
             _ => ((cycles * 5 + 7) / 8).max(2),
         }
     }

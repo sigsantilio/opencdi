@@ -134,7 +134,7 @@ impl CpuCore {
         // 020+ has a fixed-cost multiplier; the cycle-exact A1200/FS-UAE
         // reference measures MULU.W at ~27 cycles, so pre-scale to 42
         // (-> 27 after scale_cycles_for_cpu_type).
-        if self.cpu_type == CpuType::M68000 {
+        if self.uses_m68000_timing() {
             38 + 2 * (src & 0xFFFF).count_ones() as i32 + self.ea_source_cycles(mode, Size::Word)
         } else {
             42
@@ -171,7 +171,7 @@ impl CpuCore {
 
         // MC68000: MULS.W = 38 + 2 * (bit transitions in source<<1) + EA.
         // 020+ fixed-cost multiplier (~27 cycles measured); pre-scale 42.
-        if self.cpu_type == CpuType::M68000 {
+        if self.uses_m68000_timing() {
             38 + 2 * muls_transitions(src as u16) as i32 + self.ea_source_cycles(mode, Size::Word)
         } else {
             42
@@ -206,12 +206,12 @@ impl CpuCore {
             return self.exception_zero_divide(bus);
         }
 
-        let div_clocks = if m68000 {
+        let div_clocks = if self.uses_m68000_timing() {
             divu_cycles(dst, src as u16)
         } else {
             140
         };
-        let cycles = if m68000 {
+        let cycles = if self.uses_m68000_timing() {
             div_clocks + self.ea_source_cycles(mode, Size::Word)
         } else {
             140
@@ -289,12 +289,12 @@ impl CpuCore {
             return self.exception_zero_divide(bus);
         }
 
-        let div_clocks = if m68000 {
+        let div_clocks = if self.uses_m68000_timing() {
             divs_cycles(dst, src as i16)
         } else {
             158
         };
-        let cycles = if m68000 {
+        let cycles = if self.uses_m68000_timing() {
             div_clocks + self.ea_source_cycles(mode, Size::Word)
         } else {
             158
