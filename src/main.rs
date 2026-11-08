@@ -1164,7 +1164,7 @@ impl App {
     // Hide and confine the host cursor while captured and focused (Win32 ShowCursor/ClipCursor before)
     fn apply_grab(&mut self) {
         let Some(window) = &self.window else { return };
-        let want = self.host_input && self.focused && self.mouse_captured;
+        let want = self.host_input && self.focused && self.mouse_captured && self.input_device_mode == InputDeviceMode::Mouse;
         if self.grab_applied == Some(want) {
             return;
         }
@@ -1430,6 +1430,8 @@ impl App {
                     self.input_device_mode = mode;
                     self.bindings.input_device = mode;
                     self.bindings.save_to_ini();
+                    self.mouse_captured = mode == InputDeviceMode::Mouse;
+                    self.apply_grab();
                     #[cfg(target_os = "windows")]
                     gui::update_input_device_menu(mode);
                     info!("Input device mode set to: {:?}", mode);
@@ -1628,7 +1630,7 @@ impl App {
             if ((m.cpu.pc >= 0x00010000 && m.cpu.pc < 0x00300000) || (m.cpu.pc >= 0x00D00000 && m.cpu.pc < 0x00E00000)) && self.frame_count > 250 {
                 info!("Applicazione disco in esecuzione in RAM (PC=0x{:06X}), controllo passato all'utente.", m.cpu.pc);
                 self.disc_launched = true;
-                self.mouse_captured = true;
+                self.mouse_captured = self.input_device_mode == InputDeviceMode::Mouse;
                 just_launched = true;
                 m.bus.emulate_wait_states = true;
                 self.pad_x = 384;
@@ -1660,7 +1662,7 @@ impl App {
         self.prev_middle = self.mouse_middle;
 
         // Left click inside window re-captures mouse if released
-        if is_active && !self.mouse_captured && left_clicked && self.cursor.is_some() {
+        if is_active && !self.mouse_captured && left_clicked && self.cursor.is_some() && self.input_device_mode == InputDeviceMode::Mouse {
             self.mouse_captured = true;
             self.swallow_left = true;
             info!("Controllo mouse: CATTURATO (focus console, puntatore host nascosto)");
@@ -1819,24 +1821,14 @@ impl App {
                         self.pad_y = self.pad_y_f.round() as i32;
                         moved = true;
                     }
-                    if is_active && self.mouse_captured {
-                        if mouse_x != self.pad_x || mouse_y != self.pad_y {
-                            self.pad_x = mouse_x;
-                            self.pad_y = mouse_y;
-                            self.pad_x_f = mouse_x as f32;
-                            self.pad_y_f = mouse_y as f32;
-                            moved = true;
-                        }
-                    }
-                    let combined_btn = key_btn | mouse_btn;
-                    if moved || combined_btn != self.prev_key_btn {
-                        send_pointer(&mut m.bus, self.pad_x, self.pad_y, combined_btn);
+                    if moved || key_btn != self.prev_key_btn {
+                        send_pointer(&mut m.bus, self.pad_x, self.pad_y, key_btn);
                     }
                     // The 490 reports relative moves, so a direction held against the screen edge keeps moving
                     if let Some(m4) = m.bus.mono4.as_deref_mut() {
                         m4.ikat.push_pointer(over.0.round() as i32, over.1.round() as i32);
                     }
-                    self.prev_key_btn = combined_btn;
+                    self.prev_key_btn = key_btn;
                 }
                 InputDeviceMode::Mouse => {
                     self.pad_x = mouse_x;
