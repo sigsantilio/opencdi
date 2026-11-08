@@ -293,7 +293,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if frame % 200 == 0 {
-            let aud_q = bus.cdic.audio.sample_queue.lock().unwrap().len();
+            let aud_q = bus.cdic.audio.main.len();
             println!(
                 "[F{:4}] PC=0x{:06X} | DCR0=0x{:04X} DCR1=0x{:04X} VSR0=0x{:06X} VSR1=0x{:06X} | DVC fit={} play={} dec_cnt={} | aud_q={}",
                 frame, cpu.pc,

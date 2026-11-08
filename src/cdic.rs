@@ -252,9 +252,8 @@ impl Cdic {
                     self.decode_addr = 0xFFFF;
                     self.decoding_audio_map = false;
                 } else {
-                    let req_addr = val & 0x3A00;
-                    if !self.decoding_audio_map || self.decode_addr == 0xFFFF || self.decode_addr != req_addr {
-                        self.decode_addr = req_addr;
+                    if !self.decoding_audio_map || self.decode_addr == 0xFFFF {
+                        self.decode_addr = val & 0x3A00;
                         self.audio_format_sectors = 0;
                         if self.audio_map_counter == 0 {
                             self.audio_map_counter = 1;
@@ -319,9 +318,7 @@ impl Cdic {
         if is_seek {
             self.audio.left_state.reset();
             self.audio.right_state.reset();
-            if let Ok(mut q) = self.audio.sample_queue.lock() {
-                q.clear();
-            }
+            self.audio.main.clear();
         }
 
         info!(
