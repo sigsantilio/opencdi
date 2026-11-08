@@ -496,6 +496,16 @@ impl CdiAudio {
         self.main.push(&final_samples, ADPCM_LATENCY, k.bound(), &|| format!("main {}", k.level()));
     }
 
+    // A raw CD-DA sector (16-bit little-endian stereo at 44.1 kHz, the mixer rate) goes straight into the main stream.
+    pub fn push_cdda(&mut self, sector: &[u8]) {
+        let frames: Vec<Frame> = sector
+            .chunks_exact(4)
+            .map(|c| (i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0, i16::from_le_bytes([c[2], c[3]]) as f32 / 32768.0))
+            .collect();
+        let bound = ADPCM_LATENCY + 2 * frames.len();
+        self.main.push(&frames, ADPCM_LATENCY, bound, &|| "main cdda".to_string());
+    }
+
     pub fn decode_audio_map_sector(&mut self, payload: &[u8], is_stereo: bool, is_8bit: bool, sample_rate: u32) {
         if payload.len() >= 18 * 128 {
             self.decode_audio_map_groups(&payload[..18 * 128], true, is_stereo, is_8bit, sample_rate);
