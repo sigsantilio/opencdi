@@ -1741,6 +1741,7 @@ impl Frame {
         let sh = self.height.max(1);
         let yw = self.y.width;
         let cw = self.cr.width;
+        let studio = crate::mcd212::studio_levels();
 
         for ty in 0..dst_h {
             let sy = (ty * sh / dst_h).min(sh - 1);
@@ -1754,10 +1755,12 @@ impl Frame {
                 let cr = self.cr.data[ci] as i32 - 128;
                 let cb = self.cb.data[ci] as i32 - 128;
 
-                let yy = ((yv - 16) * 76309) >> 16;
-                let r = (cr * 104597) >> 16;
-                let g = (cb * 25674 + cr * 53278) >> 16;
-                let b = (cb * 132201) >> 16;
+                let (yy, r, g, b) = if studio {
+                    // Studio level: luma keeps its pedestal, chroma is scaled by 219/255.
+                    (yv, (cr * 89827 + 32768) >> 16, (cb * 22049 + cr * 45758 + 32768) >> 16, (cb * 113538 + 32768) >> 16)
+                } else {
+                    (((yv - 16) * 76309) >> 16, (cr * 104597) >> 16, (cb * 25674 + cr * 53278) >> 16, (cb * 132201) >> 16)
+                };
 
                 let rr = clamp_u8(yy + r) as u32;
                 let gg = clamp_u8(yy - g) as u32;

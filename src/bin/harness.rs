@@ -43,7 +43,7 @@ fn dump_ppm(fb: &[u32], path: &str) {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: harness <bios.rom> <disc|none> <frames> [--dvc <rom>] [--ppm <out.ppm>] [--ntsc] [--autoplay [--print-autoplay-script]] [--input <script|@file>] [--sample <n> [--sample-audio]] [--dump-every <n> <prefix>] [--audio-out <file.s16>]");
+    eprintln!("usage: harness <bios.rom> <disc|none> <frames> [--dvc <rom>] [--video-levels full|studio] [--ppm <out.ppm>] [--ntsc] [--autoplay [--print-autoplay-script]] [--input <script|@file>] [--sample <n> [--sample-audio]] [--dump-every <n> <prefix>] [--audio-out <file.s16>]");
     std::process::exit(2);
 }
 
@@ -68,6 +68,14 @@ fn main() {
     while i < a.len() {
         match a[i].as_str() {
             "--dvc" => { i += 1; dvc = a.get(i); }
+            "--video-levels" => {
+                i += 1;
+                match a.get(i).map(|s| s.as_str()) {
+                    Some("full") => opencdi::mcd212::set_studio_levels(false),
+                    Some("studio") => opencdi::mcd212::set_studio_levels(true),
+                    _ => usage(),
+                }
+            }
             "--ppm" => { i += 1; ppm = a.get(i); }
             "--audio-out" => { i += 1; audio_out = Some((a.get(i).cloned().unwrap_or_else(|| usage()), Vec::new())); }
             "--ntsc" => ntsc = true,
@@ -168,7 +176,7 @@ fn main() {
                 win_nonzero += audio_buf.iter().filter(|&&(l, r)| l != 0.0 || r != 0.0).count() as u64;
             }
             if sample > 0 && (frame + 1) % sample == 0 {
-                let nb = m.framebuffer().iter().filter(|&&p| p & 0x00FF_FFFF != 0).count();
+                let nb = nonblack_count(m.framebuffer());
                 eprintln!("SAMPLE frame={} nonblack={}", frame + 1, nb);
                 if sample_audio {
                     eprintln!("AUDIO frame={} samples={} nonzero={}", frame + 1, win_samples, win_nonzero);
@@ -184,7 +192,7 @@ fn main() {
     }
 
     let video_last = video_hash(FNV_OFFSET, m.framebuffer());
-    let nonblack = m.framebuffer().iter().filter(|&&p| p & 0x00FF_FFFF != 0).count();
+    let nonblack = nonblack_count(m.framebuffer());
     if let Some(p) = ppm {
         dump_ppm(m.framebuffer(), p);
     }
@@ -201,4 +209,10 @@ fn main() {
     if print_script {
         println!("AUTOPLAY_SCRIPT {}", input_script::format(&recorded));
     }
+}
+
+// Pixels with any channel above the black level of the selected output range (16 studio, 0 full).
+fn nonblack_count(fb: &[u32]) -> usize {
+    let black = if opencdi::mcd212::studio_levels() { 16 } else { 0 };
+    fb.iter().filter(|&&p| [16, 8, 0].iter().any(|&s| (p >> s) & 0xFF > black)).count()
 }

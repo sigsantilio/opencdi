@@ -328,6 +328,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rom_arg = flag_value("--rom").map(PathBuf::from);
     let max_frames: Option<u64> = flag_value("--frames").and_then(|s| s.parse().ok());
 
+    if let Some(v) = flag_value("--video-levels") {
+        match v.as_str() {
+            "full" => opencdi::mcd212::set_studio_levels(false),
+            "studio" => opencdi::mcd212::set_studio_levels(true),
+            _ => {
+                eprintln!("--video-levels takes full or studio");
+                std::process::exit(2);
+            }
+        }
+    }
+
     let mut m = Machine::new();
     m.bus.slave.debug_log = has_flag("--slave-debug");
     if m.bus.slave.debug_log {
@@ -436,6 +447,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             || a == "--screenshot-dir"
             || a == "--monitor"
             || a == "--mouse-sensitivity"
+            || a == "--video-levels"
             || (a == "--recent" && recent_pick.is_some())
         {
             it.next();
@@ -601,7 +613,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         measured_cd_rate: 0.0,
     };
 
-    info!("Emulation loop started. Shortcuts: [F11]/[Alt+Enter] Fullscreen, [F5]/[H] Reset, [P] Pause, [Space] hold Fast-forward, [F8] Screenshot (BMP), [F12] Screenshot (PNG), [M] Mute, [+]/[-] Volume, [Ctrl+I] Insert Disc, [Ctrl+O] Open & Reset, [Middle Click] Capture/Release Mouse, [Esc] Quit");
+    info!("Emulation loop started. Shortcuts: [F11]/[Alt+Enter] Fullscreen, [F5]/[H] Reset, [P] Pause, [Space] hold Fast-forward, [F8] Screenshot (BMP), [F12] Screenshot (PNG), [M] Mute, [+]/[-] Volume, [L] Video levels studio/full, [Ctrl+I] Insert Disc, [Ctrl+O] Open & Reset, [Middle Click] Capture/Release Mouse, [Esc] Quit");
 
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut app)?;
@@ -911,6 +923,11 @@ impl App {
             Key::Enter | Key::NumpadEnter if alt => self.toggle_fullscreen(),
             Key::F8 => save_screenshot_bmp(&self.screenshot_dir, self.frame_count, &self.m.bus.mcd212.framebuffer[..]),
             Key::F12 => save_screenshot_png(&self.screenshot_dir, self.frame_count, &self.m.bus.mcd212.framebuffer[..]),
+            Key::KeyL if !ctrl && !self.bound(code) => {
+                let studio = !opencdi::mcd212::studio_levels();
+                opencdi::mcd212::set_studio_levels(studio);
+                info!("Video levels: {}", if studio { "studio (black 16)" } else { "full (black 0)" });
+            }
             Key::KeyM if !self.bound(code) => {
                 self.muted = !self.muted;
                 self.publish_gain();

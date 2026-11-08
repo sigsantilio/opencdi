@@ -923,6 +923,7 @@ pub fn show_controls_dialog(owner: *mut std::ffi::c_void) {
            • F8: Screenshot (BMP)  |  F12: Screenshot (PNG)\n\
            • Ctrl+I: Insert disc  |  Ctrl+O: Open disc image and restart\n\
            • M: Mute / Unmute audio  |  + / - : Adjust volume\n\
+           • L: Video levels studio (black 16) / full (black 0)\n\
            • Esc: Quit"
     );
     let title = to_wide("OpenCDi - Controls & Key Mapping Guide");
