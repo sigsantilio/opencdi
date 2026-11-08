@@ -57,6 +57,14 @@ pub const CRC_CCITT_TABLE: [u16; 256] = [
     0x6e17, 0x7e36, 0x4e55, 0x5e74, 0x2e93, 0x3eb2, 0x0ed1, 0x1ef0
 ];
 
+const DISC_MODE_CDDA: u8 = 3;
+const CDDA_SECTOR_BYTES: usize = 2352;
+
+// Raw CD-DA sectors land at byte 0x1400 (bit 0 of DBUF clear) or 0x1E00 (set).
+fn cdda_buffer_base(data_buffer: u16) -> usize {
+    if data_buffer & 1 != 0 { 0x1E00 } else { 0x1400 }
+}
+
 pub struct Cdic {
     pub ram: Box<[u8; CDIC_RAM_SIZE]>,
     pub audio: CdiAudio,
@@ -93,6 +101,7 @@ pub struct Cdic {
     pub map_sector_cycles: u32,
     // Audio channel the decoder took over with the last command 0x2E.
     pub dsp_achan: u16,
+    pub cdda_playing: bool,
 
     // Timing & Interrupt
     pub cycle_accumulator: u32,
@@ -136,6 +145,7 @@ impl Cdic {
             map_finished: false,
             map_sector_cycles: crate::mcd212::VideoMode::Pal.cycles_per_sector(),
             dsp_achan: 0,
+            cdda_playing: false,
 
             cycle_accumulator: 0,
             irq_pending: false,
@@ -177,6 +187,7 @@ impl Cdic {
         self.buf_elapsed = 0;
         self.map_finished = false;
         self.dsp_achan = 0;
+        self.cdda_playing = false;
 
         self.cycle_accumulator = 0;
         self.irq_pending = false;
@@ -264,6 +275,12 @@ impl Cdic {
             0x3FA => {
                 self.z_buffer = val;
                 trace!("CDIC WRITE audio control = 0x{:04X} (on={}, buffer=0x{:04X})", val, self.map_on, self.buf_addr);
+                // During a CD-DA read bit 11 starts and stops CD-DA playback.
+                if self.disc_mode == DISC_MODE_CDDA && self.disc_command != 0 {
+                    self.set_cdda_playing((val & 0x0800) != 0);
+                    self.update_interrupt();
+                    return;
+                }
                 // Bit 11 alone starts the map only with no audio channel; an empty map on an idle decoder ends at once with the finished flag.
                 let bit11_start = (val & 0x0800) != 0 && self.audio_channel == 0 && (val & 0x2000) == 0;
                 if bit11_start || (val & 0x2000) != 0 {
@@ -307,7 +324,16 @@ impl Cdic {
     }
 
     fn map_playing(&self) -> bool {
-        self.map_on
+        self.map_on || self.cdda_playing
+    }
+
+    // Playback starts from the buffer that was refreshed last.
+    fn set_cdda_playing(&mut self, on: bool) {
+        if on && !self.cdda_playing {
+            let base = cdda_buffer_base(self.data_buffer);
+            self.audio.push_cdda(&self.ram[base..base + CDDA_SECTOR_BYTES]);
+        }
+        self.cdda_playing = on;
     }
 
     // ABUF interrupts only while AUDCTL bit 13 is set.
@@ -366,6 +392,7 @@ impl Cdic {
         self.curr_lba = 0;
         self.disc_spinup_counter = 0;
         self.cycle_accumulator = 0;
+        self.cdda_playing = false;
     }
 
     fn handle_cdic_command(&mut self) {
@@ -657,12 +684,50 @@ impl Cdic {
         subcode[11] = (crc_accum & 0xFF) as u8;
     }
 
+    // Raw CD-DA sector into the audio buffers with the Q subcode behind the other buffer; plays at once when started.
+    fn process_cdda_sector(&mut self, cd: &mut CdRom) {
+        let mut sector_buf = [0u8; CD_SECTOR_RAW_SIZE];
+        if !cd.read_sector(self.curr_lba, &mut sector_buf) {
+            error!("CDIC CD-DA: read_sector({}) failed, stopping", self.curr_lba);
+            self.cancel_disc_read();
+            return;
+        }
+
+        self.data_buffer ^= 0x0001;
+        self.data_buffer &= !0x0004;
+        let base = cdda_buffer_base(self.data_buffer);
+        self.ram[base..base + CDDA_SECTOR_BYTES].copy_from_slice(&sector_buf[..CDDA_SECTOR_BYTES]);
+
+        let q_base = if self.data_buffer & 1 != 0 { 0x1324 } else { 0x0924 };
+        let mut q = self.track_q_fields(cd);
+        Self::add_q_crc(&mut q);
+        for (i, &b) in q.iter().enumerate() {
+            self.ram[q_base + i * 2] = 0;
+            self.ram[q_base + i * 2 + 1] = b;
+        }
+
+        if self.cdda_playing {
+            self.audio.push_cdda(&sector_buf[..CDDA_SECTOR_BYTES]);
+            self.audio_buffer |= 0x8000;
+        }
+
+        self.x_buffer |= 0x8000;
+        self.data_buffer |= 0x4000;
+        self.update_interrupt();
+        info!("CDIC CD-DA sector ready: LBA={}, XBUF=0x{:04X}, playing={}", self.curr_lba, self.x_buffer, self.cdda_playing);
+    }
+
     fn process_sector(&mut self, cdrom: &mut Option<CdRom>) {
         info!("CDIC process_sector: LBA={}, mode={}", self.curr_lba, self.disc_mode);
         let Some(cd) = cdrom else {
             error!("CDIC process_sector: cdrom is None!");
             return;
         };
+
+        if self.disc_mode == DISC_MODE_CDDA {
+            self.process_cdda_sector(cd);
+            return;
+        }
 
         let is_toc = self.disc_mode == 4 || self.command == 0x27 || self.disc_command == 0x27;
 
@@ -995,5 +1060,73 @@ mod tests {
         assert!(!c.map_on);
         assert_eq!(c.read_reg(0x3FA), 0x0801);
         assert_eq!(c.read_reg(0x3FA), 0x0800);
+    }
+
+    const CD_SECTOR: u32 = 200_000;
+
+    fn audio_disc(tag: &str, sectors: usize) -> CdRom {
+        let dir = std::env::temp_dir().join(format!("opencdi-cdda-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bin = Vec::new();
+        for n in 0..sectors * 588 {
+            bin.extend_from_slice(&((n % 30000) as i16).to_le_bytes());
+            bin.extend_from_slice(&(-((n % 30000) as i16)).to_le_bytes());
+        }
+        std::fs::write(dir.join("a.bin"), bin).unwrap();
+        std::fs::write(dir.join("a.cue"), "FILE \"a.bin\" BINARY\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n").unwrap();
+        let cd = CdRom::open(dir.join("a.cue")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        cd
+    }
+
+    fn start_cdda(c: &mut Cdic) {
+        c.audio_channel = 0;
+        c.write_reg(0x00, 0x28);
+        c.write_reg(0x02, 0x0002);
+        c.write_reg(0x04, 0x0000);
+        c.write_reg(0x3FE, 0xC000);
+    }
+
+    #[test]
+    fn cdda_sector_lands_raw_in_the_audio_buffers() {
+        let mut c = Cdic::new();
+        let mut cd = Some(audio_disc("raw", 6));
+        start_cdda(&mut c);
+        c.step_cycles(CD_SECTOR, CD_SECTOR, &mut cd);
+        assert_ne!(c.x_buffer & 0x8000, 0);
+        assert_ne!(c.data_buffer & 0x4000, 0);
+        let base = cdda_buffer_base(c.data_buffer);
+        assert_eq!(&c.ram[base..base + 8], &[0, 0, 0, 0, 1, 0, 0xFF, 0xFF]);
+        assert_eq!(c.audio.main.len(), 0);
+    }
+
+    #[test]
+    fn cdda_plays_from_the_buffer_refreshed_last_once_started() {
+        let mut c = Cdic::new();
+        let mut cd = Some(audio_disc("play", 8));
+        start_cdda(&mut c);
+        c.step_cycles(CD_SECTOR, CD_SECTOR, &mut cd);
+        c.write_reg(0x3FA, 0x0800);
+        assert!(c.cdda_playing);
+        assert!(!c.map_on);
+        assert_eq!(c.read_reg(0x3FA) & 0x0800, 0x0800);
+        let queued = c.audio.main.len();
+        assert!(queued >= 588);
+        c.step_cycles(CD_SECTOR * 3, CD_SECTOR, &mut cd);
+        assert!(c.audio.main.len() >= queued + 3 * 588);
+        c.write_reg(0x3FA, 0x0000);
+        assert!(!c.cdda_playing);
+    }
+
+    #[test]
+    fn cdda_stops_with_the_disc_read() {
+        let mut c = Cdic::new();
+        let mut cd = Some(audio_disc("stop", 6));
+        start_cdda(&mut c);
+        c.step_cycles(CD_SECTOR, CD_SECTOR, &mut cd);
+        c.write_reg(0x3FA, 0x0800);
+        c.write_reg(0x3FE, 0x0000);
+        assert!(!c.cdda_playing);
     }
 }

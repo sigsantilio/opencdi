@@ -425,6 +425,7 @@ pub fn save_state_to_file<P: AsRef<Path>>(
     w.write_bool(bus.cdic.map_finished);
     w.write_u32(bus.cdic.map_sector_cycles);
     w.write_u16(bus.cdic.dsp_achan);
+    w.write_bool(bus.cdic.cdda_playing);
     w.write_u32(bus.cdic.cycle_accumulator);
     w.write_bool(bus.cdic.irq_pending);
     w.write_bool(bus.cdic.dma_triggered);
@@ -821,6 +822,7 @@ pub fn load_state_from_file<P: AsRef<Path>>(
     bus.cdic.map_finished = r.read_bool()?;
     bus.cdic.map_sector_cycles = r.read_u32()?;
     bus.cdic.dsp_achan = r.read_u16()?;
+    bus.cdic.cdda_playing = r.read_bool()?;
     bus.cdic.cycle_accumulator = r.read_u32()?;
     bus.cdic.irq_pending = r.read_bool()?;
     bus.cdic.dma_triggered = r.read_bool()?;
