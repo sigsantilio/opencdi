@@ -581,7 +581,10 @@ pub fn save_state_to_file<P: AsRef<Path>>(
             let _ = fs::create_dir_all(parent);
         }
     }
-    fs::write(p, &w.buf)
+    let tmp = std::path::PathBuf::from(format!("{}.tmp", p.display()));
+    fs::write(&tmp, &w.buf)?;
+    fs::rename(&tmp, p)?;
+    Ok(())
 }
 
 pub fn load_state_from_file<P: AsRef<Path>>(
