@@ -85,7 +85,7 @@ pub struct Cdic {
     pub decode_addr: u16,
     pub audio_sector_counter: u8,
     pub audio_map_counter: u8,
-    pub stopped_in_flight: bool,
+    pub buffer_in_flight: bool,
     pub map_finished: bool,
     pub audio_format_sectors: u8,
     pub audio_cycle_accumulator: u32,
@@ -126,7 +126,7 @@ impl Cdic {
             decode_addr: 0xFFFF,
             audio_sector_counter: 0,
             audio_map_counter: 0,
-            stopped_in_flight: false,
+            buffer_in_flight: false,
             map_finished: false,
             audio_format_sectors: 0,
             audio_cycle_accumulator: 0,
@@ -166,7 +166,7 @@ impl Cdic {
         self.decode_addr = 0xFFFF;
         self.audio_sector_counter = 0;
         self.audio_map_counter = 0;
-        self.stopped_in_flight = false;
+        self.buffer_in_flight = false;
         self.map_finished = false;
         self.audio_format_sectors = 0;
         self.audio_cycle_accumulator = 0;
@@ -278,7 +278,6 @@ impl Cdic {
                         }
                     }
                 } else if (val & 0x2000) == 0 {
-                    self.stopped_in_flight |= self.decoding_audio_map && self.audio_map_counter > 0;
                     self.decode_addr = 0xFFFF;
                     self.decoding_audio_map = false;
                 } else {
@@ -454,6 +453,7 @@ impl Cdic {
             self.decoding_audio_map = true;
             self.audio_format_sectors = get_sector_count_for_coding(coding);
             self.audio_map_counter = self.audio_format_sectors;
+            self.buffer_in_flight = true;
 
             let is_stereo = (coding & 0x03) == 0x01;
             let is_8bit = (coding & 0x30) == 0x10;
@@ -467,20 +467,11 @@ impl Cdic {
                 );
                 self.audio.decode_audio_map_sector(&self.ram[payload_start..payload_start + 2304], is_stereo, is_8bit, sample_rate);
             }
-
-            // Signal ABUF interrupt: alternate buffer is now free to be refilled by host
-            self.audio_buffer |= 0x8000;
-            self.update_interrupt();
         } else {
             // Buffer has finished (coding == 0xFF)
-            let was_decoding = self.decoding_audio_map;
-            trace!("CDIC AUDIO MAP END: addr=0x{:04X}, coding=0xFF, was_decoding={}", addr, was_decoding);
+            trace!("CDIC AUDIO MAP END: addr=0x{:04X}, coding=0xFF", addr);
             self.decode_addr = 0xFFFF;
             self.audio_format_sectors = 0;
-            if was_decoding {
-                self.audio_buffer |= 0x8000;
-                self.update_interrupt();
-            }
         }
     }
 
@@ -495,9 +486,9 @@ impl Cdic {
                 self.audio_map_counter -= 1;
             }
 
-            // A stopped buffer that has played out still sets ABUF bit 15.
-            if self.stopped_in_flight && self.audio_map_counter == 0 {
-                self.stopped_in_flight = false;
+            // ABUF bit 15 is set when a buffer has played, also after a stop; the next buffer starts at the same moment.
+            if self.buffer_in_flight && self.audio_map_counter == 0 {
+                self.buffer_in_flight = false;
                 self.audio_buffer |= 0x8000;
                 self.update_interrupt();
             }
@@ -891,13 +882,33 @@ mod tests {
         c.ram[0x2800 + 11] = 0x05;
         c.write_reg(0x3FA, 0x2800);
         tick(&mut c, 1);
-        assert_eq!(c.read_reg(0x3F4) & 0x8000, 0x8000);
+        assert_eq!(c.read_reg(0x3F4) & 0x8000, 0);
         c.write_reg(0x3FA, 0x0000);
         tick(&mut c, 7);
         assert_eq!(c.read_reg(0x3F4) & 0x8000, 0);
         tick(&mut c, 1);
         assert_eq!(c.read_reg(0x3F4) & 0x8000, 0x8000);
         assert!(!c.decoding_audio_map);
+    }
+
+    #[test]
+    fn abuf_comes_when_the_first_buffer_has_played_so_the_second_still_plays_after_an_ff_mark() {
+        let mut c = Cdic::new();
+        c.audio_channel = 0;
+        c.ram[0x2800 + 11] = 0x05;
+        c.ram[0x3200 + 11] = 0x05;
+        c.write_reg(0x3FA, 0x2800);
+        tick(&mut c, 8);
+        assert_eq!(c.audio_buffer & 0x8000, 0);
+        tick(&mut c, 1);
+        assert_eq!(c.read_reg(0x3F4) & 0x8000, 0x8000);
+        c.ram[0x2800 + 11] = 0xFF;
+        c.ram[0x3200 + 11] = 0xFF;
+        assert_eq!(c.audio.total_sectors_decoded, 2);
+        tick(&mut c, 8);
+        assert_eq!(c.read_reg(0x3F4) & 0x8000, 0x8000);
+        assert_eq!(c.audio.total_sectors_decoded, 2);
+        assert_eq!(c.read_reg(0x3FA) & 0x0800, 0);
     }
 
     #[test]
