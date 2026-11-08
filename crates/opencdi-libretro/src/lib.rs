@@ -18,7 +18,7 @@ pub const BIOS_NAMES: &[&str] = &["cdi220b.rom", "cdi200.rom", "cdimono1.zip", "
 // Cartridge ROM, looked up the same way; the cdimono1.zip set carries vmpega.rom next to the system ROMs.
 pub const DVC_NAMES: &[&str] = &["vmpega.rom", "cdimono1.zip", "cdibios.zip"];
 const MESSAGE_FRAMES: c_uint = 360;
-const AUDIO_RATE: u32 = 37800;
+const AUDIO_RATE: u32 = opencdi::audio::OUT_RATE;
 // Room above the size measured at the first serialize_size call, for buffers that grow later (DVC decoder, FIFOs).
 const STATE_HEADROOM: usize = 4 << 20;
 const STATE_ALIGN: usize = 64 << 10;
@@ -75,7 +75,6 @@ struct Core {
     spec: Option<LoadSpec>,
     temp_disc: Option<PathBuf>,
     mix: Vec<(f32, f32)>,
-    sfx: Vec<(f32, f32)>,
     pcm: Vec<i16>,
     input: Input,
     uart_line: Vec<u8>,
@@ -96,7 +95,6 @@ static CORE: Mutex<Core> = Mutex::new(Core {
     spec: None,
     temp_disc: None,
     mix: Vec::new(),
-    sfx: Vec::new(),
     uart_line: Vec::new(),
     pcm: Vec::new(),
     input: Input::new(),
@@ -482,20 +480,10 @@ pub extern "C" fn retro_reset() {
 }
 
 fn send_audio(core: &mut Core, batch: retro_audio_sample_batch_t) {
-    let Core { machine, mix, sfx, pcm, .. } = core;
+    let Core { machine, mix, pcm, .. } = core;
     let Some(m) = machine.as_mut() else { return };
-    let audio = &m.bus.cdic.audio;
     mix.clear();
-    sfx.clear();
-    mix.extend(lock(&audio.sample_queue).drain(..));
-    sfx.extend(lock(&audio.sfx_queue).drain(..));
-    if mix.len() < sfx.len() {
-        mix.resize(sfx.len(), (0.0, 0.0));
-    }
-    for (a, b) in mix.iter_mut().zip(sfx.iter()) {
-        a.0 += b.0;
-        a.1 += b.1;
-    }
+    m.drain_audio(mix);
     let Some(f) = batch else { return };
     pcm.clear();
     let to_i16 = |x: f32| (x.clamp(-1.0, 1.0) * 32767.0) as i16;

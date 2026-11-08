@@ -234,7 +234,7 @@ impl Replay {
     }
 }
 
-// Harness autoplay decision from plane A through retro_get_memory_data, the same check the harness uses.
+// Harness autoplay decision from plane A through retro_get_memory_data; see doc/handover/status-and-todo.md for the launch substitute.
 #[derive(Clone)]
 struct Memory {
     ready: u32,

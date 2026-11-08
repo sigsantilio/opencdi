@@ -100,7 +100,7 @@ impl SccTimer {
 
     pub fn read_byte(&self, reg: u32) -> u8 {
         match reg {
-            0x1001 => self.lir,
+            0x1001 => self.lir & 0x77, // pending bits read as 0
             0x2020 => self.tsr,
             0x2021 => self.tcr,
             0x2022 => (self.reload >> 8) as u8,
@@ -203,12 +203,15 @@ impl SccTimer {
         }
     }
 
+    /// Level of a pending INT1 request; 0 when none is pending or LIR gives level 0.
     pub fn int1_level(&self) -> u8 {
-        if (self.lir & 0x80) != 0 {
-            let lvl = (self.lir >> 4) & 7;
-            if lvl != 0 { lvl } else { 5 }
-        } else {
-            0
+        if (self.lir & 0x80) != 0 { (self.lir >> 4) & 7 } else { 0 }
+    }
+
+    /// Latches an INT1 request; at LIR level 0 the input is off and the request is dropped.
+    pub fn raise_int1(&mut self) {
+        if (self.lir & 0x70) != 0 {
+            self.lir |= 0x80;
         }
     }
 
@@ -222,8 +225,8 @@ impl SccTimer {
 
     pub fn int1_w(&mut self, state: bool) {
         if self.int1_line != state {
-            if state && (self.lir & 0x80) == 0 {
-                self.lir |= 0x80;
+            if state {
+                self.raise_int1();
             }
             self.int1_line = state;
         }
@@ -233,3 +236,22 @@ impl SccTimer {
 opencdi::impl_state!(SccTimer {
     tsr, tcr, reload, timer0, timer1, timer2, picr1, picr2, lir, int1_line, timer_irq, cycle_accum,
 } skip {});
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lir_level_zero_drops_int1_and_pending_reads_zero() {
+        let mut t = SccTimer::new();
+        t.int1_w(true);
+        t.int1_w(false);
+        assert_eq!(t.int1_level(), 0);
+        t.write_byte(0x1001, 0xD4);
+        assert_eq!((t.int1_level(), t.read_byte(0x1001)), (0, 0x54));
+        t.int1_w(true);
+        assert_eq!((t.int1_level(), t.read_byte(0x1001)), (5, 0x54));
+        t.write_byte(0x1001, 0x00);
+        assert_eq!(t.int1_level(), 0);
+    }
+}

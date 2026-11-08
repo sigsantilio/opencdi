@@ -4,7 +4,7 @@ use std::fmt;
 
 pub const MAGIC: [u8; 8] = *b"OPENCDI\x1a";
 // Bump whenever a saved field is added, removed, reordered or changes type.
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 pub const HEADER_LEN: usize = 64;
 const CPU_BLOB_MAX: u64 = 1 << 20;
 
@@ -466,7 +466,7 @@ mod tests {
         assert_eq!(n.load_state(&bad), Err(StateError::BadMagic));
         assert_eq!(n.load_state(&a[..a.len() - 1]), Err(StateError::TooShort));
         assert_eq!(n.load_state(&a[..10]), Err(StateError::TooShort));
-        n.bus.dvc.rom = Some(vec![0x5A; 256 * 1024].into_boxed_slice().try_into().unwrap());
+        n.bus.dvc.load_rom_bytes(&[0x5A; 1024]);
         assert_eq!(n.load_state(&a), Err(StateError::DvcMismatch));
         let mut c = Vec::new();
         n.save_state(b"fe", &mut c);
