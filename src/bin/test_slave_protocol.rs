@@ -12,12 +12,16 @@ mod dma;
 mod dvc;
 #[path = "../mcd212.rs"]
 mod mcd212;
+#[path = "../mono4/mod.rs"]
+mod mono4;
 #[path = "../nvram.rs"]
 mod nvram;
 #[path = "../scc_timer.rs"]
 mod scc_timer;
 #[path = "../slave.rs"]
 mod slave;
+#[path = "../tap.rs"]
+mod tap;
 
 use crate::bus::CdiBus;
 

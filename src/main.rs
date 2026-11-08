@@ -493,20 +493,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("File NVRAM {:?} non presente: verrà creato automaticamente al salvataggio", resolved_nvram_path);
         }
     }
-        if let Err(e) = m.bus.nvram.load_from_file(&resolved_nvram_path) {
-            log::warn!("Impossibile caricare NVRAM da {:?}: {:?}", resolved_nvram_path, e);
-        } else {
-            info!("NVRAM caricata da {:?}", resolved_nvram_path);
-        }
-    } else if nvram_arg.is_some() {
-        if let Err(e) = m.bus.nvram.save_to_file() {
-            log::warn!("Impossibile creare file iniziale NVRAM in {:?}: {:?}", resolved_nvram_path, e);
-        } else {
-            info!("Inizializzato nuovo file NVRAM in {:?}", resolved_nvram_path);
-        }
-    } else {
-        info!("File NVRAM {:?} non presente: verrà creato automaticamente al salvataggio", resolved_nvram_path);
-    }
 
     // 2b. Load DVC ROM (Digital Video Cartridge) by default if present
     let dvc_disabled = has_flag("--no-dvc") || has_flag("--nodvc");
@@ -1330,8 +1316,6 @@ impl App {
                     send_pointer(&mut m.bus, 575, 335, 0);
                 }
             }
-                }
-            }
             if ((m.cpu.pc >= 0x00010000 && m.cpu.pc < 0x00300000) || (m.cpu.pc >= 0x00D00000 && m.cpu.pc < 0x00E00000)) && self.frame_count > 250 {
                 info!("Applicazione disco in esecuzione in RAM (PC=0x{:06X}), controllo passato all'utente.", m.cpu.pc);
                 self.disc_launched = true;
@@ -1541,13 +1525,7 @@ impl App {
                     }
                     // The 490 reports relative moves, so a direction held against the screen edge keeps moving
                     if let Some(m4) = m.bus.mono4.as_deref_mut() {
-                        m4.ikat.push_pointer(self.rel_over.0.round() as i32, self.rel_over.1.round() as i32);
-                    }
-                    self.prev_key_btn = combined_btn;
-                    }
-                    let combined_btn = key_btn | mouse_btn;
-                    if moved || combined_btn != self.prev_key_btn {
-                        m.bus.slave.update_mouse(self.pad_x, self.pad_y, combined_btn);
+                        m4.ikat.push_pointer(over.0.round() as i32, over.1.round() as i32);
                     }
                     self.prev_key_btn = combined_btn;
                 }
@@ -1558,7 +1536,7 @@ impl App {
                     self.pad_y_f = mouse_y as f32;
                     send_pointer(&mut m.bus, self.pad_x, self.pad_y, mouse_btn | key_btn);
                     if let Some(m4) = m.bus.mono4.as_deref_mut() {
-                        m4.ikat.push_pointer(rel_over.0 as i32, rel_over.1 as i32);
+                        m4.ikat.push_pointer(self.rel_over.0 as i32, self.rel_over.1 as i32);
                     }
                 }
             }
