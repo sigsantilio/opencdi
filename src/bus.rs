@@ -231,7 +231,7 @@ impl CdiBus {
     }
 
     pub fn tick_cdic(&mut self, cycles: u32) {
-        self.cdic.step_cycles(cycles, &mut self.cdrom);
+        self.cdic.step_cycles(cycles, self.mcd212.video_mode.cycles_per_sector(), &mut self.cdrom);
     }
 
     #[inline]
@@ -273,6 +273,7 @@ impl CdiBus {
 
     pub fn tick_dvc(&mut self, cycles: u32) {
         if self.dvc.is_fitted() {
+            self.dvc.cpu_hz = u64::from(self.mcd212.video_mode.cpu_clock_hz());
             self.dvc.tick(cycles);
             if self.dvc_dma_requested() {
                 self.perform_dvc_dma();
@@ -309,7 +310,7 @@ impl CdiBus {
             }
         }
         let frame_done = self.mcd212.tick_scanline(line);
-        let mcd_int = (self.mcd212.csrr[1] & (crate::mcd212::CSR2R_IT1 | crate::mcd212::CSR2R_IT2)) != 0;
+        let mcd_int = self.mcd212.int_line();
         self.scc_timer.int1_w(mcd_int);
         if line == 0 && self.dvc.is_fitted() {
             self.dvc.vsync_hz = if self.mcd212.video_mode == crate::mcd212::VideoMode::Pal { 50.0 } else { 60.0 };
@@ -521,7 +522,7 @@ impl AddressBus for CdiBus {
                 let offset = addr - 0x4FFFE0;
                 let reg_base = offset & !1;
                 let word = self.mcd212.read_reg(reg_base);
-                let mcd_int = (self.mcd212.csrr[1] & (crate::mcd212::CSR2R_IT1 | crate::mcd212::CSR2R_IT2)) != 0;
+                let mcd_int = self.mcd212.int_line();
                 self.scc_timer.int1_w(mcd_int);
                 if (addr & 1) == 0 { (word >> 8) as u8 } else { word as u8 }
             }
@@ -636,7 +637,7 @@ impl AddressBus for CdiBus {
             0x4FFFE0..=0x4FFFFF => {
                 let offset = (addr - 0x4FFFE0) & !1;
                 let word = self.mcd212.read_reg(offset);
-                let mcd_int = (self.mcd212.csrr[1] & (crate::mcd212::CSR2R_IT1 | crate::mcd212::CSR2R_IT2)) != 0;
+                let mcd_int = self.mcd212.int_line();
                 self.scc_timer.int1_w(mcd_int);
                 word
             }
@@ -725,6 +726,13 @@ impl AddressBus for CdiBus {
                 0x2020..=0x2029 | 0x2045 | 0x2047 => self.scc_timer.write_byte(reg, value),
                 0x4000..=0x406F => {
                     let offset = (reg - 0x4000) & !1;
+                    // The error register is read-only, and a status byte write clears only its own bits.
+                    if offset % 0x40 == 0 {
+                        if (reg & 1) == 0 {
+                            self.dma.write_reg(offset, (value as u16) << 8);
+                        }
+                        return;
+                    }
                     let cur = self.dma.read_reg(offset);
                     let new_val = if (reg & 1) == 0 {
                         (cur & 0x00FF) | ((value as u16) << 8)
@@ -973,9 +981,8 @@ impl AddressBus for CdiBus {
 
     fn interrupt_acknowledge(&mut self, level: u8) -> u32 {
         let vec = (|| {
-            let int1_lvl = (self.scc_timer.lir >> 4) & 7;
-            let int1_priority = if int1_lvl != 0 { int1_lvl } else { 5 };
-            if (self.scc_timer.lir & 0x80) != 0 && level == int1_priority {
+            let int1_lvl = self.scc_timer.int1_level();
+            if int1_lvl != 0 && level == int1_lvl {
                 self.scc_timer.lir &= 0x7F;
                 self.mcd212.vblank_irq = false;
                 return 0x38 + level as u32; // SCC68070 Vector 0x3D (Vector 61)
@@ -1050,5 +1057,16 @@ mod tests {
         assert_eq!(bus.read_long(0x5172), 2);
         assert_eq!(bus.read_byte(0x405E48), 0x12);
         assert!(bus.wait_cycles > 0 && bus.current_line_cycle > 100 && bus.trace_setup);
+    }
+
+    #[test]
+    fn dma_error_byte_is_read_only_and_status_byte_clears_only_its_bits() {
+        let mut bus = CdiBus::new();
+        bus.dma.channels[0].channel_status = 0x90;
+        bus.dma.channels[0].channel_error = 0x02;
+        bus.write_byte(0x8000_4001, 0xFF);
+        assert_eq!((bus.dma.channels[0].channel_status, bus.dma.channels[0].channel_error), (0x90, 0x02));
+        bus.write_byte(0x8000_4000, 0x10);
+        assert_eq!(bus.dma.channels[0].channel_status, 0x80);
     }
 }

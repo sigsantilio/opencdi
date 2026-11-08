@@ -136,7 +136,7 @@ fn test_game(game_name: &str, frames: usize) {
 
             cycle_debt = (line_cycles - cyc_per_line as i32).clamp(0, 100);
 
-            // Clock real-time peripherals (CDIC, SCC Timer, Slave MCU) strictly at 15.5 MHz master clock
+            // Clock real-time peripherals (CDIC, SCC Timer, Slave MCU) on the CPU clock
             bus.tick_cdic(cyc_per_line);
             bus.tick_timer(cyc_per_line);
         }

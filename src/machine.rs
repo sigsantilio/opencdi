@@ -62,7 +62,7 @@ impl Machine {
             bus.tick_scanline(line);
 
             if bus.mcd212.vblank_irq {
-                bus.scc_timer.lir |= 0x80;
+                bus.scc_timer.raise_int1();
                 bus.mcd212.vblank_irq = false;
             }
             cpu.set_irq(highest_ipl(bus));
@@ -131,12 +131,7 @@ impl Default for Machine {
 }
 
 pub fn highest_ipl(bus: &mut CdiBus) -> u8 {
-    let int1_lvl = if (bus.scc_timer.lir & 0x80) != 0 {
-        let lvl = (bus.scc_timer.lir >> 4) & 7;
-        if lvl != 0 { lvl } else { 5 }
-    } else {
-        0
-    };
+    let int1_lvl = bus.scc_timer.int1_level();
     let timer_lvl = if bus.scc_timer.timer_irq { bus.scc_timer.picr1 & 7 } else { 0 };
     let cdic_lvl = if bus.in4_pending() { 4 } else { 0 };
     let slave_lvl = if bus.slave.irq_pending { 2 } else { 0 };
