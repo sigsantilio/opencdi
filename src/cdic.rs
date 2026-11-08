@@ -85,6 +85,7 @@ pub struct Cdic {
     pub decode_addr: u16,
     pub audio_sector_counter: u8,
     pub audio_map_counter: u8,
+    pub stopped_in_flight: bool,
     pub audio_format_sectors: u8,
     pub audio_cycle_accumulator: u32,
 
@@ -124,6 +125,7 @@ impl Cdic {
             decode_addr: 0xFFFF,
             audio_sector_counter: 0,
             audio_map_counter: 0,
+            stopped_in_flight: false,
             audio_format_sectors: 0,
             audio_cycle_accumulator: 0,
 
@@ -162,6 +164,7 @@ impl Cdic {
         self.decode_addr = 0xFFFF;
         self.audio_sector_counter = 0;
         self.audio_map_counter = 0;
+        self.stopped_in_flight = false;
         self.audio_format_sectors = 0;
         self.audio_cycle_accumulator = 0;
 
@@ -249,6 +252,7 @@ impl Cdic {
                     val, self.decoding_audio_map, self.decode_addr
                 );
                 if (val & 0x2000) == 0 {
+                    self.stopped_in_flight |= self.decoding_audio_map && self.audio_map_counter > 0;
                     self.decode_addr = 0xFFFF;
                     self.decoding_audio_map = false;
                 } else {
@@ -456,6 +460,13 @@ impl Cdic {
 
             if self.audio_map_counter > 0 {
                 self.audio_map_counter -= 1;
+            }
+
+            // A stopped buffer that has played out still sets ABUF bit 15.
+            if self.stopped_in_flight && self.audio_map_counter == 0 {
+                self.stopped_in_flight = false;
+                self.audio_buffer |= 0x8000;
+                self.update_interrupt();
             }
 
             if self.decoding_audio_map && self.audio_map_counter == 0 {
@@ -832,5 +843,27 @@ mod tests {
         assert!(c.is_mode2_audio_selected(&buf));
         buf[21] = 17;
         assert!(!c.is_mode2_audio_selected(&buf));
+    }
+
+    fn tick(c: &mut Cdic, n: u32) {
+        let mut cd = None;
+        for _ in 0..n {
+            c.step_cycles(1000, 1000, &mut cd);
+        }
+    }
+
+    #[test]
+    fn a_stopped_buffer_sets_abuf_when_it_has_played_out() {
+        let mut c = Cdic::new();
+        c.ram[0x2800 + 11] = 0x05;
+        c.write_reg(0x3FA, 0x2800);
+        tick(&mut c, 1);
+        assert_eq!(c.read_reg(0x3F4) & 0x8000, 0x8000);
+        c.write_reg(0x3FA, 0x0000);
+        tick(&mut c, 7);
+        assert_eq!(c.read_reg(0x3F4) & 0x8000, 0);
+        tick(&mut c, 1);
+        assert_eq!(c.read_reg(0x3F4) & 0x8000, 0x8000);
+        assert!(!c.decoding_audio_map);
     }
 }
