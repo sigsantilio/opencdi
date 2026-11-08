@@ -5,6 +5,7 @@
 *.txt
 !Cargo.lock
 *.exe
+*.dll
 /builds
 /screenshots_hotel_mario
 /traces
