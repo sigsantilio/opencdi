@@ -1809,3 +1809,24 @@ mod edge_mc_tests {
         assert_eq!(d[last], s[last]);
     }
 }
+
+// Savestate: the decoder is created on demand, so a state may need one before loading into it.
+impl Default for Video {
+    fn default() -> Self {
+        Video::new(Vec::new())
+    }
+}
+
+opencdi::impl_state!(Plane { width, height, data } skip {});
+opencdi::impl_state!(Frame { width, height, y, cr, cb } skip {});
+opencdi::impl_state!(Motion { full_px, is_set, r_size, h, v } skip {});
+
+opencdi::impl_state!(Video {
+    buffer, framerate, pixel_aspect_ratio, time, last_frame_time, frames_decoded,
+    width, height, mb_width, mb_height, mb_size, luma_width, luma_height, chroma_width, chroma_height,
+    start_code, picture_type, motion_forward, motion_backward, has_sequence_header,
+    quantizer_scale, slice_begin, macroblock_address, mb_row, mb_col, macroblock_type, macroblock_intra,
+    dc_predictor, frames, cur, fwd, bwd, block_data, intra_quant_matrix, non_intra_quant_matrix,
+    has_reference_frame, assume_no_b_frames, sequence_end_seen, sequence_header_seen,
+    gop_header_seen, last_gop_timecode, prpa,
+} skip {});

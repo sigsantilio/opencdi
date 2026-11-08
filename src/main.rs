@@ -22,6 +22,7 @@ use opencdi::bios;
 use opencdi::bus::BoardKind;
 use opencdi::machine::Machine;
 use opencdi::mcd212::{SCREEN_WIDTH, SCREEN_HEIGHT, VideoMode};
+use opencdi::savestate::{Reader, State, StateError};
 
 #[cfg(target_os = "windows")]
 #[link(name = "winmm")]
@@ -105,17 +106,6 @@ Usage: opencdi [options] [disc image (cue, chd, iso, bin)]
   --help, -h               Show this text
 ";
 
-
-fn savestate_path_for(game_name: &str, slot: usize) -> PathBuf {
-    let safe_name: String = game_name
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' || c == '(' || c == ')' { c } else { '_' })
-        .collect();
-    let trimmed = safe_name.trim();
-    let base = if trimmed.is_empty() { "cdi_bios" } else { trimmed };
-    let _ = std::fs::create_dir_all("savestates");
-    PathBuf::from("savestates").join(format!("{}_slot{}.st", base, slot))
-}
 
 fn default_nvram490_save_path() -> PathBuf {
     if Path::new("bios").is_dir() {
@@ -438,6 +428,40 @@ fn file_stem(game: &str) -> String {
     }
     let name = name.trim_matches('_');
     if name.is_empty() { "opencdi".to_string() } else { name.to_string() }
+}
+
+// Savestates go into states/ next to the binary
+fn states_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("states")))
+        .unwrap_or_else(|| PathBuf::from("states"))
+}
+
+// RetroArch naming: slot 0 is <name>.state, slot N is <name>.stateN
+fn state_path(dir: &Path, game: &str, slot: u32) -> PathBuf {
+    let name: String = game.chars().map(|c| if c.is_alphanumeric() || " ()-_.,'&!".contains(c) { c } else { '_' }).collect();
+    let name = if name.is_empty() { "opencdi".to_string() } else { name };
+    if slot == 0 { dir.join(format!("{}.state", name)) } else { dir.join(format!("{}.state{}", name, slot)) }
+}
+
+// Written to a temporary file first so a crash never leaves a half-written slot
+fn write_state_file(path: &Path, m: &Machine, frontend: &[u8]) -> std::io::Result<usize> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut buf = Vec::new();
+    m.save_state(frontend, &mut buf);
+    let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
+    std::fs::write(&tmp, &buf)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(buf.len())
+}
+
+// Returns the frontend bytes; the machine is unchanged on any error
+fn read_state_file(path: &Path, m: &mut Machine) -> Result<Vec<u8>, String> {
+    let data = std::fs::read(path).map_err(|e| e.to_string())?;
+    m.load_state(&data).map(|fe| fe.to_vec()).map_err(|e: StateError| e.to_string())
 }
 
 // <game>_<frame>.png in dir, created on demand
@@ -788,6 +812,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         paused: false,
         fast_forward: false,
         last_present: now,
+        state_slot: 0,
         occluded: false,
         grab_applied: None,
         frame_count: 0,
@@ -814,7 +839,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         measured_cd_rate: 0.0,
     };
 
-    info!("Emulation loop started. Shortcuts: [F11]/[Alt+Enter] Fullscreen, [F5]/[H] Reset, [P] Pause, [Space] hold Fast-forward, [F8]/[F12] Screenshot (PNG), [M] Mute, [+]/[-] Volume, [L] Video levels studio/full, [Ctrl+I] Insert Disc, [Ctrl+O] Open & Reset, [Middle Click] Capture/Release Mouse, [Esc] Quit");
+    info!("Emulation loop started. Shortcuts: [F11]/[Alt+Enter] Fullscreen, [F5]/[H] Reset, [P] Pause, [Space] hold Fast-forward, [F8]/[F12] Screenshot (PNG), [F2]/[F4] Save/Load state, [F6]/[F7] State slot, [M] Mute, [+]/[-] Volume, [L] Video levels studio/full, [Ctrl+I] Insert Disc, [Ctrl+O] Open & Reset, [Ctrl+B] Select BIOS, [Middle Click] Capture/Release Mouse, [Esc] Quit");
 
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut app)?;
@@ -948,6 +973,7 @@ struct App {
     paused: bool,
     fast_forward: bool,
     last_present: Instant,
+    state_slot: u32,
     grab_applied: Option<bool>,
     frame_count: u64,
     frames_run: u64,
@@ -1181,14 +1207,61 @@ impl App {
         [b.up, b.down, b.left, b.right, b.btn1, b.btn2].contains(&k)
     }
 
+    // Host-side input and autoplay state saved alongside the machine so a load does not re-run autoplay clicks
+    fn frontend_state(&self) -> Vec<u8> {
+        let mut w = Vec::new();
+        (self.frame_count, self.disc_launched, self.shell_ready_count).save(&mut w);
+        (self.pad_x, self.pad_y, self.prev_key_btn).save(&mut w);
+        (self.pad_x_f, self.pad_y_f).save(&mut w);
+        w
+    }
+
+    fn set_frontend_state(&mut self, data: &[u8]) -> Result<(), StateError> {
+        let mut r = Reader::new(data);
+        let mut a = (self.frame_count, self.disc_launched, self.shell_ready_count);
+        let mut b = (self.pad_x, self.pad_y, self.prev_key_btn);
+        let mut c = (self.pad_x_f, self.pad_y_f);
+        a.load(&mut r)?;
+        b.load(&mut r)?;
+        c.load(&mut r)?;
+        (self.frame_count, self.disc_launched, self.shell_ready_count) = a;
+        (self.pad_x, self.pad_y, self.prev_key_btn) = b;
+        (self.pad_x_f, self.pad_y_f) = c;
+        Ok(())
+    }
+
+    fn state_file(&self) -> PathBuf {
+        state_path(&states_dir(), &self.current_game_name, self.state_slot)
+    }
+
+    fn save_state(&mut self) {
+        let path = self.state_file();
+        match write_state_file(&path, &self.m, &self.frontend_state()) {
+            Ok(n) => info!("State slot {} saved to {:?} ({} bytes)", self.state_slot, path, n),
+            Err(e) => error!("State slot {} not saved to {:?}: {}", self.state_slot, path, e),
+        }
+    }
+
+    fn load_state(&mut self) {
+        let path = self.state_file();
+        match read_state_file(&path, &mut self.m) {
+            Ok(fe) => {
+                if let Err(e) = self.set_frontend_state(&fe) {
+                    error!("State slot {}: frontend section unreadable ({}); autoplay state kept", self.state_slot, e);
+                }
+                self.reset_telemetry();
+                info!("State slot {} loaded from {:?}", self.state_slot, path);
+            }
+            Err(e) => error!("State slot {} not loaded from {:?}: {}", self.state_slot, path, e),
+        }
+    }
+
     fn on_key_pressed(&mut self, el: &ActiveEventLoop, code: Key) {
         let ctrl = self.mods.control_key();
         let alt = self.mods.alt_key();
         match code {
             Key::Escape => el.exit(),
             Key::F1 => push_action(GuiAction::OpenFeedback),
-            Key::F6 => push_action(GuiAction::QuickSaveState),
-            Key::F7 => push_action(GuiAction::QuickLoadState),
             Key::F9 => {
                 let next_mode = match self.input_device_mode {
                     InputDeviceMode::Gamepad => InputDeviceMode::Mouse,
@@ -1210,6 +1283,13 @@ impl App {
             Key::F11 => self.toggle_fullscreen(),
             Key::Enter | Key::NumpadEnter if alt => self.toggle_fullscreen(),
             Key::F8 | Key::F12 => self.take_screenshot(),
+            Key::F2 => self.save_state(),
+            Key::F4 => self.load_state(),
+            Key::F6 | Key::F7 => {
+                self.state_slot = if code == Key::F6 { self.state_slot.saturating_sub(1) } else { (self.state_slot + 1).min(999) };
+                info!("State slot: {} ({:?})", self.state_slot, self.state_file());
+                self.refresh_title();
+            }
             Key::KeyL if !ctrl && !self.bound(code) => {
                 let studio = !opencdi::mcd212::studio_levels();
                 opencdi::mcd212::set_studio_levels(studio);
@@ -1438,43 +1518,17 @@ impl App {
                     #[cfg(target_os = "windows")]
                     gui::post_menu_command(self.hwnd(), gui::ID_HELP_ABOUT);
                 }
-                GuiAction::QuickSaveState => {
-                    let st_path = savestate_path_for(&self.current_game_name, 1);
-                    match opencdi::savestate::save_state_to_file(&st_path, &self.m.cpu, &self.m.bus, self.disc_launched, self.shell_ready_count, self.pad_x, self.pad_y) {
-                        Ok(_) => info!("Quick Save State (Slot 1) salvato con successo: {:?}", st_path),
-                        Err(e) => error!("Errore salvataggio Quick Save State (Slot 1): {:?}", e),
+                GuiAction::QuickSaveState | GuiAction::SaveState(_) | GuiAction::QuickLoadState | GuiAction::LoadState(_) => {
+                    self.state_slot = match action {
+                        GuiAction::SaveState(slot) | GuiAction::LoadState(slot) => slot as u32,
+                        _ => 1,
+                    };
+                    if matches!(action, GuiAction::QuickSaveState | GuiAction::SaveState(_)) {
+                        self.save_state();
+                    } else {
+                        self.load_state();
                     }
-                }
-                GuiAction::QuickLoadState => {
-                    let st_path = savestate_path_for(&self.current_game_name, 1);
-                    match opencdi::savestate::load_state_from_file(&st_path, &mut self.m.cpu, &mut self.m.bus, &mut self.disc_launched, &mut self.shell_ready_count, &mut self.pad_x, &mut self.pad_y) {
-                        Ok(_) => {
-                            self.pad_x_f = self.pad_x as f32;
-                            self.pad_y_f = self.pad_y as f32;
-                            self.reset_telemetry();
-                            info!("Quick Load State (Slot 1) caricato con successo: {:?}", st_path);
-                        }
-                        Err(e) => error!("Errore caricamento Quick Load State (Slot 1): {:?}", e),
-                    }
-                }
-                GuiAction::SaveState(slot) => {
-                    let st_path = savestate_path_for(&self.current_game_name, slot);
-                    match opencdi::savestate::save_state_to_file(&st_path, &self.m.cpu, &self.m.bus, self.disc_launched, self.shell_ready_count, self.pad_x, self.pad_y) {
-                        Ok(_) => info!("Save State (Slot {}) salvato con successo: {:?}", slot, st_path),
-                        Err(e) => error!("Errore salvataggio Save State (Slot {}): {:?}", slot, e),
-                    }
-                }
-                GuiAction::LoadState(slot) => {
-                    let st_path = savestate_path_for(&self.current_game_name, slot);
-                    match opencdi::savestate::load_state_from_file(&st_path, &mut self.m.cpu, &mut self.m.bus, &mut self.disc_launched, &mut self.shell_ready_count, &mut self.pad_x, &mut self.pad_y) {
-                        Ok(_) => {
-                            self.pad_x_f = self.pad_x as f32;
-                            self.pad_y_f = self.pad_y as f32;
-                            self.reset_telemetry();
-                            info!("Load State (Slot {}) caricato con successo: {:?}", slot, st_path);
-                        }
-                        Err(e) => error!("Errore caricamento Load State (Slot {}): {:?}", slot, e),
-                    }
+                    self.refresh_title();
                 }
                 GuiAction::ClearNvram => {
                     if let Some(m4) = self.m.bus.mono4.as_deref_mut() {
@@ -1895,8 +1949,8 @@ impl App {
         };
         if let Some(window) = &self.window {
             window.set_title(&format!(
-                "OpenCDi – {} | {} | CPU: {:.2} MIPS | CD: {} | Render: {} | WaitStates: {}",
-                self.current_game_name, speed, self.measured_mips, cd_str, render_str, wait_status
+                "OpenCDi – {} | {} | CPU: {:.2} MIPS | CD: {} | Render: {} | WaitStates: {} | Slot: {}",
+                self.current_game_name, speed, self.measured_mips, cd_str, render_str, wait_status, self.state_slot
             ));
         }
     }
@@ -1912,7 +1966,7 @@ impl App {
             self.windowed = None;
         }
         if self.paused {
-            // Keep the title live (disc, wait states) at about two updates a second
+            // Keep the title live (disc, slot, wait states) at about two updates a second
             self.paused_ticks += 1;
             if self.paused_ticks % 25 == 0 {
                 self.refresh_title();
@@ -2289,5 +2343,24 @@ mod tests {
         assert_eq!((info.width, info.height), (SCREEN_WIDTH as u32, SCREEN_HEIGHT as u32));
         assert_eq!(&buf[..3], &[0xFF, 0x80, 0x40]);
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn state_file_round_trip_and_names() {
+        let dir = std::env::temp_dir().join(format!("opencdi-state-test-{}", std::process::id()));
+        assert_eq!(state_path(&dir, "Hotel Mario (Europe)", 0), dir.join("Hotel Mario (Europe).state"));
+        assert_eq!(state_path(&dir, "a/b", 3), dir.join("a_b.state3"));
+        let mut m = Machine::new();
+        m.bus.sys_ram[7] = 0x5A;
+        let p = state_path(&dir, "test", 1);
+        write_state_file(&p, &m, b"front").unwrap();
+        let mut n = Machine::new();
+        assert_eq!(read_state_file(&p, &mut n).unwrap(), b"front");
+        assert_eq!(n.bus.sys_ram[7], 0x5A);
+        n.bus.rom[0] = 9;
+        assert!(read_state_file(&p, &mut n).is_err());
+        assert!(read_state_file(&state_path(&dir, "missing", 0), &mut n).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     }
 }

@@ -460,3 +460,15 @@ impl SlaveHle {
         self.prepare_readback(0, &[b0, b1, b2, b3], 0xF7, true);
     }
 }
+
+opencdi::impl_state!(SlaveChannel {
+    out_buf, out_count, out_index, out_cmd, in_buf, in_count, in_index, pending_buf, pending_count, pending_cmd,
+} skip {});
+
+opencdi::impl_state!(SlaveHle {
+    channels, attenuation, device_mouse_x, device_mouse_y, device_mouse_updated, mouse_btn, center_x, center_y,
+    input_mouse_x, input_mouse_y, input_mouse_btn,
+    irq_pending, has_disc, disc_state, disc_timer, xbus_interrupt_enable, video_mode, stream_counter, reset_request,
+} skip {
+    debug_log,
+});

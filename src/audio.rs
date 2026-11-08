@@ -685,117 +685,44 @@ impl HostAudioOutput {
     }
 }
 
-// Savestate blob of the mixer: decoder history, resamplers, stream queues and the output clock.
-struct Blob<'a>(&'a [u8]);
+opencdi::impl_state!(ChannelState { s0, s1 } skip {});
+opencdi::impl_state!(OutputClock { rem } skip {});
+opencdi::impl_state!(Resampler { rate, num, den, pos, hist } skip {});
 
-impl Blob<'_> {
-    fn take<const N: usize>(&mut self) -> Option<[u8; N]> {
-        let (head, rest) = self.0.split_at_checked(N)?;
-        self.0 = rest;
-        head.try_into().ok()
-    }
-    fn u32(&mut self) -> Option<u32> {
-        self.take::<4>().map(u32::from_le_bytes)
-    }
-    fn u64(&mut self) -> Option<u64> {
-        self.take::<8>().map(u64::from_le_bytes)
-    }
-    fn i16(&mut self) -> Option<i16> {
-        self.take::<2>().map(i16::from_le_bytes)
-    }
-    fn f32(&mut self) -> Option<f32> {
-        self.u32().map(f32::from_bits)
-    }
-    fn frame(&mut self) -> Option<Frame> {
-        Some((self.f32()?, self.f32()?))
-    }
-    fn frames(&mut self) -> Option<Vec<Frame>> {
-        let n = self.u32()? as usize;
-        if n > self.0.len() / 8 {
-            return None;
-        }
-        (0..n).map(|_| self.frame()).collect()
-    }
-}
+opencdi::impl_state!(Stream { fifo, primed } skip { warned, restarts, warnings, frames_in });
 
-fn put_frame(w: &mut Vec<u8>, f: Frame) {
-    w.extend_from_slice(&f.0.to_bits().to_le_bytes());
-    w.extend_from_slice(&f.1.to_bits().to_le_bytes());
-}
-
-fn put_frames<'a>(w: &mut Vec<u8>, n: usize, frames: impl Iterator<Item = &'a Frame>) {
-    w.extend_from_slice(&(n as u32).to_le_bytes());
-    for &f in frames {
-        put_frame(w, f);
-    }
-}
-
-impl Resampler {
+impl opencdi::savestate::State for CdiAudio {
     fn save(&self, w: &mut Vec<u8>) {
-        for v in [self.rate, self.num, self.den, self.pos] {
-            w.extend_from_slice(&v.to_le_bytes());
+        let Self { left_state, right_state, map_left_state, map_right_state, resampler, map_resampler, attenuation, total_sectors_decoded, main, sfx, mpeg, rate_warned: _, clock, out, scratch: _ } = self;
+        for s in [left_state, right_state, map_left_state, map_right_state] {
+            s.save(w);
         }
-        for &f in &self.hist {
-            put_frame(w, f);
+        attenuation.save(w);
+        total_sectors_decoded.save(w);
+        resampler.save(w);
+        map_resampler.save(w);
+        for s in [main, sfx, mpeg] {
+            s.save(w);
         }
+        clock.save(w);
+        out.save(w);
     }
 
-    fn load(&mut self, r: &mut Blob) -> Option<()> {
-        (self.rate, self.num, self.den, self.pos) = (r.u32()?, r.u32()?, r.u32()?, r.u32()?);
-        for f in &mut self.hist {
-            *f = r.frame()?;
+    fn load(&mut self, r: &mut opencdi::savestate::Reader) -> Result<(), opencdi::savestate::StateError> {
+        let Self { left_state, right_state, map_left_state, map_right_state, resampler, map_resampler, attenuation, total_sectors_decoded, main, sfx, mpeg, rate_warned: _, clock, out, scratch: _ } = self;
+        for s in [left_state, right_state, map_left_state, map_right_state] {
+            s.load(r)?;
         }
-        Some(())
-    }
-}
-
-impl Stream {
-    fn save(&self, w: &mut Vec<u8>) {
-        put_frames(w, self.fifo.len(), self.fifo.iter());
-        w.push(self.primed as u8);
-    }
-
-    fn load(&mut self, r: &mut Blob) -> Option<()> {
-        self.fifo = r.frames()?.into();
-        self.primed = r.take::<1>()?[0] != 0;
-        Some(())
-    }
-}
-
-impl CdiAudio {
-    pub fn save_state(&self) -> Vec<u8> {
-        let mut w = Vec::new();
-        for s in [&self.left_state, &self.right_state, &self.map_left_state, &self.map_right_state] {
-            w.extend_from_slice(&s.s0.to_le_bytes());
-            w.extend_from_slice(&s.s1.to_le_bytes());
+        attenuation.load(r)?;
+        total_sectors_decoded.load(r)?;
+        resampler.load(r)?;
+        map_resampler.load(r)?;
+        for s in [main, sfx, mpeg] {
+            s.load(r)?;
         }
-        w.extend_from_slice(&self.attenuation);
-        w.extend_from_slice(&self.total_sectors_decoded.to_le_bytes());
-        self.resampler.save(&mut w);
-        self.map_resampler.save(&mut w);
-        for s in [&self.main, &self.sfx, &self.mpeg] {
-            s.save(&mut w);
-        }
-        w.extend_from_slice(&self.clock.rem.to_le_bytes());
-        put_frames(&mut w, self.out.len(), self.out.iter());
-        w
-    }
-
-    pub fn load_state(&mut self, bytes: &[u8]) -> Option<()> {
-        let mut r = Blob(bytes);
-        for s in [&mut self.left_state, &mut self.right_state, &mut self.map_left_state, &mut self.map_right_state] {
-            (s.s0, s.s1) = (r.i16()?, r.i16()?);
-        }
-        self.attenuation = r.take::<4>()?;
-        self.total_sectors_decoded = r.u64()?;
-        self.resampler.load(&mut r)?;
-        self.map_resampler.load(&mut r)?;
-        for s in [&mut self.main, &mut self.sfx, &mut self.mpeg] {
-            s.load(&mut r)?;
-        }
-        self.clock.rem = r.u64()?;
-        self.out = r.frames()?;
-        Some(())
+        clock.load(r)?;
+        out.load(r)?;
+        Ok(())
     }
 }
 
@@ -944,6 +871,7 @@ mod tests {
 
     #[test]
     fn output_state_round_trips() {
+        use opencdi::savestate::{Reader, State};
         let sector = VideoMode::Ntsc.cycles_per_sector();
         let run = |a: &mut CdiAudio, v: f32| {
             a.main.push(&[(v, -v); 700], ADPCM_LATENCY, usize::MAX, &String::new);
@@ -954,9 +882,10 @@ mod tests {
         };
         let mut a = CdiAudio::new();
         run(&mut a, 0.1);
-        let buf = a.save_state();
+        let mut buf = Vec::new();
+        a.save(&mut buf);
         let mut b = CdiAudio::new();
-        b.load_state(&buf).unwrap();
+        b.load(&mut Reader::new(&buf)).unwrap();
         for _ in 0..8 {
             run(&mut a, 0.4);
             run(&mut b, 0.4);

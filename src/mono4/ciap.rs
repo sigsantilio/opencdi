@@ -579,34 +579,7 @@ impl Ciap {
     }
 }
 
-impl Ciap {
-    pub fn save(&self, w: &mut Vec<u8>) {
-        super::put_vec(w, &self.ram);
-        for r in self.regs {
-            w.extend_from_slice(&r.to_le_bytes());
-        }
-        w.extend_from_slice(&[self.running as u8, self.q_mode as u8]);
-        w.extend_from_slice(&self.lba.to_le_bytes());
-        w.extend_from_slice(&[self.drive_active as u8, self.audio_playing as u8, self.audio_wait, self.audio_next as u8, self.audio_coding[0], self.audio_coding[1]]);
-        w.extend_from_slice(&[self.event_armed as u8, self.asel as u8, self.selecting as u8, self.toc as u8, self.start_delay, self.byteswap as u8]);
-        w.extend_from_slice(&(self.toc_index as u32).to_le_bytes());
-        w.extend_from_slice(&self.cycles.to_le_bytes());
-    }
-
-    pub fn load(&mut self, r: &mut super::BlobReader) -> Option<()> {
-        let ram = r.vec().filter(|v| v.len() == WINDOW_SIZE)?;
-        self.ram.copy_from_slice(&ram);
-        for v in self.regs.iter_mut() {
-            *v = r.u16()?;
-        }
-        (self.running, self.q_mode, self.lba) = (r.bool()?, r.bool()?, r.u32()?);
-        (self.drive_active, self.audio_playing, self.audio_wait, self.audio_next) = (r.bool()?, r.bool()?, r.u8()?, usize::from(r.u8()? & 1));
-        self.audio_coding = [r.u8()?, r.u8()?];
-        (self.event_armed, self.asel, self.selecting, self.toc, self.start_delay, self.byteswap) = (r.bool()?, r.bool()?, r.bool()?, r.bool()?, r.u8()?, r.bool()?);
-        (self.toc_index, self.cycles) = (r.u32()? as usize, r.u32()?);
-        Some(())
-    }
-}
+opencdi::impl_state!(Ciap { ram, regs, running, q_mode, lba, drive_active, audio_playing, audio_wait, audio_next, audio_coding, event_armed, asel, selecting, toc, toc_index, start_delay, cycles, byteswap } skip { descrambled, q_reports, audio_buffers, audio_sectors, audio_overlap, drive_stopped, dma_request, seeks, sectors, skipped, dmas, loud, trace });
 
 #[cfg(test)]
 mod tests {
@@ -786,9 +759,9 @@ mod tests {
         c.write_reg(REG_APCR, 0x140, 0);
         c.tick(period, period, &mut None, &mut audio);
         let mut buf = Vec::new();
-        c.save(&mut buf);
+        opencdi::savestate::State::save(&c, &mut buf);
         let mut d = Ciap::default();
-        assert!(d.load(&mut super::super::BlobReader::new(&buf)).is_some());
+        opencdi::savestate::State::load(&mut d, &mut opencdi::savestate::Reader::new(&buf)).unwrap();
         assert_eq!((d.audio_playing, d.audio_wait, d.audio_next, d.audio_coding, d.peek_reg(REG_BMAN) & 3), (c.audio_playing, c.audio_wait, c.audio_next, c.audio_coding, c.peek_reg(REG_BMAN) & 3));
         assert_eq!(c.audio_coding[1], 0x14);
         // TACS selection needs ASEL, Form 2 audio and the channel bit.

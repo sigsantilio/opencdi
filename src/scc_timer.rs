@@ -233,6 +233,10 @@ impl SccTimer {
     }
 }
 
+opencdi::impl_state!(SccTimer {
+    tsr, tcr, reload, timer0, timer1, timer2, picr1, picr2, lir, int1_line, timer_irq, cycle_accum,
+} skip {});
+
 #[cfg(test)]
 mod tests {
     use super::*;

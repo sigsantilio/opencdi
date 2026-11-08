@@ -78,6 +78,8 @@ impl Ds1216 {
     }
 }
 
+opencdi::impl_state!(Ds1216 { regs, matched, failed, bit, shift } skip {});
+
 pub struct Nvram32 {
     pub ram: Vec<u8>,
     pub clock: Ds1216,
@@ -157,24 +159,7 @@ impl Nvram32 {
     }
 }
 
-impl Nvram32 {
-    pub fn save(&self, w: &mut Vec<u8>) {
-        super::put_vec(w, &self.ram);
-        let c = &self.clock;
-        w.extend_from_slice(&c.regs);
-        w.extend_from_slice(&[c.matched, c.failed as u8, c.bit]);
-        w.extend_from_slice(&c.shift.to_le_bytes());
-    }
-
-    pub fn load(&mut self, r: &mut super::BlobReader) -> Option<()> {
-        let ram = r.vec().filter(|v| v.len() == NVRAM32_SIZE)?;
-        self.ram.copy_from_slice(&ram);
-        let c = &mut self.clock;
-        c.regs.copy_from_slice(r.bytes(8)?);
-        (c.matched, c.failed, c.bit, c.shift) = (r.u8()?, r.bool()?, r.u8()?, r.u64()?);
-        Some(())
-    }
-}
+opencdi::impl_state!(Nvram32 { ram, clock } skip { dirty, save_path });
 
 #[cfg(test)]
 mod tests {

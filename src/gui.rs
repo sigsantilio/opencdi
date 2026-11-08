@@ -1028,6 +1028,7 @@ pub fn show_controls_dialog(owner: *mut std::ffi::c_void) {
            • F6: Quick Save State (Slot 1)  |  F7: Quick Load State (Slot 1)\n\
            • F9: Switch Active Input Device (Gamepad <-> Mouse)\n\
            • P: Pause  |  Space (hold): Fast-forward\n\
+           • F2 / F4: Save / Load state  |  F6: Quick Save  |  F7: Quick Load\n\
            • F8: Screenshot (BMP)  |  F12: Screenshot (PNG)\n\
            • Ctrl+I: Insert disc  |  Ctrl+O: Open disc image and restart\n\
            • M: Mute / Unmute audio  |  + / - : Adjust volume\n\

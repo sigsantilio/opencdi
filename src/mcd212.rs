@@ -1347,6 +1347,20 @@ impl Mcd212 {
     }
 }
 
+opencdi::impl_state_enum!(VideoMode { Pal = 0, Ntsc = 1 });
+
+opencdi::impl_state!(Mcd212 {
+    plane_a, plane_b, display_plane_a, display_plane_b,
+    csrr, csrw, dcr, vsr, ddr, dcp, dca,
+    clut, clut_bank, image_coding_method, transparency_control, plane_order, transparent_color, mask_color, dyuv_abs_start,
+    cursor_position, cursor_control, cursor_pattern, matte_control, backdrop_color, mosaic_hold, weight_factor, matte_flag,
+    blink_time, blink_active,
+    framebuffer, interlace_field,
+    scanline, scanline_cycles, vblank_irq, video_mode, external_video_line, external_video_present,
+} skip {
+    s_4bpp_color, delta_y_lut, delta_uv_lut, dyuv_limit_lut, dyuv_u_to_b, dyuv_u_to_g, dyuv_v_to_g, dyuv_v_to_r, trace_dca,
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;
