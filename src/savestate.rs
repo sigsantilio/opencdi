@@ -420,6 +420,7 @@ pub fn save_state_to_file<P: AsRef<Path>>(
     w.write_u8(bus.cdic.audio_sector_counter);
     w.write_u8(bus.cdic.audio_map_counter);
     w.write_bool(bus.cdic.stopped_in_flight);
+    w.write_bool(bus.cdic.map_finished);
     w.write_u8(bus.cdic.audio_format_sectors);
     w.write_u32(bus.cdic.audio_cycle_accumulator);
     w.write_u32(bus.cdic.cycle_accumulator);
@@ -813,6 +814,7 @@ pub fn load_state_from_file<P: AsRef<Path>>(
     bus.cdic.audio_sector_counter = r.read_u8()?;
     bus.cdic.audio_map_counter = r.read_u8()?;
     bus.cdic.stopped_in_flight = r.read_bool()?;
+    bus.cdic.map_finished = r.read_bool()?;
     bus.cdic.audio_format_sectors = r.read_u8()?;
     bus.cdic.audio_cycle_accumulator = r.read_u32()?;
     bus.cdic.cycle_accumulator = r.read_u32()?;
