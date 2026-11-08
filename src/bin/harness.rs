@@ -43,7 +43,7 @@ fn dump_ppm(fb: &[u32], path: &str) {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: harness <bios.rom> <disc|none> <frames> [--dvc <rom>] [--video-levels full|studio] [--ppm <out.ppm>] [--ntsc] [--autoplay [--print-autoplay-script]] [--input <script|@file>] [--sample <n> [--sample-audio]] [--dump-every <n> <prefix>] [--audio-out <file.s16>]");
+    eprintln!("usage: harness <bios.rom> <disc|none> <frames> [--dvc <rom>] [--video-levels full|studio] [--ppm <out.ppm>] [--ntsc] [--autoplay [--print-autoplay-script]] [--input <script|@file>] [--sample <n> [--sample-audio]] [--dump-every <n> <prefix>] [--audio-out <file.s16>] [--nvram-out <file>]");
     std::process::exit(2);
 }
 
@@ -64,6 +64,7 @@ fn main() {
     let mut sample_audio = false;
     let mut dump: Option<(u64, String)> = None;
     let mut audio_out: Option<(String, Vec<u8>)> = None;
+    let mut nvram_out: Option<&String> = None;
     let mut i = 4;
     while i < a.len() {
         match a[i].as_str() {
@@ -78,6 +79,7 @@ fn main() {
             }
             "--ppm" => { i += 1; ppm = a.get(i); }
             "--audio-out" => { i += 1; audio_out = Some((a.get(i).cloned().unwrap_or_else(|| usage()), Vec::new())); }
+            "--nvram-out" => { i += 1; nvram_out = Some(a.get(i).unwrap_or_else(|| usage())); }
             "--ntsc" => ntsc = true,
             "--autoplay" => autoplay = true,
             "--print-autoplay-script" => print_script = true,
@@ -199,6 +201,12 @@ fn main() {
     if let Some((p, bytes)) = &audio_out {
         if let Err(e) = std::fs::write(p, bytes) {
             eprintln!("cannot write audio {}: {}", p, e);
+            std::process::exit(1);
+        }
+    }
+    if let Some(p) = nvram_out {
+        if let Err(e) = std::fs::write(p, &m.bus.nvram.ram[..]) {
+            eprintln!("cannot write nvram {}: {}", p, e);
             std::process::exit(1);
         }
     }
