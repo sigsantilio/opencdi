@@ -91,6 +91,8 @@ pub struct Cdic {
     pub buf_elapsed: u32,
     pub map_finished: bool,
     pub map_sector_cycles: u32,
+    // Audio channel the decoder took over with the last command 0x2E.
+    pub dsp_achan: u16,
 
     // Timing & Interrupt
     pub cycle_accumulator: u32,
@@ -133,6 +135,7 @@ impl Cdic {
             buf_elapsed: 0,
             map_finished: false,
             map_sector_cycles: crate::mcd212::VideoMode::Pal.cycles_per_sector(),
+            dsp_achan: 0,
 
             cycle_accumulator: 0,
             irq_pending: false,
@@ -173,6 +176,7 @@ impl Cdic {
         self.buf_group = 0;
         self.buf_elapsed = 0;
         self.map_finished = false;
+        self.dsp_achan = 0;
 
         self.cycle_accumulator = 0;
         self.irq_pending = false;
@@ -272,7 +276,7 @@ impl Cdic {
                         }
                     }
                 } else {
-                    self.map_on = false;
+                    self.stop_audio_map();
                 }
                 self.update_interrupt();
             }
@@ -291,6 +295,14 @@ impl Cdic {
                 }
             }
             _ => {}
+        }
+    }
+
+    // Stop: the buffer playing finishes, unless the decoder holds an audio channel, then it stops at once without ABUF.
+    fn stop_audio_map(&mut self) {
+        self.map_on = false;
+        if self.dsp_achan != 0 {
+            self.buf_addr = 0xFFFF;
         }
     }
 
@@ -370,7 +382,11 @@ impl Cdic {
                 self.cancel_disc_read();
             }
             0x2E => {
-                // Update
+                // Update: the decoder takes over the audio channel; with a channel and AUDCTL bit 11 clear it stops at once.
+                self.dsp_achan = self.audio_channel;
+                if (self.z_buffer & 0x0800) == 0 {
+                    self.stop_audio_map();
+                }
             }
             0x27 => {
                 // Fetch TOC
@@ -838,7 +854,7 @@ opencdi::impl_state!(Cdic {
     ram, audio,
     command, time, file, channel, audio_channel, audio_buffer, x_buffer, dma_control, z_buffer, interrupt_vector, data_buffer,
     disc_command, disc_mode, disc_spinup_counter, curr_lba,
-    audio_sector_counter, map_on, map_next, buf_addr, buf_coding, buf_group, buf_elapsed, map_finished, map_sector_cycles,
+    audio_sector_counter, map_on, map_next, buf_addr, buf_coding, buf_group, buf_elapsed, map_finished, map_sector_cycles, dsp_achan,
     cycle_accumulator, irq_pending, dma_triggered,
     cd_byteswap,
 } skip {
@@ -963,6 +979,23 @@ mod tests {
         assert!(!c.irq_pending);
         c.write_reg(0x3FA, 0x2000);
         assert!(c.irq_pending);
+    }
+
+    #[test]
+    fn a_stop_with_an_audio_channel_taken_over_by_command_2e_ends_the_buffer_at_once() {
+        let mut c = Cdic::new();
+        c.audio_channel = 0;
+        c.ram[0x2800 + 11] = 0x05;
+        c.write_reg(0x3FA, 0x2800);
+        tick(&mut c, 1);
+        c.audio_channel = 2;
+        c.command = 0x2E;
+        c.write_reg(0x3FE, 0x8000);
+        assert_eq!(c.buf_addr, 0x2800);
+        c.write_reg(0x3FA, 0x0000);
+        assert_eq!(c.buf_addr, 0xFFFF);
+        tick(&mut c, 8);
+        assert_eq!(c.read_reg(0x3F4) & 0x8000, 0);
     }
 
     #[test]
