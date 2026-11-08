@@ -732,6 +732,7 @@ struct App {
     mouse_middle: bool,
     prev_middle: bool,
     mouse_captured: bool,
+    no_autoplay: bool,
     host_input: bool,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     run_in_menu: bool,
@@ -1271,8 +1272,10 @@ impl App {
         self.prev_middle = self.mouse_middle;
 
         // Left click inside window re-captures mouse if released
+        let mut swallowed_capture = false;
         if is_active && !self.mouse_captured && left_clicked && self.cursor.is_some() {
             self.mouse_captured = true;
+            swallowed_capture = true;
             info!("Controllo mouse: CATTURATO (focus console, puntatore host nascosto)");
         }
         self.apply_grab();
@@ -1386,7 +1389,7 @@ impl App {
                 (mouse_x, mouse_y) = cursor_to_cdi(pos, self.image_rect);
             }
             if self.rel_pointer.is_some() || self.cursor.is_some() {
-                if left_clicked { mouse_btn |= 1; }
+                if left_clicked && !swallowed_capture { mouse_btn |= 1; }
                 if right_clicked { mouse_btn |= 2; }
             }
         }
