@@ -148,8 +148,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bus.cdic.curr_lba,
                 bus.cdic.audio_channel,
                 bus.cdic.channel,
-                bus.cdic.decoding_audio_map,
-                bus.cdic.decode_addr,
+                bus.cdic.map_on,
+                bus.cdic.map_next,
                 bus.cdic.audio_sector_counter,
                 bus.cdic.audio.total_sectors_decoded,
                 q_len

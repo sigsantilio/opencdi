@@ -81,14 +81,16 @@ pub struct Cdic {
     pub curr_lba: u32,
 
     // Audio Map State
-    pub decoding_audio_map: bool,
-    pub decode_addr: u16,
     pub audio_sector_counter: u8,
-    pub audio_map_counter: u8,
-    pub buffer_in_flight: bool,
+    // Audio map player: playback on, next buffer, buffer playing (0xFFFF none) with its coding, groups decoded and cycles played.
+    pub map_on: bool,
+    pub map_next: u16,
+    pub buf_addr: u16,
+    pub buf_coding: u8,
+    pub buf_group: u8,
+    pub buf_elapsed: u32,
     pub map_finished: bool,
-    pub audio_format_sectors: u8,
-    pub audio_cycle_accumulator: u32,
+    pub map_sector_cycles: u32,
 
     // Timing & Interrupt
     pub cycle_accumulator: u32,
@@ -122,14 +124,15 @@ impl Cdic {
             disc_spinup_counter: 0,
             curr_lba: 0,
 
-            decoding_audio_map: false,
-            decode_addr: 0xFFFF,
             audio_sector_counter: 0,
-            audio_map_counter: 0,
-            buffer_in_flight: false,
+            map_on: false,
+            map_next: 0x2800,
+            buf_addr: 0xFFFF,
+            buf_coding: 0,
+            buf_group: 0,
+            buf_elapsed: 0,
             map_finished: false,
-            audio_format_sectors: 0,
-            audio_cycle_accumulator: 0,
+            map_sector_cycles: crate::mcd212::VideoMode::Pal.cycles_per_sector(),
 
             cycle_accumulator: 0,
             irq_pending: false,
@@ -162,14 +165,14 @@ impl Cdic {
         self.curr_lba = 0;
         self.cd_byteswap = false;
 
-        self.decoding_audio_map = false;
-        self.decode_addr = 0xFFFF;
         self.audio_sector_counter = 0;
-        self.audio_map_counter = 0;
-        self.buffer_in_flight = false;
+        self.map_on = false;
+        self.map_next = 0x2800;
+        self.buf_addr = 0xFFFF;
+        self.buf_coding = 0;
+        self.buf_group = 0;
+        self.buf_elapsed = 0;
         self.map_finished = false;
-        self.audio_format_sectors = 0;
-        self.audio_cycle_accumulator = 0;
 
         self.cycle_accumulator = 0;
         self.irq_pending = false;
@@ -210,7 +213,7 @@ impl Cdic {
                     self.map_finished = false;
                     return r;
                 }
-                if !self.decoding_audio_map {
+                if self.buf_addr == 0xFFFF {
                     self.z_buffer ^= 0x0001;
                 }
                 self.z_buffer
@@ -256,39 +259,20 @@ impl Cdic {
             }
             0x3FA => {
                 self.z_buffer = val;
-                trace!(
-                    "CDIC WRITE z_buffer = 0x{:04X} (dec_map={}, dec_addr=0x{:04X})",
-                    val, self.decoding_audio_map, self.decode_addr
-                );
+                trace!("CDIC WRITE audio control = 0x{:04X} (on={}, buffer=0x{:04X})", val, self.map_on, self.buf_addr);
                 // Bit 11 alone starts the map only with no audio channel; an empty map on an idle decoder ends at once with the finished flag.
-                let start = (val & 0x0800) != 0 && (self.audio_channel == 0 || (val & 0x2000) != 0);
-                if start && (val & 0x2000) == 0 {
-                    if !self.map_playing() {
-                        self.decode_addr = 0x2800;
-                        self.audio_format_sectors = 0;
-                        self.decoding_audio_map = true;
-                        if self.audio_map_counter == 0 {
-                            if self.ram[0x2800 + 11] == 0xFF {
-                                self.decode_addr = 0xFFFF;
-                                self.decoding_audio_map = false;
-                                self.map_finished = true;
-                            } else {
-                                self.audio_map_counter = 1;
-                            }
+                let bit11_start = (val & 0x0800) != 0 && self.audio_channel == 0 && (val & 0x2000) == 0;
+                if bit11_start || (val & 0x2000) != 0 {
+                    // A start while a map plays is ignored; over a stopped buffer still playing it waits for that buffer.
+                    if !self.map_on {
+                        self.map_on = true;
+                        self.map_next = if bit11_start { 0x2800 } else { val & 0x3A00 };
+                        if self.buf_addr == 0xFFFF && !self.start_map_buffer(0) && bit11_start {
+                            self.map_finished = true;
                         }
                     }
-                } else if (val & 0x2000) == 0 {
-                    self.decode_addr = 0xFFFF;
-                    self.decoding_audio_map = false;
                 } else {
-                    if !self.decoding_audio_map || self.decode_addr == 0xFFFF {
-                        self.decode_addr = val & 0x3A00;
-                        self.audio_format_sectors = 0;
-                        if self.audio_map_counter == 0 {
-                            self.audio_map_counter = 1;
-                        }
-                        self.decoding_audio_map = true;
-                    }
+                    self.map_on = false;
                 }
                 self.update_interrupt();
             }
@@ -311,7 +295,7 @@ impl Cdic {
     }
 
     fn map_playing(&self) -> bool {
-        self.decoding_audio_map && self.decode_addr != 0xFFFF
+        self.map_on
     }
 
     // ABUF interrupts only while AUDCTL bit 13 is set.
@@ -427,76 +411,74 @@ pub fn get_sector_count_for_coding(coding: u8) -> u8 {
 }
 
 impl Cdic {
-    pub fn process_audio_map(&mut self) {
-        if self.decode_addr == 0xFFFF {
-            self.audio_map_counter = 0;
-            self.audio_format_sectors = 0;
-            self.decoding_audio_map = false;
-            return;
-        }
-
-        let addr = (self.decode_addr & 0x3FFE) as usize;
-
-        if addr + 12 >= CDIC_RAM_SIZE {
-            self.decode_addr = 0xFFFF;
-            self.audio_map_counter = 0;
-            self.audio_format_sectors = 0;
-            self.decoding_audio_map = false;
-            return;
-        }
-
-        let coding = self.ram[addr + 11];
-        if coding != 0xFF {
-            // Buffer is ready! Toggle decode_addr for the NEXT buffer
-            self.decode_addr ^= 0x1A00;
-
-            self.decoding_audio_map = true;
-            self.audio_format_sectors = get_sector_count_for_coding(coding);
-            self.audio_map_counter = self.audio_format_sectors;
-            self.buffer_in_flight = true;
-
-            let is_stereo = (coding & 0x03) == 0x01;
-            let is_8bit = (coding & 0x30) == 0x10;
-            let sample_rate = if (coding & 0x0C) == 0x04 { 18900 } else { 37800 };
-
-            let payload_start = addr + 12;
-            if payload_start + 2304 <= CDIC_RAM_SIZE {
-                info!(
-                    "CDIC DECODE AUDIO MAP: addr=0x{:04X}, coding=0x{:02X}, stereo={}, 8bit={}, rate={}",
-                    addr, coding, is_stereo, is_8bit, sample_rate
-                );
-                self.audio.decode_audio_map_sector(&self.ram[payload_start..payload_start + 2304], is_stereo, is_8bit, sample_rate);
-            }
-        } else {
-            // Buffer has finished (coding == 0xFF)
+    // Starts the buffer at `map_next`, `elapsed` cycles in; coding 0xFF ends the map instead (returns false).
+    fn start_map_buffer(&mut self, elapsed: u32) -> bool {
+        let addr = (self.map_next & 0x3FFE) as usize;
+        let coding = if addr + 12 + 2304 <= CDIC_RAM_SIZE { self.ram[addr + 11] } else { 0xFF };
+        if coding == 0xFF {
             trace!("CDIC AUDIO MAP END: addr=0x{:04X}, coding=0xFF", addr);
-            self.decode_addr = 0xFFFF;
-            self.audio_format_sectors = 0;
+            self.map_on = false;
+            return false;
+        }
+        self.buf_addr = addr as u16;
+        self.buf_coding = coding;
+        self.buf_group = 0;
+        self.buf_elapsed = elapsed;
+        self.map_next ^= 0x1A00;
+        self.decode_map_groups();
+        true
+    }
+
+    fn map_buffer_cycles(&self) -> u32 {
+        get_sector_count_for_coding(self.buf_coding) as u32 * self.map_sector_cycles
+    }
+
+    // The decoder reads buffer RAM as it plays: each of the 18 sound groups is decoded when its time comes.
+    fn decode_map_groups(&mut self) {
+        let len = self.map_buffer_cycles() as u64;
+        let due = ((self.buf_elapsed as u64 * 18 / len) as u8 + 1).min(18);
+        if self.buf_group >= due {
+            return;
+        }
+        let coding = self.buf_coding;
+        let is_stereo = (coding & 0x03) == 0x01;
+        let is_8bit = (coding & 0x30) == 0x10;
+        let sample_rate = if (coding & 0x0C) == 0x04 { 18900 } else { 37800 };
+        let start = self.buf_addr as usize + 12 + self.buf_group as usize * 128;
+        let end = self.buf_addr as usize + 12 + due as usize * 128;
+        let first = self.buf_group == 0;
+        self.audio.decode_audio_map_groups(&self.ram[start..end], first, is_stereo, is_8bit, sample_rate);
+        self.buf_group = due;
+    }
+
+    // Plays the audio map buffer in real time; when it has played ABUF bit 15 is set (also after a stop) and the next buffer starts at once.
+    fn step_audio_map(&mut self, cycles: u32) {
+        if self.buf_addr == 0xFFFF {
+            return;
+        }
+        self.buf_elapsed += cycles;
+        loop {
+            let len = self.map_buffer_cycles();
+            if self.buf_elapsed < len {
+                self.decode_map_groups();
+                return;
+            }
+            self.decode_map_groups();
+            let rest = self.buf_elapsed - len;
+            self.buf_addr = 0xFFFF;
+            self.audio_buffer |= 0x8000;
+            self.update_interrupt();
+            if !self.map_on || !self.start_map_buffer(rest) {
+                return;
+            }
         }
     }
 
     // `sector_cycles` is one sector at 1x speed (75 per second) in CPU cycles of the current video standard.
     pub fn step_cycles(&mut self, cycles: u32, sector_cycles: u32, cdrom: &mut Option<CdRom>) {
-        // 1. Audio tick (75 Hz) for audio maps
-        self.audio_cycle_accumulator += cycles;
-        while self.audio_cycle_accumulator >= sector_cycles {
-            self.audio_cycle_accumulator -= sector_cycles;
-
-            if self.audio_map_counter > 0 {
-                self.audio_map_counter -= 1;
-            }
-
-            // ABUF bit 15 is set when a buffer has played, also after a stop; the next buffer starts at the same moment.
-            if self.buffer_in_flight && self.audio_map_counter == 0 {
-                self.buffer_in_flight = false;
-                self.audio_buffer |= 0x8000;
-                self.update_interrupt();
-            }
-
-            if self.decoding_audio_map && self.audio_map_counter == 0 {
-                self.process_audio_map();
-            }
-        }
+        // 1. Audio map playback
+        self.map_sector_cycles = sector_cycles;
+        self.step_audio_map(cycles);
 
         // 2. Disc sector read (75 Hz)
         if self.disc_command == 0 {
@@ -881,14 +863,27 @@ mod tests {
         let mut c = Cdic::new();
         c.ram[0x2800 + 11] = 0x05;
         c.write_reg(0x3FA, 0x2800);
-        tick(&mut c, 1);
         assert_eq!(c.read_reg(0x3F4) & 0x8000, 0);
         c.write_reg(0x3FA, 0x0000);
         tick(&mut c, 7);
         assert_eq!(c.read_reg(0x3F4) & 0x8000, 0);
         tick(&mut c, 1);
         assert_eq!(c.read_reg(0x3F4) & 0x8000, 0x8000);
-        assert!(!c.decoding_audio_map);
+        assert_eq!(c.buf_addr, 0xFFFF);
+        assert!(!c.map_on);
+    }
+
+    #[test]
+    fn the_map_starts_at_the_write_and_decodes_its_sound_groups_as_they_play() {
+        let mut c = Cdic::new();
+        c.ram[0x2800 + 11] = 0x05;
+        tick(&mut c, 1);
+        c.write_reg(0x3FA, 0x2800);
+        assert_eq!((c.buf_addr, c.buf_group, c.audio.total_sectors_decoded), (0x2800, 1, 1));
+        tick(&mut c, 4);
+        assert_eq!(c.buf_group, 10);
+        tick(&mut c, 3);
+        assert_eq!(c.buf_group, 16);
     }
 
     #[test]
@@ -897,18 +892,19 @@ mod tests {
         c.audio_channel = 0;
         c.ram[0x2800 + 11] = 0x05;
         c.ram[0x3200 + 11] = 0x05;
+        tick(&mut c, 1);
         c.write_reg(0x3FA, 0x2800);
-        tick(&mut c, 8);
+        tick(&mut c, 7);
         assert_eq!(c.audio_buffer & 0x8000, 0);
         tick(&mut c, 1);
         assert_eq!(c.read_reg(0x3F4) & 0x8000, 0x8000);
+        assert_eq!(c.audio.total_sectors_decoded, 2);
         c.ram[0x2800 + 11] = 0xFF;
         c.ram[0x3200 + 11] = 0xFF;
-        assert_eq!(c.audio.total_sectors_decoded, 2);
         tick(&mut c, 8);
         assert_eq!(c.read_reg(0x3F4) & 0x8000, 0x8000);
         assert_eq!(c.audio.total_sectors_decoded, 2);
-        assert_eq!(c.read_reg(0x3FA) & 0x0800, 0);
+        assert_eq!(c.read_reg(0x3FA), 0x2000);
     }
 
     #[test]
@@ -919,7 +915,7 @@ mod tests {
         c.write_reg(0x3FA, 0x0800);
         assert_eq!(c.read_reg(0x3FA), 0x0001);
         assert_eq!(c.read_reg(0x3FA), 0x0000);
-        assert!(!c.decoding_audio_map);
+        assert!(!c.map_on);
     }
 
     #[test]
@@ -964,7 +960,7 @@ mod tests {
         c.audio_channel = 2;
         c.ram[0x2800 + 11] = 0xFF;
         c.write_reg(0x3FA, 0x0800);
-        assert!(!c.decoding_audio_map);
+        assert!(!c.map_on);
         assert_eq!(c.read_reg(0x3FA), 0x0801);
         assert_eq!(c.read_reg(0x3FA), 0x0800);
     }
