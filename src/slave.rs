@@ -468,7 +468,7 @@ opencdi::impl_state!(SlaveChannel {
 opencdi::impl_state!(SlaveHle {
     channels, attenuation, device_mouse_x, device_mouse_y, device_mouse_updated, mouse_btn, center_x, center_y,
     input_mouse_x, input_mouse_y, input_mouse_btn,
-    irq_pending, has_disc, disc_state, disc_timer, xbus_interrupt_enable, video_mode, stream_counter, reset_request,
+    irq_pending, irq_deferred, has_disc, is_data, disc_state, disc_timer, xbus_interrupt_enable, video_mode, stream_counter, reset_request,
 } skip {
     debug_log,
 });

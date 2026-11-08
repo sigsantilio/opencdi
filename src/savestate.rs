@@ -273,11 +273,11 @@ macro_rules! impl_state {
     ($ty:ty { $($f:ident),* $(,)? } skip { $($s:ident),* $(,)? }) => {
         impl $crate::savestate::State for $ty {
             fn save(&self, w: &mut Vec<u8>) {
-                let Self { $($f,)* $($s: _,)* } = self;
+                let Self { $($f,)* $($s: _,)* .. } = self;
                 $( $crate::savestate::State::save($f, w); )*
             }
             fn load(&mut self, r: &mut $crate::savestate::Reader) -> Result<(), $crate::savestate::StateError> {
-                let Self { $($f,)* $($s: _,)* } = self;
+                let Self { $($f,)* $($s: _,)* .. } = self;
                 $( $crate::savestate::State::load($f, r)?; )*
                 Ok(())
             }

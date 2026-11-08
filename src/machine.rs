@@ -282,7 +282,7 @@ impl Machine {
     }
 }
 
-crate::impl_state!(Machine { cpu, bus, instructions } skip {});
+crate::impl_state!(Machine { cpu, bus, instructions } skip { os9_trace });
 
 impl Default for Machine {
     fn default() -> Self {

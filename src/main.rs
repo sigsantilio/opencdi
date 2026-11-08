@@ -2362,5 +2362,4 @@ mod tests {
         assert!(read_state_file(&state_path(&dir, "missing", 0), &mut n).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
-    }
 }
