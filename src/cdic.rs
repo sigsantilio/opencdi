@@ -291,6 +291,7 @@ impl Cdic {
                         self.decoding_audio_map = true;
                     }
                 }
+                self.update_interrupt();
             }
             0x3FC => {
                 trace!("CDIC WRITE interrupt_vector = 0x{:04X}", val);
@@ -314,8 +315,10 @@ impl Cdic {
         self.decoding_audio_map && self.decode_addr != 0xFFFF
     }
 
+    // ABUF interrupts only while AUDCTL bit 13 is set.
     fn update_interrupt(&mut self) {
-        self.irq_pending = ((self.x_buffer | self.audio_buffer) & 0x8000) != 0;
+        let abuf = (self.audio_buffer & 0x8000) != 0 && (self.z_buffer & 0x2000) != 0;
+        self.irq_pending = (self.x_buffer & 0x8000) != 0 || abuf;
     }
 
     fn lba_from_time(&self) -> u32 {
@@ -932,6 +935,16 @@ mod tests {
         assert_eq!(c.read_reg(0x3FA), 0x2800);
         tick(&mut c, 1);
         assert_eq!(c.read_reg(0x3FA), 0x2800);
+    }
+
+    #[test]
+    fn audctl_bit_13_gates_the_buffer_interrupt() {
+        let mut c = Cdic::new();
+        c.audio_buffer = 0x8000;
+        c.write_reg(0x3FA, 0x0000);
+        assert!(!c.irq_pending);
+        c.write_reg(0x3FA, 0x2000);
+        assert!(c.irq_pending);
     }
 
     #[test]
