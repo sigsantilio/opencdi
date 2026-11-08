@@ -115,6 +115,18 @@ The dynamic library `opencdi_libretro.dll` (or `.so` on Linux) will be generated
 
 ---
 
+---
+
+## Special Acknowledgments
+
+Heartfelt thanks to everyone who contributed to the development and preservation goals of OpenCDi:
+- **ArnoldDeRuiter**: for the outstanding and extensive engineering work, Libretro core implementation, in-memory deterministic savestates, Mono-IV chip models (CIAP, IKAT), regression harness, and countless timing and audio refinements.
+- **The MAME / MESS Team**: for their invaluable documentation and foundational work on Philips and Motorola custom chips (SCC68070, MCD212, CDIC, Slave 68HC05).
+- **The World of CD-i** and the broader CD-i preservation community for their dedication, technical insights, and continuous support.
+- All testers, players, and contributors who helped test games and provided feedback.
+
+---
+
 ## License
 
 Distributed under the **MIT License**. See [LICENSE](LICENSE) for details.

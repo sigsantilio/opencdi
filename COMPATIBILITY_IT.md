@@ -29,6 +29,11 @@ Questo documento traccia lo stato di compatibilità e i problemi riscontrati dei
 | 17 | `Ultra CD-i Soccer (Europe).chd` | **Sì** | **Avviabile / Ottimo** | DVC rilevata (risolto avviso assenza cartuccia), schermata titolo CD-i Soccer e render campo. |
 | 18 | `Space Ace (USA).chd` | **Sì** | **Giocabile / Ottimo** | Video MPEG-1 e audio FMV perfetti, interazioni di gioco verificate. |
 | 19 | `Brain Dead 13 (USA) (Disc 1).chd` | **Sì** | **Intro Funzionante / In Analisi** | Riproduzione video/audio del bumper Philips Media (`misc.rtf`) fluida; analisi in corso sul preload della Scena 1 post-logo. |
+| 20 | `Mad Dog McCree (USA).chd` | **Sì** | **Giocabile / Ottimo** | Riconoscimento pistola/mouse Slave HLE immediato (`is_data`), mira precisa, video FMV e audio sincronizzati. |
+| 21 | `Mad Dog II - The Lost Gold (Europe).chd` | **Sì** | **Giocabile / Ottimo** | Supporto completo mouse e pistola ottica, branching delle scene corretto, video MPEG fluido. |
+| 22 | `Drug Wars (USA).chd` | No | **Giocabile / Ottimo** | Riconoscimento input mouse/gun istantaneo fin dal boot, sparo e mirino reattivi. |
+| 23 | `Earth Command (USA).chd` | No | **Giocabile / Ottimo** | Auto-rilevamento standard video NTSC a 60 Hz, timing corretto e render privo di artefatti. |
+| 24 | `Apprentice, The (Europe).cue` | No | **Giocabile / Ottimo** | 50 fps fluidi, scrolling verticale e orizzontale a doppio piano, audio ADPCM completo. |
 
 ---
 

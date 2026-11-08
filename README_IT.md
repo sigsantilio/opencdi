@@ -112,6 +112,18 @@ La libreria `opencdi_libretro.dll` (o `.so` su Linux) viene generata in `target/
 
 ---
 
+---
+
+## Ringraziamenti Speciali
+
+Un sincero ringraziamento a tutti coloro che hanno reso possibile lo sviluppo e l'evoluzione di OpenCDi:
+- **ArnoldDeRuiter**: per l'eccezionale e massiccio lavoro di reverse engineering, implementazione del core Libretro, savestates in memoria, chip Mono-IV (CIAP, IKAT), harness di test deterministico e innumerevoli rifiniture al timing e all'audio.
+- **Il Team di MAME / MESS**: per la fondamentale documentazione di riferimento sull'hardware personalizzato Philips e Motorola (SCC68070, MCD212, CDIC, Slave 68HC05).
+- **The World of CD-i** e l'intera comunità di preservazione CD-i per la passione, le informazioni tecniche e il supporto continuo.
+- Tutti i tester e appassionati che hanno provato l'emulatore e fornito feedback prezioso.
+
+---
+
 ## Licenza
 
 Distribuito sotto licenza **MIT**. Vedere il file [LICENSE](LICENSE) per ulteriori dettagli.
