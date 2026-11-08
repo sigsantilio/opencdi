@@ -1,7 +1,7 @@
 // OpenCDi Release Build - 2026-09-29 15:45
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 use std::path::{Path, PathBuf};
-use log::{info, error};
+use log::{info, error, warn};
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,6 +18,7 @@ use opencdi::audio::{self, Frame, HostAudioOutput};
 use opencdi::frontend::{pop_action, push_action, GuiAction, InputDeviceMode, KeyBindings};
 #[cfg(target_os = "windows")]
 use opencdi::gui;
+use opencdi::bios;
 use opencdi::machine::Machine;
 use opencdi::mcd212::{SCREEN_WIDTH, SCREEN_HEIGHT, VideoMode};
 
@@ -163,23 +164,39 @@ fn find_bios_rom() -> Option<PathBuf> {
     const BIOS_CANDIDATES: &[&str] = &[
         "bios/cdi220b.rom",
         "cdi220b.rom",
-        "bios/cdi220.rom",
-        "cdi220.rom",
         "bios/cdi200.rom",
         "cdi200.rom",
+        "bios/cdimono1.zip",
+        "cdimono1.zip",
+        "bios/cdibios.zip",
+        "cdibios.zip",
         "bios/cdi.rom",
         "cdi.rom",
+        "bios/cdi220.rom",
+        "cdi220.rom",
         "bios/cdi490a.rom",
         "cdi490a.rom",
+        "bios/cdi490a.zip",
+        "cdi490a.zip",
     ];
-    for &name in BIOS_CANDIDATES {
-        if let Some(p) = find_file(name) {
-            return Some(p);
+    // Each found file is checked; the best one wins.
+    let mut seen = HashSet::new();
+    let found = BIOS_CANDIDATES.iter().filter_map(|n| find_file(n)).filter(|p| seen.insert(p.clone())).filter_map(|p| {
+        match Machine::read_bios(&p) {
+            Ok((_, img)) => {
+                info!("BIOS candidate {:?} [{}]: {}", p, img.report.status, img.report.message);
+                Some((p, img))
+            }
+            Err(e) => {
+                warn!("BIOS candidate {:?}: {}", p, e);
+                None
+            }
         }
-    }
-    None
+    });
+    bios::best(found).filter(|(_, img)| img.report.status != bios::Status::Error).map(|(p, _)| p)
 }
 
+// First candidate that passes the cartridge check; refused files are logged with the reason.
 fn find_dvc_rom() -> Option<PathBuf> {
     const DVC_CANDIDATES: &[&str] = &[
         "dvc/vmpega.rom",
@@ -190,11 +207,36 @@ fn find_dvc_rom() -> Option<PathBuf> {
         "impega.rom",
     ];
     for &name in DVC_CANDIDATES {
-        if let Some(p) = find_file(name) {
-            return Some(p);
+        let Some(p) = find_file(name) else { continue };
+        match Machine::read_dvc(&p) {
+            Ok((_, img)) if img.report.status != bios::Status::Error => return Some(p),
+            Ok((_, img)) => warn!("DVC ROM {:?} refused: {}", p, img.report.message),
+            Err(e) => warn!("DVC ROM {:?}: {}", p, e),
         }
     }
     None
+}
+
+// Fits a cartridge ROM and logs the check verdict: refused images say so, unknown ones warn.
+fn load_dvc_logged(m: &mut Machine, path: &std::path::Path) -> bool {
+    match m.load_dvc(path) {
+        Ok(r) if r.status == bios::Status::Warning => {
+            warn!("DVC ROM {:?}: {}", path, r.message);
+            true
+        }
+        Ok(r) => {
+            info!("DVC ROM {:?} [{}]: {}", path, r.status, r.message);
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            warn!("DVC ROM {:?} refused: {}", path, e);
+            false
+        }
+        Err(e) => {
+            warn!("DVC ROM {:?}: {}", path, e);
+            false
+        }
+    }
 }
 
 fn find_nvram_file() -> Option<PathBuf> {
@@ -340,13 +382,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let error_msg =
                 "OpenCDi - Required System BIOS Missing\n\
                 ======================================\n\n\
-                The emulator cannot start because no Philips CD-i system BIOS ROM was found.\n\n\
+                The emulator cannot start because no usable Philips CD-i system BIOS ROM was found (see the log).\n\n\
                 Recommended File:\n\
                   • cdi220b.rom (512 KB, Philips CD-i 220 European PAL BIOS)\n\
                     SHA-1: 53360A1F21DDAC952E95306CED64186A3FC0B93E\n\
                     MD5:   AC0D468BE366779C9DF633BE98DA250A\n\n\
                 Alternative Supported BIOSes:\n\
-                  • cdi220.rom, cdi200.rom, cdi490a.rom\n\n\
+                  • cdi200.rom, cdi.rom, cdimono1.zip / cdibios.zip\n\
+                  • cdi220.rom is a truncated dump; cdi490a.rom is not emulated yet\n\n\
                 Where to place the BIOS ROM:\n\
                   1. In a 'bios/' subfolder next to opencdi.exe\n\
                   2. OR directly in the same folder as opencdi.exe\n\
@@ -378,7 +421,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     match m.load_bios(&bios_path) {
-        Ok(()) => info!("Loaded system BIOS from {:?}", bios_path),
+        Ok(r) if r.status == bios::Status::Ok => info!("Loaded system BIOS from {:?}: {}", bios_path, r.message),
+        Ok(r) => warn!("Loaded system BIOS from {:?} [{}]: {}", bios_path, r.status, r.message),
         Err(e) => {
             error!("Cannot use system BIOS {:?}: {}", bios_path, e);
             eprintln!("Cannot use system BIOS {:?}: {}", bios_path, e);
@@ -411,7 +455,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dvc_arg = flag_value("--dvc").map(PathBuf::from);
     if !dvc_disabled {
         if let Some(dvc_path) = dvc_arg.clone().or_else(find_dvc_rom) {
-            if let Ok(_) = m.load_dvc_rom(&dvc_path) {
+            if load_dvc_logged(&mut m, &dvc_path) {
                 info!("Loaded Digital Video Cartridge (DVC) ROM from {:?}", dvc_path);
             }
         } else {
@@ -967,7 +1011,7 @@ impl App {
 
                             if !self.dvc_disabled && !self.m.bus.dvc.is_fitted() {
                                 if let Some(dvc_path) = self.dvc_arg.clone().or_else(find_dvc_rom) {
-                                    if let Ok(_) = self.m.load_dvc_rom(&dvc_path) {
+                                    if load_dvc_logged(&mut self.m, &dvc_path) {
                                         info!("Loaded Digital Video Cartridge (DVC) extension from {:?}", dvc_path);
                                         #[cfg(target_os = "windows")]
                                         gui::update_dvc_menu(true);
@@ -1115,7 +1159,7 @@ impl App {
                         gui::update_dvc_menu(false);
                     } else {
                         if let Some(dvc_path) = self.dvc_arg.clone().or_else(find_dvc_rom) {
-                            if let Ok(_) = self.m.load_dvc_rom(&dvc_path) {
+                            if load_dvc_logged(&mut self.m, &dvc_path) {
                                 info!("Inserted Digital Video Cartridge (DVC) from {:?}", dvc_path);
                                 #[cfg(target_os = "windows")]
                                 gui::update_dvc_menu(true);

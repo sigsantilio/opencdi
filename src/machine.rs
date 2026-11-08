@@ -1,3 +1,4 @@
+use crate::bios::{self, BiosImage};
 use crate::bus::CdiBus;
 use m68k::AddressBus;
 use crate::mcd212::VideoMode;
@@ -17,12 +18,71 @@ impl Machine {
         Self { bus: CdiBus::new(), cpu: CpuCore::new(), instructions: 0, os9_trace: Os9Trace::from_env() }
     }
 
-    pub fn load_bios<P: AsRef<Path>>(&mut self, path: P) -> std::io::Result<()> {
-        self.bus.load_rom(path)
+    /// Reads and checks a system ROM file or zip; the name is the zip entry used, if any.
+    pub fn read_bios<P: AsRef<Path>>(path: P) -> std::io::Result<(Option<String>, BiosImage)> {
+        let data = std::fs::read(path)?;
+        if bios::is_zip(&data) {
+            let (entry, img) = bios::best_in_zip(&data).map_err(std::io::Error::other)?;
+            Ok((Some(entry), img))
+        } else {
+            Ok((None, bios::inspect(data)))
+        }
+    }
+
+    /// Loads a checked system ROM; refuses images whose check failed.
+    pub fn load_bios<P: AsRef<Path>>(&mut self, path: P) -> std::io::Result<bios::Report> {
+        let (entry, img) = Self::read_bios(path)?;
+        let mut report = img.report.clone();
+        if let Some(e) = entry {
+            report.message = format!("{}: {}", e, report.message);
+        }
+        if report.status == bios::Status::Error {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, report.message));
+        }
+        self.load_bios_image(&img);
+        Ok(report)
+    }
+
+    pub fn load_bios_image(&mut self, img: &BiosImage) {
+        let rom = &mut self.bus.rom;
+        let len = img.data.len().min(rom.len());
+        rom[..len].copy_from_slice(&img.data[..len]);
+        // Reset vectors (SSP at 0, PC at 4) are read from plane A RAM, as in CdiBus::load_rom.
+        self.bus.mcd212.plane_a[0..8].copy_from_slice(&rom[0..8]);
     }
 
     pub fn load_dvc_rom<P: AsRef<Path>>(&mut self, path: P) -> std::io::Result<()> {
         self.bus.load_dvc_rom(path)
+    }
+
+    /// Reads a DVC cartridge ROM (`.rom` or a zip holding `vmpega.rom`) and checks it; nothing is fitted.
+    pub fn read_dvc<P: AsRef<Path>>(path: P) -> std::io::Result<(Option<String>, BiosImage)> {
+        let data = std::fs::read(path)?;
+        if bios::is_zip(&data) {
+            let (entry, img) = bios::best_dvc_in_zip(&data).map_err(std::io::Error::other)?;
+            Ok((Some(entry), img))
+        } else {
+            Ok((None, bios::inspect_dvc(data)))
+        }
+    }
+
+    /// Fits a checked cartridge ROM.
+    pub fn load_dvc_image(&mut self, img: &BiosImage) {
+        self.bus.dvc.load_rom_bytes(&img.data);
+    }
+
+    /// Checks and fits a cartridge ROM; refuses images whose check failed (an unknown image loads with a warning).
+    pub fn load_dvc<P: AsRef<Path>>(&mut self, path: P) -> std::io::Result<bios::Report> {
+        let (entry, img) = Self::read_dvc(path)?;
+        let mut report = img.report.clone();
+        if let Some(e) = entry {
+            report.message = format!("{}: {}", e, report.message);
+        }
+        if report.status == bios::Status::Error {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, report.message));
+        }
+        self.load_dvc_image(&img);
+        Ok(report)
     }
 
     pub fn load_disc<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Box<dyn std::error::Error>> {

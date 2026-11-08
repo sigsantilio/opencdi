@@ -42,6 +42,7 @@ required-features = ["host"]
 [dependencies]
 byteorder = "1.5.0"
 chd = "0.3.4"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 cpal = { version = "0.18.2", optional = true }
 env_logger = { version = "0.11.11", optional = true }
 gilrs = { version = "0.11.2", optional = true }
