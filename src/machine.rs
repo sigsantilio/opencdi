@@ -1,5 +1,5 @@
 use crate::bios::{self, BiosImage};
-use crate::bus::CdiBus;
+use crate::bus::{BoardKind, CdiBus};
 use m68k::AddressBus;
 use crate::mcd212::VideoMode;
 use crate::os9_trace::Os9Trace;
@@ -52,7 +52,9 @@ impl Machine {
     }
 
     pub fn load_dvc_rom<P: AsRef<Path>>(&mut self, path: P) -> std::io::Result<()> {
-        self.bus.load_dvc_rom(path)
+        self.bus.load_dvc_rom(path)?;
+        self.bus.dvc.impeg = self.bus.board == BoardKind::Mono4;
+        Ok(())
     }
 
     /// Reads a DVC cartridge ROM (`.rom` or a zip holding `vmpega.rom`) and checks it; nothing is fitted.
@@ -69,6 +71,7 @@ impl Machine {
     /// Fits a checked cartridge ROM.
     pub fn load_dvc_image(&mut self, img: &BiosImage) {
         self.bus.dvc.load_rom_bytes(&img.data);
+        self.bus.dvc.impeg = self.bus.board == BoardKind::Mono4;
     }
 
     /// Checks and fits a cartridge ROM; refuses images whose check failed (an unknown image loads with a warning).
@@ -97,6 +100,7 @@ impl Machine {
         self.cpu.set_cpu_type(CpuType::SCC68070);
         self.cpu.reset(&mut self.bus);
         self.bus.emulate_wait_states = true;
+        self.bus.counters.halted = false;
     }
 
     pub fn framebuffer(&self) -> &[u32] {
@@ -179,9 +183,10 @@ impl Machine {
 
                 line_cycles += batch_cycles;
                 bus.tick_timer(batch_cycles as u32);
-                if bus.slave.reset_request {
+                if bus.board_reset_request() {
                     bus.player_reset();
                     cpu.reset(bus);
+                    bus.counters.halted = false;
                 }
                 cpu.set_irq(highest_ipl(bus));
             }
@@ -190,10 +195,17 @@ impl Machine {
 
             bus.render_scanline(line);
 
-            bus.tick_slave(cyc_per_line);
-            bus.tick_cdic(cyc_per_line);
-            bus.tick_dvc(cyc_per_line);
+            bus.tick_board(cyc_per_line);
             bus.tick_audio(cyc_per_line);
+        }
+        bus.counters.end_frame();
+        // A double fault parks the CPU for good; say so once instead of idling silently.
+        if cpu.is_halted() && !bus.counters.halted {
+            bus.counters.halted = true;
+            eprintln!("CPU halted (double fault) at frame {} pc {:06X}", bus.current_frame, cpu.pc);
+        }
+        if bus.taps.pc && bus.counters.frames % 10 == 0 {
+            eprintln!("PC F{} {:06X}", bus.current_frame, cpu.pc);
         }
     }
 }
@@ -207,7 +219,5 @@ impl Default for Machine {
 pub fn highest_ipl(bus: &mut CdiBus) -> u8 {
     let int1_lvl = bus.scc_timer.int1_level();
     let timer_lvl = if bus.scc_timer.timer_irq { bus.scc_timer.picr1 & 7 } else { 0 };
-    let cdic_lvl = if bus.in4_pending() { 4 } else { 0 };
-    let slave_lvl = if bus.slave.irq_pending { 2 } else { 0 };
-    int1_lvl.max(timer_lvl).max(cdic_lvl).max(slave_lvl)
+    int1_lvl.max(timer_lvl).max(bus.board_ipl())
 }
