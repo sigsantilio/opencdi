@@ -697,41 +697,50 @@ impl Dvc {
         self.reset_regs();
     }
 
-    pub fn reset_stream(&mut self) {
+    pub fn reset_video_stream(&mut self) {
         self.video_playing = false;
         self.video_armed = false;
         self.decoder_enabled = false;
+        self.fmv_playback_active = false;
+        self.fmv_decoder_active = false;
+        self.video_decoder = None;
+        self.frames_decoded_count = 0;
+        self.frames_presented_count = 0;
+        self.underflow_count = 0;
+        self.frame_accum = 0.0;
+        self.display_timecode = 0;
+        self.decoder_timecode = 0;
+        self.display_frame_counter = 0;
+        self.decoder_frame_counter = 0;
+        self.dvc_stream_fifo.clear();
+        self.demux.clear();
+        self.set_fmv_word(0x58, 0);
+        self.set_fmv_word(0x5A, 0);
+        self.set_fmv_word(0x08, 0);
+        self.set_fmv_word(0x0A, 0);
+        self.set_fmv_word(0x5C, 0x0000);
+    }
+
+    pub fn reset_stream(&mut self) {
+        self.reset_video_stream();
         self.audio_armed = false;
         self.audio_enabled = false;
         self.vcd_pixel_clock_13_5 = false;
-        self.fmv_playback_active = false;
-        self.fmv_decoder_active = false;
         self.dma_requested = false;
         self.total_cycles = 0;
         self.dclk = 0;
         self.dclk_accum = 0;
         self.timer_accum = 0;
         self.timer_counter = 0;
-        self.dvc_stream_fifo.clear();
         self.fma_stream_fifo.clear();
         self.transfer_for_fma = false;
         self.fma_dma_seen = false;
-        self.demux.clear();
         self.fma_demux.clear();
         self.mp2.reset();
         self.audio_out.clear();
         self.audio_stopped = true;
-        self.video_decoder = None;
-        self.frames_decoded_count = 0;
-        self.frames_presented_count = 0;
         self.vsync_counter = 0;
-        self.underflow_count = 0;
         self.reset_fma_schedule();
-        self.frame_accum = 0.0;
-        self.display_timecode = 0;
-        self.decoder_timecode = 0;
-        self.display_frame_counter = 0;
-        self.decoder_frame_counter = 0;
         // NOTE: Real DVC hardware keeps the last decoded picture in DRAM.
         // Screen blanking and plane transitions are managed by MCD-212.
     }
@@ -1191,9 +1200,7 @@ impl Dvc {
                     self.set_fmv_word(0x5C, 0x0000);
                 }
                 if value & 0x0100 != 0 { // RESET
-                    self.video_playing = false;
-                    self.video_armed = false;
-                    self.reset_stream();
+                    self.reset_video_stream();
                     self.set_fmv_word(FMV_ISR, 0);
                 }
                 if value & 0x1000 != 0 { // DEC_ON

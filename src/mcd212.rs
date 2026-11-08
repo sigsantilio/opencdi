@@ -532,9 +532,6 @@ impl Mcd212 {
             }
             0xC0 => {
                 if PATH == 0 {
-                    if self.image_coding_method != val {
-                        println!(">>> [Scanline {}] ICMR changed from 0x{:08X} to 0x{:08X}", self.scanline, self.image_coding_method, val);
-                    }
                     self.image_coding_method = val;
                 }
             }
