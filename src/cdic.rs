@@ -288,7 +288,7 @@ impl Cdic {
                     if !self.map_on {
                         self.map_on = true;
                         self.map_next = if bit11_start { 0x2800 } else { val & 0x3A00 };
-                        if self.buf_addr == 0xFFFF && !self.start_map_buffer(0) && bit11_start {
+                        if self.buf_addr == 0xFFFF && !self.start_map_buffer(0) {
                             self.map_finished = true;
                         }
                     }
@@ -494,7 +494,7 @@ impl Cdic {
         self.buf_group = due;
     }
 
-    // Plays the audio map buffer in real time; when it has played ABUF bit 15 is set (also after a stop) and the next buffer starts at once.
+    // Plays the audio map buffer in real time; when it has played ABUF bit 15 is set (also after a stop) and the next buffer starts at once, or coding 0xFF ends the map with the finished flag.
     fn step_audio_map(&mut self, cycles: u32) {
         if self.buf_addr == 0xFFFF {
             return;
@@ -511,7 +511,11 @@ impl Cdic {
             self.buf_addr = 0xFFFF;
             self.audio_buffer |= 0x8000;
             self.update_interrupt();
-            if !self.map_on || !self.start_map_buffer(rest) {
+            if !self.map_on {
+                return;
+            }
+            if !self.start_map_buffer(rest) {
+                self.map_finished = true;
                 return;
             }
         }
@@ -984,6 +988,34 @@ mod tests {
         tick(&mut c, 8);
         assert_eq!(c.read_reg(0x3F4) & 0x8000, 0x8000);
         assert_eq!(c.audio.total_sectors_decoded, 2);
+        assert_eq!(c.read_reg(0x3FA), 0x2001);
+        assert_eq!(c.read_reg(0x3FA), 0x2000);
+    }
+
+    #[test]
+    fn a_running_map_meeting_coding_ff_sets_the_finished_flag_and_clears_bit_11() {
+        let mut c = Cdic::new();
+        c.audio_channel = 0;
+        c.ram[0x2800 + 11] = 0x05;
+        c.ram[0x3200 + 11] = 0xFF;
+        c.write_reg(0x3FA, 0x2800);
+        tick(&mut c, 7);
+        assert_eq!(c.read_reg(0x3FA), 0x2800);
+        tick(&mut c, 1);
+        assert_eq!(c.read_reg(0x3F4) & 0x8000, 0x8000);
+        assert!(!c.map_on);
+        assert_eq!(c.read_reg(0x3FA), 0x2001);
+        assert_eq!(c.read_reg(0x3FA), 0x2000);
+    }
+
+    #[test]
+    fn audctl_start_with_bit_13_over_an_empty_map_ends_at_once_with_the_finished_flag() {
+        let mut c = Cdic::new();
+        c.audio_channel = 0;
+        c.ram[0x2800 + 11] = 0xFF;
+        c.write_reg(0x3FA, 0x2800);
+        assert!(!c.map_on);
+        assert_eq!(c.read_reg(0x3FA), 0x2001);
         assert_eq!(c.read_reg(0x3FA), 0x2000);
     }
 
