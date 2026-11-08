@@ -10,7 +10,7 @@ use crate::mcd212::VideoMode;
 use crate::dvc::mpeg::{Buffer, Frame, Plane, Video};
 use crate::dvc::mpeg::video::Motion;
 
-const SAVESTATE_MAGIC: &[u8; 8] = b"OCDIST03";
+const SAVESTATE_MAGIC: &[u8; 8] = b"OCDIST04";
 
 struct StateWriter {
     buf: Vec<u8>,
@@ -494,7 +494,8 @@ pub fn save_state_to_file<P: AsRef<Path>>(
         w.write_opt_u64(dm.scr_base);
         w.write_u64(dm.mux_rate);
         w.write_u64(dm.pack_bytes);
-        w.write_u64(dm.tick_bytes);
+        w.write_opt_u64(dm.run);
+        w.write_u64(dm.run_frac);
         w.write_u32(dm.due.len() as u32);
         for &d in &dm.due {
             w.write_u64(d);
@@ -890,7 +891,8 @@ pub fn load_state_from_file<P: AsRef<Path>>(
         dm.scr_base = r.read_opt_u64()?;
         dm.mux_rate = r.read_u64()?;
         dm.pack_bytes = r.read_u64()?;
-        dm.tick_bytes = r.read_u64()?;
+        dm.run = r.read_opt_u64()?;
+        dm.run_frac = r.read_u64()?;
         let n = r.read_u32()?;
         dm.due.clear();
         if n as usize > crate::dvc::DUE_RING {

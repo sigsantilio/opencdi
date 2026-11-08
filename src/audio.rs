@@ -155,8 +155,8 @@ impl Resampler {
 
 // Silence in front of an ADPCM stream that starts from empty: one sector period, as the decoder needs a whole sector first.
 pub const ADPCM_LATENCY: usize = OUT_RATE as usize / 75;
-// An MPEG stream starts one Layer II frame late, so decode times quantised to 1/75 s cannot run it dry.
-pub const MPEG_LATENCY: usize = 1152;
+// An MPEG stream starts 70 frames (1.6 ms) after its first decoded samples, as the decoder output FIFO fills first.
+pub const MPEG_LATENCY: usize = 70;
 // An MPEG stream holding more than this (two seconds) is reported; nothing is dropped.
 const MPEG_WARN: usize = 2 * OUT_RATE as usize;
 
@@ -952,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn mpeg_starts_one_frame_late() {
+    fn mpeg_starts_after_the_output_fifo_fills() {
         let mut a = CdiAudio::new();
         a.push_mpeg(&mut VecDeque::from(vec![(0.25, 0.25); 1152]), 44_100);
         assert_eq!(a.mpeg.len(), MPEG_LATENCY + 1152);

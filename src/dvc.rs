@@ -229,9 +229,11 @@ pub struct MpegSystemDemux {
     /// Decode clock: pack SCR in 22.5 kHz units and mux rate in 50 byte/s units, set at each pack header.
     pub scr_base: Option<u64>,
     pub mux_rate: u64,
-    /// Bytes fed since the last pack header (4 at the header itself); the tick path counts its own bytes.
+    /// Bytes fed since the last pack header (4 at the header itself).
     pub pack_bytes: u64,
-    pub tick_bytes: u64,
+    /// Free-running decode clock (22.5 kHz units): runs with the CPU between pack headers and never steps back; `run_frac` is its sub-unit remainder.
+    pub run: Option<u64>,
+    pub run_frac: u64,
     /// Scheduled decode times (22.5 kHz units), one per audio frame, capped like a hardware ring of 32.
     pub due: VecDeque<u64>,
     pub last_due: Option<u64>,
@@ -271,7 +273,8 @@ impl MpegSystemDemux {
         self.scr_base = None;
         self.mux_rate = 0;
         self.pack_bytes = 0;
-        self.tick_bytes = 0;
+        self.run = None;
+        self.run_frac = 0;
         self.due.clear();
         self.last_due = None;
         self.interval = 0;
@@ -321,10 +324,30 @@ impl MpegSystemDemux {
         self.clock_at(self.pack_bytes)
     }
 
-    /// Clock extrapolated by the 1/75 s tick (2,352 bytes each) once more than 4,703 bytes passed without a pack header.
-    pub fn tick_clock(&mut self) -> Option<u64> {
-        self.tick_bytes += 2352;
-        if self.tick_bytes > 4703 { self.clock_at(self.tick_bytes) } else { None }
+    /// Moves the free-running clock forward to a data clock reading and returns it; a reading behind it changes nothing.
+    pub fn merge_clock(&mut self, c: u64) -> u64 {
+        match self.run {
+            Some(r) if !clock_before(r, c) => r,
+            _ => {
+                self.run = Some(c);
+                c
+            }
+        }
+    }
+
+    /// Runs the free-running clock for `cycles` at 176,400 bytes/s of stream data (2,352 per 1/75 s).
+    pub fn run_clock(&mut self, cycles: u32, cpu_hz: u64) -> Option<u64> {
+        let r = self.run?;
+        if self.mux_rate == 0 {
+            return None;
+        }
+        let per_unit = cpu_hz * self.mux_rate;
+        self.run_frac += cycles as u64 * 176_400 * 450;
+        let n = self.run_frac / per_unit;
+        self.run_frac %= per_unit;
+        let r = (r + n) & CLOCK_MASK;
+        self.run = Some(r);
+        Some(r)
     }
 
     fn eat(&mut self, n: usize) {
@@ -370,7 +393,6 @@ impl MpegSystemDemux {
                         self.mux_rate = Self::decode_mpeg1_mux(&self.pending[9..12]);
                         self.pending.drain(..12);
                         self.pack_bytes = 4;
-                        self.tick_bytes = 0;
                         self.events.push(AudioEvent { packet: false, pts: None, clock: self.clock() });
                     } else {
                         if self.pending.len() < 14 {
@@ -874,6 +896,16 @@ impl Dvc {
     pub fn tick(&mut self, cycles: u32) {
         self.total_cycles += cycles as u64;
 
+        for which in 0..2 {
+            let hz = self.cpu_hz;
+            if let Some(clock) = self.audio_demux(which).run_clock(cycles, hz) {
+                let d = self.audio_demux(which);
+                d.backfill(clock);
+                let n = d.pop_due(clock);
+                self.decode_due(which, n);
+            }
+        }
+
         self.fma_tick_accum += (cycles as u64) * 75;
         while self.fma_tick_accum >= self.cpu_hz {
             self.fma_tick_accum -= self.cpu_hz;
@@ -1365,20 +1397,12 @@ impl Dvc {
         self.fma_pending |= FMA_IRQ_UNF;
     }
 
-    // Decode events reach the ISR and status words on the next 1/75 s tick, then the starved clock runs.
+    // Decode events reach the ISR and status words on the next 1/75 s tick.
     fn fma_tick(&mut self) {
         let bits = std::mem::take(&mut self.fma_pending);
         if bits != 0 {
             self.or_fma_word(FMA_ISR, bits);
             self.or_fma_word(0x02, bits & (FMA_IRQ_DEC | FMA_IRQ_UNF));
-        }
-        for which in 0..2 {
-            let d = self.audio_demux(which);
-            if let Some(clock) = d.tick_clock() {
-                d.backfill(clock);
-                let n = d.pop_due(clock);
-                self.decode_due(which, n);
-            }
         }
     }
 
@@ -1392,6 +1416,7 @@ impl Dvc {
             let events = std::mem::take(&mut self.audio_demux(which).events);
             for ev in events {
                 let d = self.audio_demux(which);
+                let clock = ev.clock.map(|c| d.merge_clock(c));
                 if ev.packet {
                     if let Some(t) = ev.pts {
                         d.backfill(t);
@@ -1400,11 +1425,11 @@ impl Dvc {
                     if d.due.is_empty() {
                         continue;
                     }
-                    if let Some(c) = ev.clock {
+                    if let Some(c) = clock {
                         d.backfill(c);
                     }
                 }
-                if let Some(c) = ev.clock {
+                if let Some(c) = clock {
                     let n = d.pop_due(c);
                     self.decode_due(which, n);
                 }
@@ -1790,13 +1815,15 @@ mod timing_tests {
     }
 
     #[test]
-    fn tick_clock_waits_for_two_ticks_without_a_pack() {
+    fn free_running_clock_advances_with_the_cpu_and_never_steps_back() {
         let mut d = MpegSystemDemux::default();
+        assert_eq!(d.run_clock(1000, 15_000_000), None);
         d.feed(&pack(0, 3528));
-        assert_eq!(d.tick_clock(), None);
-        assert_eq!(d.tick_clock(), Some(2 * 2352 * 450 / 3528));
-        d.feed(&pack(900, 3528));
-        assert_eq!(d.tick_bytes, 0);
+        assert_eq!(d.merge_clock(d.clock().unwrap()), 0);
+        assert_eq!(d.run_clock(15_000_000 / 75 * 2, 15_000_000), Some(600));
+        assert_eq!(d.merge_clock(300), 600);
+        assert_eq!(d.merge_clock(900), 900);
+        assert_eq!(d.run_clock(15_000_000 / 75, 15_000_000), Some(1200));
     }
 
     // Layer II frame with one non-silent subband (sample code 0 of a three-level quantiser).
