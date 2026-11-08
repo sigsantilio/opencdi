@@ -221,6 +221,154 @@ fn find_bios_rom() -> Option<PathBuf> {
     bios::best(found).filter(|(_, img)| img.report.status != bios::Status::Error).map(|(p, _)| p)
 }
 
+fn find_all_available_bioses() -> Vec<(PathBuf, String)> {
+    let mut seen = HashSet::new();
+    let mut bioses = Vec::new();
+
+    let mut dirs_to_scan = vec![
+        PathBuf::from("bios"),
+        PathBuf::from("."),
+        PathBuf::from("file utili/bios"),
+        PathBuf::from("../file utili/bios"),
+    ];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            dirs_to_scan.push(parent.join("bios"));
+            dirs_to_scan.push(parent.to_path_buf());
+            dirs_to_scan.push(parent.join("file utili").join("bios"));
+            dirs_to_scan.push(parent.join("..").join("file utili").join("bios"));
+        }
+    }
+
+    for dir in dirs_to_scan {
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let p = entry.path();
+                if !p.is_file() {
+                    continue;
+                }
+                let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                if ext != "rom" && ext != "bin" && ext != "zip" {
+                    continue;
+                }
+                let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
+                if !seen.insert(canon) {
+                    continue;
+                }
+                match Machine::read_bios(&p) {
+                    Ok((entry, img)) if img.report.status != bios::Status::Error => {
+                        let file_str = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                        let label = if let Some(k) = img.report.known {
+                            if let Some(e) = entry {
+                                format!("{} [{} / {}]", k.model, file_str, e)
+                            } else {
+                                format!("{} ({})", k.model, file_str)
+                            }
+                        } else {
+                            format!("Custom CD-i ROM ({})", file_str)
+                        };
+                        bioses.push((p, label));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    bioses
+}
+
+fn resolve_or_guide_bios(rom_arg: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(p) = rom_arg {
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Some(saved) = opencdi::frontend::load_saved_bios() {
+        if Machine::read_bios(&saved).is_ok() {
+            info!("Loaded saved system BIOS from configuration (opencdi.ini): {:?}", saved);
+            return Some(saved);
+        }
+    }
+    if let Some(found) = find_bios_rom() {
+        return Some(found);
+    }
+
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use std::os::windows::ffi::OsStrExt;
+        let prompt_text =
+            "OpenCDi - Philips CD-i System BIOS Missing\n            ==========================================\n\n            Nessun file BIOS di sistema Philips CD-i è stato trovato nelle cartelle di ricerca.\n            OpenCDi richiede una ROM BIOS autentica (es. cdi220b.rom, cdi490a.rom, cdimono1.zip).\n\n            Cosa desideri fare?\n\n            • [SÌ] SFOGLIA: Seleziona manualmente il file del BIOS (o archivio .zip) dal tuo PC\n            • [NO] GUIDAMI ALLA CARTELLA: Crea e apri la cartella 'bios/' in Esplora Risorse dove puoi copiare i file ROM\n            • [ANNULLA] Esci da OpenCDi";
+
+        let wide_text: Vec<u16> = std::ffi::OsStr::new(prompt_text).encode_wide().chain(std::iter::once(0)).collect();
+        let wide_title: Vec<u16> = std::ffi::OsStr::new("OpenCDi - Required BIOS Missing").encode_wide().chain(std::iter::once(0)).collect();
+
+        loop {
+            let res = MessageBoxW(
+                std::ptr::null_mut(),
+                wide_text.as_ptr(),
+                wide_title.as_ptr(),
+                0x0000_0003 | 0x0000_0020, // MB_YESNOCANCEL | MB_ICONQUESTION
+            );
+
+            if res == 6 { // IDYES
+                if let Some(picked) = gui::open_bios_dialog(std::ptr::null_mut()) {
+                    match Machine::read_bios(&picked) {
+                        Ok((_, img)) if img.report.status != bios::Status::Error => {
+                            opencdi::frontend::save_bios_preference(&picked);
+                            return Some(picked);
+                        }
+                        Ok((_, img)) => {
+                            let err_msg = format!("Il file selezionato è stato rifiutato come BIOS CD-i:\n\n{}", img.report.message);
+                            let wide_err: Vec<u16> = std::ffi::OsStr::new(&err_msg).encode_wide().chain(std::iter::once(0)).collect();
+                            MessageBoxW(std::ptr::null_mut(), wide_err.as_ptr(), wide_title.as_ptr(), 0x0000_0000 | 0x0000_0010); // MB_OK | MB_ICONERROR
+                        }
+                        Err(e) => {
+                            let err_msg = format!("Impossibile aprire il file selezionato:\n\n{}", e);
+                            let wide_err: Vec<u16> = std::ffi::OsStr::new(&err_msg).encode_wide().chain(std::iter::once(0)).collect();
+                            MessageBoxW(std::ptr::null_mut(), wide_err.as_ptr(), wide_title.as_ptr(), 0x0000_0000 | 0x0000_0010);
+                        }
+                    }
+                }
+            } else if res == 7 { // IDNO
+                let bios_dir = Path::new("bios");
+                let _ = std::fs::create_dir_all(bios_dir);
+                gui::open_folder(bios_dir);
+
+                let guide_text =
+                    "La cartella 'bios/' è stata aperta in Esplora Risorse!\n\n                    Copia nella cartella uno o più dei seguenti file:\n                      • cdi220b.rom (512 KB, Philips CD-i 220 European PAL - consigliato)\n                      • cdi490a.rom (512 KB, Philips CD-i 490 Mono-IV)\n                      • vmpega.rom (256 KB, Digital Video Cartridge per FMV/MPEG)\n                      • oppure archivi cdimono1.zip / cdibios.zip\n\n                    Dopo aver copiato i file, clicca [OK] per verificare e avviare OpenCDi.";
+
+                let wide_guide: Vec<u16> = std::ffi::OsStr::new(guide_text).encode_wide().chain(std::iter::once(0)).collect();
+                let guide_res = MessageBoxW(
+                    std::ptr::null_mut(),
+                    wide_guide.as_ptr(),
+                    wide_title.as_ptr(),
+                    0x0000_0001 | 0x0000_0040, // MB_OKCANCEL | MB_ICONINFORMATION
+                );
+
+                if guide_res == 1 { // IDOK
+                    if let Some(found) = find_bios_rom() {
+                        opencdi::frontend::save_bios_preference(&found);
+                        return Some(found);
+                    } else {
+                        let not_found = "Nessun BIOS valido trovato nella cartella 'bios/'.\nAssicurati di aver incollato il file (es. cdi220b.rom) e riprova.";
+                        let wide_nf: Vec<u16> = std::ffi::OsStr::new(not_found).encode_wide().chain(std::iter::once(0)).collect();
+                        MessageBoxW(std::ptr::null_mut(), wide_nf.as_ptr(), wide_title.as_ptr(), 0x0000_0000 | 0x0000_0030); // MB_OK | MB_ICONWARNING
+                    }
+                }
+            } else {
+                // IDCANCEL
+                return None;
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    None
+}
+
 // First candidate that passes the cartridge check; refused files are logged with the reason.
 fn find_dvc_rom() -> Option<PathBuf> {
     const DVC_CANDIDATES: &[&str] = &[
@@ -406,64 +554,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Debug Slave XBUS abilitato (--slave-debug): log byte CH0 (mouse)");
     }
 
-    // 1. Load BIOS ROM
-    let bios_path = match rom_arg.or_else(find_bios_rom) {
+    // 1. Load BIOS ROM (CLI --rom, saved config, auto-detect, or interactive guide)
+    let bios_path = match resolve_or_guide_bios(rom_arg.clone()) {
         Some(path) => path,
         None => {
-            let error_msg =
-                "OpenCDi - Required System BIOS Missing\n\
-                ======================================\n\n\
-                The emulator cannot start because no usable Philips CD-i system BIOS ROM was found (see the log).\n\n\
-                Recommended File:\n\
-                  • cdi220b.rom (512 KB, Philips CD-i 220 European PAL BIOS)\n\
-                    SHA-1: 53360A1F21DDAC952E95306CED64186A3FC0B93E\n\
-                    MD5:   AC0D468BE366779C9DF633BE98DA250A\n\n\
-                Alternative Supported BIOSes:\n\
-                  • cdi200.rom, cdi.rom, cdimono1.zip / cdibios.zip\n\
-                  • cdi220.rom is a truncated dump; cdi490a.rom is not emulated yet\n\n\
-                Where to place the BIOS ROM:\n\
-                  1. In a 'bios/' subfolder next to opencdi.exe\n\
-                  2. OR directly in the same folder as opencdi.exe\n\
-                  3. OR pass it on the command line: --rom <path>\n\n\
-                Digital Video Cartridge (DVC) for MPEG / FMV games:\n\
-                  • Place 'vmpega.rom' (256 KB) in 'dvc/', 'bios/', or next to opencdi.exe.";
-
-            error!("{}", error_msg);
-
-            #[cfg(target_os = "windows")]
-            unsafe {
-                use std::os::windows::ffi::OsStrExt;
-                let wide_text: Vec<u16> = std::ffi::OsStr::new(error_msg)
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect();
-                let wide_title: Vec<u16> = std::ffi::OsStr::new("OpenCDi - Required BIOS Missing")
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect();
-                MessageBoxW(
-                    std::ptr::null_mut(),
-                    wide_text.as_ptr(),
-                    wide_title.as_ptr(),
-                    0x0000_0000 | 0x0000_0010, // MB_OK | MB_ICONERROR
-                );
-            }
-            std::process::exit(1);
+            info!("OpenCDi exit: no system BIOS selected.");
+            std::process::exit(0);
         }
     };
-    match m.load_bios(&bios_path) {
-        Ok(r) if r.status == bios::Status::Ok => info!("Loaded system BIOS from {:?}: {}", bios_path, r.message),
-        Ok(r) => warn!("Loaded system BIOS from {:?} [{}]: {}", bios_path, r.status, r.message),
+    let bios_report = match m.load_bios(&bios_path) {
+        Ok(r) if r.status == bios::Status::Ok => {
+            info!("Loaded system BIOS from {:?}: {}", bios_path, r.message);
+            Some(r)
+        }
+        Ok(r) => {
+            warn!("Loaded system BIOS from {:?} [{}]: {}", bios_path, r.status, r.message);
+            Some(r)
+        }
         Err(e) => {
             error!("Cannot use system BIOS {:?}: {}", bios_path, e);
             eprintln!("Cannot use system BIOS {:?}: {}", bios_path, e);
             std::process::exit(1);
         }
-    }
+    };
 
-    if let Some(b) = board {
+    let detected_board = if bios_report.as_ref().map_or(false, |r| r.board == Some(bios::Board::Mono4)) {
+        Some(BoardKind::Mono4)
+    } else {
+        Some(BoardKind::Mono1)
+    };
+    if let Some(b) = board.or(detected_board) {
         m.bus.set_board(b);
     }
+    let available_bioses = find_all_available_bioses();
 
     // 2. Load NVRAM if present
     let nvram_arg = flag_value("--nvram").map(PathBuf::from);
@@ -497,10 +620,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2b. Load DVC ROM (Digital Video Cartridge) by default if present
     let dvc_disabled = has_flag("--no-dvc") || has_flag("--nodvc");
     let dvc_arg = flag_value("--dvc").map(PathBuf::from);
+    let mut resolved_dvc_path = None;
     if !dvc_disabled {
-        if let Some(dvc_path) = dvc_arg.clone().or_else(find_dvc_rom) {
+        let dvc_candidate = dvc_arg.clone()
+            .or_else(opencdi::frontend::load_saved_dvc)
+            .or_else(find_dvc_rom);
+        if let Some(dvc_path) = dvc_candidate {
             if load_dvc_logged(&mut m, &dvc_path) {
                 info!("Loaded Digital Video Cartridge (DVC) ROM from {:?}", dvc_path);
+                resolved_dvc_path = Some(dvc_path);
             }
         } else {
             info!("No DVC ROM (vmpega.rom) found: booting in Base CD-i mode (MPEG video disabled).");
@@ -619,6 +747,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_frames,
         current_game_name,
         nvram_path: Some(resolved_nvram_path),
+        active_bios_path: bios_path.clone(),
+        available_bioses,
+        bios_report,
+        dvc_path: resolved_dvc_path,
         start_fullscreen,
         no_menu,
         monitor_index,
@@ -773,6 +905,10 @@ struct App {
     max_frames: Option<u64>,
     current_game_name: String,
     nvram_path: Option<PathBuf>,
+    active_bios_path: PathBuf,
+    available_bioses: Vec<(PathBuf, String)>,
+    bios_report: Option<bios::Report>,
+    dvc_path: Option<PathBuf>,
     start_fullscreen: bool,
     no_menu: bool,
     monitor_index: Option<usize>,
@@ -914,6 +1050,81 @@ impl App {
         }
     }
 
+    fn switch_bios(&mut self, new_path: &Path) -> bool {
+        info!("Switching system BIOS to: {:?}", new_path);
+        let (entry, img) = match Machine::read_bios(new_path) {
+            Ok(res) => res,
+            Err(e) => {
+                error!("Cannot read BIOS file {:?}: {}", new_path, e);
+                #[cfg(target_os = "windows")]
+                gui::show_disc_error(self.hwnd(), &format!("Cannot read BIOS file:\n\n{:?}\n\nError: {}", new_path, e));
+                return false;
+            }
+        };
+
+        if img.report.status == bios::Status::Error {
+            error!("BIOS file {:?} is invalid: {}", new_path, img.report.message);
+            #[cfg(target_os = "windows")]
+            gui::show_disc_error(self.hwnd(), &format!("Selected BIOS file was rejected:\n\n{}", img.report.message));
+            return false;
+        }
+
+        let is_mono4 = img.report.board == Some(bios::Board::Mono4);
+        let target_board = if is_mono4 { BoardKind::Mono4 } else { BoardKind::Mono1 };
+
+        self.m.bus.set_board(target_board);
+        self.m.load_bios_image(&img);
+        let mut rep = img.report.clone();
+        if let Some(e) = entry {
+            rep.message = format!("{}: {}", e, rep.message);
+        }
+        info!("Loaded system BIOS from {:?} [{}]: {}", new_path, rep.status, rep.message);
+
+        // Configure NVRAM for the target board
+        let new_nvram = if is_mono4 { default_nvram490_save_path() } else { default_nvram_save_path() };
+        if let Some(m4) = self.m.bus.mono4.as_deref_mut() {
+            let _ = m4.nvram.attach_file(&new_nvram);
+        } else {
+            self.m.bus.nvram.save_path = new_nvram.clone();
+            if new_nvram.is_file() {
+                let _ = self.m.bus.nvram.load_from_file(&new_nvram);
+            }
+        }
+        self.nvram_path = Some(new_nvram);
+
+        // Load DVC ROM if enabled
+        if !self.dvc_disabled {
+            if let Some(dvc_p) = self.dvc_arg.clone().or_else(opencdi::frontend::load_saved_dvc).or_else(find_dvc_rom) {
+                if load_dvc_logged(&mut self.m, &dvc_p) {
+                    self.dvc_path = Some(dvc_p);
+                }
+            }
+        }
+
+        // Full console & CPU reset
+        self.m.bus.reset_system();
+        self.m.cpu.reset(&mut self.m.bus);
+        self.reset_state();
+        self.mouse_captured = false;
+        self.apply_grab();
+        self.m.bus.emulate_wait_states = true;
+        self.next_frame_time = Instant::now() + self.m.bus.mcd212.video_mode.frame_duration();
+        self.run_at = Instant::now();
+        self.reset_telemetry();
+
+        self.active_bios_path = new_path.to_path_buf();
+        self.bios_report = Some(rep);
+        opencdi::frontend::save_bios_preference(new_path);
+
+        #[cfg(target_os = "windows")]
+        {
+            gui::update_bios_menu(self.hwnd(), &self.active_bios_path, &self.available_bioses);
+            gui::update_dvc_menu(self.m.bus.dvc.is_fitted());
+            self.refresh_title();
+        }
+        true
+    }
+
     fn reset_state(&mut self) {
         self.frame_count = 0;
         self.disc_launched = false;
@@ -987,6 +1198,7 @@ impl App {
             }
             Key::KeyI if ctrl => self.open_dialog_action(false),
             Key::KeyO if ctrl => self.open_dialog_action(true),
+            Key::KeyB if ctrl => push_action(GuiAction::OpenBiosDialog),
             Key::F5 => push_action(GuiAction::Reset),
             Key::KeyH if !ctrl && !self.bound(code) => push_action(GuiAction::Reset),
             Key::KeyP if !ctrl && !self.bound(code) => {
@@ -1283,6 +1495,49 @@ impl App {
                     gui::open_feedback_url();
                     #[cfg(not(target_os = "windows"))]
                     let _ = std::process::Command::new("xdg-open").arg("https://github.com/sigsantilio/opencdi/issues").spawn();
+                }
+                GuiAction::OpenBiosDialog => {
+                    #[cfg(target_os = "windows")]
+                    gui::post_menu_command(self.hwnd(), gui::ID_BIOS_SELECT);
+                }
+                GuiAction::SelectBios(path) => {
+                    self.switch_bios(&path);
+                }
+                GuiAction::OpenBiosFolder => {
+                    let bios_dir = Path::new("bios");
+                    let _ = std::fs::create_dir_all(bios_dir);
+                    #[cfg(target_os = "windows")]
+                    gui::open_folder(bios_dir);
+                }
+                GuiAction::ShowBiosInfo => {
+                    #[cfg(target_os = "windows")]
+                    gui::show_bios_info(
+                        self.hwnd(),
+                        &self.active_bios_path,
+                        self.bios_report.as_ref(),
+                        self.m.bus.board,
+                        self.m.bus.dvc.is_fitted(),
+                        self.dvc_path.as_deref(),
+                    );
+                }
+                GuiAction::SelectDvc(path) => {
+                    info!("Loading user-selected DVC ROM: {:?}", path);
+                    if load_dvc_logged(&mut self.m, &path) {
+                        self.dvc_path = Some(path.clone());
+                        opencdi::frontend::save_dvc_preference(&path);
+                        #[cfg(target_os = "windows")]
+                        gui::update_dvc_menu(true);
+                        info!("DVC ROM loaded successfully: {:?}", path);
+                    } else {
+                        #[cfg(target_os = "windows")]
+                        gui::show_disc_error(self.hwnd(), &format!("The selected DVC ROM is invalid:\n\n{:?}", path));
+                    }
+                }
+                GuiAction::OpenDvcFolder => {
+                    let dvc_dir = if Path::new("dvc").is_dir() { Path::new("dvc") } else { Path::new("bios") };
+                    let _ = std::fs::create_dir_all(dvc_dir);
+                    #[cfg(target_os = "windows")]
+                    gui::open_folder(dvc_dir);
                 }
             }
         }
@@ -1803,7 +2058,17 @@ impl ApplicationHandler for App {
         {
             gui::set_run_in_modal(self.run_in_menu);
             let show_menu = !self.no_menu && !self.start_fullscreen;
-            gui::attach_gui_menu(self.hwnd(), self.bindings.profile, self.input_device_mode, self.m.bus.mcd212.video_mode, self.bindings.mouse_sensitivity, show_menu);
+            gui::attach_gui_menu(
+                self.hwnd(),
+                self.bindings.profile,
+                self.input_device_mode,
+                self.m.bus.mcd212.video_mode,
+                self.bindings.mouse_sensitivity,
+                show_menu,
+                &self.active_bios_path,
+                &self.available_bioses,
+                self.m.bus.dvc.is_fitted(),
+            );
             gui::update_dvc_menu(self.m.bus.dvc.is_fitted());
             // SetMenu takes the menu bar out of the client area; winit adds it back when sizing
             if show_menu {

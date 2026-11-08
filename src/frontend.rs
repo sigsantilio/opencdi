@@ -329,6 +329,12 @@ pub enum GuiAction {
     LoadState(usize),
     ClearNvram,
     OpenFeedback,
+    SelectBios(PathBuf),
+    OpenBiosDialog,
+    OpenBiosFolder,
+    ShowBiosInfo,
+    SelectDvc(PathBuf),
+    OpenDvcFolder,
 }
 
 static PENDING_ACTIONS: Mutex<Vec<GuiAction>> = Mutex::new(Vec::new());
@@ -398,4 +404,90 @@ pub fn disc_display_name(path: &std::path::Path) -> String {
         Some(letter) => format!("Real Optical CD Drive ({}:)", letter),
         None => path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "CD-i Disc".to_string()),
     }
+}
+
+pub const CONFIG_FILE: &str = "opencdi.ini";
+
+pub fn load_saved_bios() -> Option<PathBuf> {
+    if let Ok(content) = std::fs::read_to_string(CONFIG_FILE) {
+        for line in content.lines().map(str::trim) {
+            if line.starts_with('#') || line.starts_with(';') { continue; }
+            if let Some((k, v)) = line.split_once('=') {
+                if k.trim().eq_ignore_ascii_case("bios_path") || k.trim().eq_ignore_ascii_case("bios") {
+                    let p = PathBuf::from(v.trim());
+                    if p.is_file() {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn save_bios_preference(path: &std::path::Path) {
+    let mut lines = Vec::new();
+    let mut found = false;
+    if let Ok(content) = std::fs::read_to_string(CONFIG_FILE) {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if let Some((k, _)) = trimmed.split_once('=') {
+                if k.trim().eq_ignore_ascii_case("bios_path") || k.trim().eq_ignore_ascii_case("bios") {
+                    lines.push(format!("bios_path={}", path.display()));
+                    found = true;
+                    continue;
+                }
+            }
+            lines.push(line.to_string());
+        }
+    }
+    if !found {
+        if lines.is_empty() {
+            lines.push("# OpenCDi Emulator Configuration".to_string());
+        }
+        lines.push(format!("bios_path={}", path.display()));
+    }
+    let _ = std::fs::write(CONFIG_FILE, lines.join("\n") + "\n");
+}
+
+pub fn load_saved_dvc() -> Option<PathBuf> {
+    if let Ok(content) = std::fs::read_to_string(CONFIG_FILE) {
+        for line in content.lines().map(str::trim) {
+            if line.starts_with('#') || line.starts_with(';') { continue; }
+            if let Some((k, v)) = line.split_once('=') {
+                if k.trim().eq_ignore_ascii_case("dvc_path") || k.trim().eq_ignore_ascii_case("dvc") {
+                    let p = PathBuf::from(v.trim());
+                    if p.is_file() {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn save_dvc_preference(path: &std::path::Path) {
+    let mut lines = Vec::new();
+    let mut found = false;
+    if let Ok(content) = std::fs::read_to_string(CONFIG_FILE) {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if let Some((k, _)) = trimmed.split_once('=') {
+                if k.trim().eq_ignore_ascii_case("dvc_path") || k.trim().eq_ignore_ascii_case("dvc") {
+                    lines.push(format!("dvc_path={}", path.display()));
+                    found = true;
+                    continue;
+                }
+            }
+            lines.push(line.to_string());
+        }
+    }
+    if !found {
+        if lines.is_empty() {
+            lines.push("# OpenCDi Emulator Configuration".to_string());
+        }
+        lines.push(format!("dvc_path={}", path.display()));
+    }
+    let _ = std::fs::write(CONFIG_FILE, lines.join("\n") + "\n");
 }
