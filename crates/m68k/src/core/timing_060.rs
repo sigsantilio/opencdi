@@ -762,6 +762,7 @@ impl CpuCore {
             | super::types::CpuType::M68LC040
             | super::types::CpuType::M68040 => self.cycles_040(raw),
             super::types::CpuType::M68060 => self.cycles_060(raw, fetch_cached),
+            super::types::CpuType::SCC68070 => self.cycles_070(raw),
             _ => self.scale_cycles_for_cpu_type(raw),
         }
     }

@@ -10,7 +10,7 @@ use crate::mcd212::VideoMode;
 use crate::dvc::mpeg::{Buffer, Frame, Plane, Video};
 use crate::dvc::mpeg::video::Motion;
 
-const SAVESTATE_MAGIC: &[u8; 8] = b"OCDIST01";
+const SAVESTATE_MAGIC: &[u8; 8] = b"OCDIST02";
 
 struct StateWriter {
     buf: Vec<u8>,
@@ -329,6 +329,7 @@ pub fn save_state_to_file<P: AsRef<Path>>(
     w.write_i32(bus.slave.input_mouse_y);
     w.write_u8(bus.slave.input_mouse_btn);
     w.write_bool(bus.slave.irq_pending);
+    w.write_bool(bus.slave.irq_deferred);
     w.write_bool(bus.slave.has_disc);
     w.write_u8(bus.slave.disc_state);
     w.write_u32(bus.slave.disc_timer);
@@ -342,8 +343,6 @@ pub fn save_state_to_file<P: AsRef<Path>>(
     // 8. MCD212 state
     w.write_fixed_bytes(&bus.mcd212.plane_a[..]);
     w.write_fixed_bytes(&bus.mcd212.plane_b[..]);
-    w.write_fixed_bytes(&bus.mcd212.display_plane_a[..]);
-    w.write_fixed_bytes(&bus.mcd212.display_plane_b[..]);
     w.write_fixed_bytes(&bus.mcd212.csrr);
     for &v in &bus.mcd212.csrw { w.write_u16(v); }
     for &v in &bus.mcd212.dcr { w.write_u16(v); }
@@ -711,6 +710,7 @@ pub fn load_state_from_file<P: AsRef<Path>>(
     bus.slave.input_mouse_y = r.read_i32()?;
     bus.slave.input_mouse_btn = r.read_u8()?;
     bus.slave.irq_pending = r.read_bool()?;
+    bus.slave.irq_deferred = r.read_bool()?;
     bus.slave.has_disc = r.read_bool()?;
     bus.slave.disc_state = r.read_u8()?;
     bus.slave.disc_timer = r.read_u32()?;
@@ -721,8 +721,6 @@ pub fn load_state_from_file<P: AsRef<Path>>(
     // 8. MCD212 state
     r.read_fixed_bytes(&mut bus.mcd212.plane_a[..])?;
     r.read_fixed_bytes(&mut bus.mcd212.plane_b[..])?;
-    r.read_fixed_bytes(&mut bus.mcd212.display_plane_a[..])?;
-    r.read_fixed_bytes(&mut bus.mcd212.display_plane_b[..])?;
     r.read_fixed_bytes(&mut bus.mcd212.csrr)?;
     for v in &mut bus.mcd212.csrw { *v = r.read_u16()?; }
     for v in &mut bus.mcd212.dcr { *v = r.read_u16()?; }

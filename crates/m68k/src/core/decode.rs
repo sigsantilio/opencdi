@@ -1855,6 +1855,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                         return illegal_instruction(cpu, bus);
                     }
                     let mask = cpu.read_imm_16(bus);
+                    cpu.movem_count = mask.count_ones();
                     let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
                     cpu.exec_movem_to_mem(bus, Size::Word, mode, mask)
                 }
@@ -1868,6 +1869,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                         return illegal_instruction(cpu, bus);
                     }
                     let mask = cpu.read_imm_16(bus);
+                    cpu.movem_count = mask.count_ones();
                     let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
                     cpu.exec_movem_to_mem(bus, Size::Long, mode, mask)
                 }
@@ -1881,6 +1883,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                         return illegal_instruction(cpu, bus);
                     }
                     let mask = cpu.read_imm_16(bus);
+                    cpu.movem_count = mask.count_ones();
                     let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
                     let size = if (opcode >> 6) & 1 == 0 {
                         Size::Word

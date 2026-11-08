@@ -19,6 +19,7 @@ pub mod timing;
 pub mod timing_020;
 pub mod timing_040;
 pub mod timing_060;
+pub mod timing_070;
 pub mod trace_jit;
 #[cfg(feature = "trace-profile")]
 pub mod trace_profile;
