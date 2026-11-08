@@ -275,13 +275,15 @@ impl Cdic {
                 if (self.data_buffer & 0x4000) == 0 {
                     self.cancel_disc_read();
                 }
+                self.update_interrupt();
             }
             _ => {}
         }
     }
 
+    // XBUF interrupts only while DBUF bit 14 (disc read enabled) is set.
     fn update_interrupt(&mut self) {
-        self.irq_pending = ((self.x_buffer | self.audio_buffer) & 0x8000) != 0;
+        self.irq_pending = ((self.x_buffer & 0x8000) != 0 && (self.data_buffer & 0x4000) != 0) || (self.audio_buffer & 0x8000) != 0;
     }
 
     fn lba_from_time(&self) -> u32 {
@@ -843,5 +845,16 @@ mod tests {
         assert!(c.is_mode2_audio_selected(&buf));
         buf[21] = 17;
         assert!(!c.is_mode2_audio_selected(&buf));
+    }
+
+    #[test]
+    fn clearing_dbuf_bit_14_drops_a_pending_sector_interrupt() {
+        let mut c = Cdic::new();
+        c.x_buffer = 0x8000;
+        c.write_reg(0x3FE, 0x4001);
+        assert!(c.irq_pending);
+        c.write_reg(0x3FE, 0x0001);
+        assert!(!c.irq_pending);
+        assert_eq!(c.read_reg(0x3F6), 0x8000);
     }
 }
