@@ -557,6 +557,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         no_menu,
         monitor_index,
         screenshot_dir,
+        no_autoplay: has_flag("--no-autoplay"),
         window: None,
         surface: None,
         image_rect: (0, 0, SCREEN_WIDTH, SCREEN_HEIGHT),
@@ -1227,7 +1228,7 @@ impl App {
                 (0x0000C000u32, m.bus.peek_long(0x0000C000u32.wrapping_add(0xFFFF9172)).unwrap_or(0))
             };
 
-            if shell_state == 2 {
+            if shell_state == 2 && !self.no_autoplay {
                 self.shell_ready_count += 1;
                 let phase = self.shell_ready_count % 60;
                 if phase == 1 {

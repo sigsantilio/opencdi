@@ -139,7 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if frame >= 2600 && frame % 100 == 0 {
-            let q_len = bus.cdic.audio.sample_queue.lock().unwrap().len();
+            let q_len = bus.cdic.audio.main.len();
             println!(
                 "[Frame {}] CDIC State: cmd=0x{:02X}, disc_cmd=0x{:02X}, lba={}, audio_chan=0x{:04X}, chan=0x{:08X}, dec_map={}, dec_addr=0x{:04X}, sec_cnt={}, total_audio_sectors={}, q_len={}",
                 frame,
