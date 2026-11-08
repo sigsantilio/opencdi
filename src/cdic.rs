@@ -628,6 +628,35 @@ impl Cdic {
         }
     }
 
+    // Q subcode of a data or audio sector inside a track, CRC not yet filled in.
+    fn track_q_fields(&self, cd: &CdRom) -> [u8; 12] {
+        let real_lba = self.curr_lba + 150;
+        let bcd = |v: u32| (((v / 10) << 4) | (v % 10)) as u8;
+        let (cur_track_num, cur_track_ctrl, rel_lba) = if let Some(t) = cd.tracks.iter().find(|t| self.curr_lba >= t.start_lba && self.curr_lba < t.start_lba + t.length_sectors) {
+            (t.number, t.control, self.curr_lba - t.start_lba)
+        } else {
+            (1, 0x41, self.curr_lba)
+        };
+        [
+            cur_track_ctrl, // Control
+            bcd(cur_track_num as u32), // Track
+            0x01, // Index
+            bcd(rel_lba / (60 * 75)), bcd((rel_lba / 75) % 60), bcd(rel_lba % 75), // Track relative MSF
+            0x00,
+            bcd(real_lba / (60 * 75)), bcd((real_lba / 75) % 60), bcd(real_lba % 75), // Absolute disc MSF
+            0xFF, 0xFF, // CRC (init)
+        ]
+    }
+
+    fn add_q_crc(subcode: &mut [u8; 12]) {
+        let mut crc_accum: u16 = 0;
+        for i in 0..12 {
+            crc_accum = ((crc_accum << 8) | (subcode[i] as u16)) ^ CRC_CCITT_TABLE[(crc_accum >> 8) as usize];
+        }
+        subcode[10] = (crc_accum >> 8) as u8;
+        subcode[11] = (crc_accum & 0xFF) as u8;
+    }
+
     fn process_sector(&mut self, cdrom: &mut Option<CdRom>) {
         info!("CDIC process_sector: LBA={}, mode={}", self.curr_lba, self.disc_mode);
         let Some(cd) = cdrom else {
@@ -701,10 +730,8 @@ impl Cdic {
 
         // Q subcode calculation
         let real_lba = self.curr_lba + 150;
-        let mins = (real_lba / (60 * 75)) as u8;
         let secs = ((real_lba / 75) % 60) as u8;
         let frac = (real_lba % 75) as u8;
-        let mins_bcd = ((mins / 10) << 4) | (mins % 10);
         let secs_bcd = ((secs / 10) << 4) | (secs % 10);
         let frac_bcd = ((frac / 10) << 4) | (frac % 10);
 
@@ -761,38 +788,10 @@ impl Cdic {
                 0xFF,        // [11] CRC1 (init)
             ]
         } else {
-            let (cur_track_num, cur_track_ctrl, rel_lba) = if let Some(t) = cd.tracks.iter().find(|t| self.curr_lba >= t.start_lba && self.curr_lba < t.start_lba + t.length_sectors) {
-                (t.number, t.control, self.curr_lba - t.start_lba)
-            } else {
-                (1, 0x41, self.curr_lba)
-            };
-
-            let rel_msf = rel_lba;
-            let rel_m = (rel_msf / (60 * 75)) as u8;
-            let rel_s = ((rel_msf / 75) % 60) as u8;
-            let rel_f = (rel_msf % 75) as u8;
-            let rel_m_bcd = ((rel_m / 10) << 4) | (rel_m % 10);
-            let rel_s_bcd = ((rel_s / 10) << 4) | (rel_s % 10);
-            let rel_f_bcd = ((rel_f / 10) << 4) | (rel_f % 10);
-            let track_bcd = ((cur_track_num / 10) << 4) | (cur_track_num % 10);
-
-            [
-                cur_track_ctrl, // Control
-                track_bcd,      // Track
-                0x01,           // Index
-                rel_m_bcd, rel_s_bcd, rel_f_bcd, // Track relative MSF
-                0x00,
-                mins_bcd, secs_bcd, frac_bcd,    // Absolute disc MSF
-                0xFF, 0xFF // CRC (init)
-            ]
+            self.track_q_fields(cd)
         };
 
-        let mut crc_accum: u16 = 0;
-        for i in 0..12 {
-            crc_accum = ((crc_accum << 8) | (subcode[i] as u16)) ^ CRC_CCITT_TABLE[(crc_accum >> 8) as usize];
-        }
-        subcode[10] = (crc_accum >> 8) as u8;
-        subcode[11] = (crc_accum & 0xFF) as u8;
+        Self::add_q_crc(&mut subcode);
 
         // Store into CDIC RAM
         self.data_buffer ^= 0x0001;
