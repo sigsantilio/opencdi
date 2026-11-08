@@ -848,6 +848,7 @@ mod tests {
         assert!(!POISONED.load(Ordering::SeqCst), "retro_deinit clears the poison");
     }
 
+    #[cfg(unix)]
     extern "C" fn unguarded() {
         panic!("unguarded panic in extern \"C\"");
     }

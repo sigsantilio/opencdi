@@ -1591,7 +1591,7 @@ fn process_macroblock(
     mb_row: usize,
     mb_col: usize,
     mb_width: usize,
-    mb_height: usize,
+    _mb_height: usize,
     motion_h: i32,
     motion_v: i32,
     block_size: usize,

@@ -91,11 +91,13 @@ const GWLP_WNDPROC: i32 = -4;
 
 const MB_OK: u32 = 0x0000_0000;
 const MB_YESNO: u32 = 0x0000_0004;
+#[allow(dead_code)]
 const MB_YESNOCANCEL: u32 = 0x0000_0003;
 const MB_ICONINFORMATION: u32 = 0x0000_0040;
 const MB_ICONQUESTION: u32 = 0x0000_0020;
 const MB_ICONWARNING: u32 = 0x0000_0030;
 const IDYES: i32 = 6;
+#[allow(dead_code)]
 const IDNO: i32 = 7;
 
 #[repr(C)]
