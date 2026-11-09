@@ -676,7 +676,7 @@ impl CdiBus {
                 let offset = addr - 0x4FFFE0;
                 let reg_base = offset & !1;
                 let word = self.mcd212.read_reg(reg_base);
-                let mcd_int = (self.mcd212.csrr[1] & (crate::mcd212::CSR2R_IT1 | crate::mcd212::CSR2R_IT2)) != 0;
+                let mcd_int = self.mcd212.int_line();
                 self.scc_timer.int1_w(mcd_int);
                 if (addr & 1) == 0 { (word >> 8) as u8 } else { word as u8 }
             }
@@ -807,7 +807,7 @@ impl CdiBus {
             0x4FFFE0..=0x4FFFFF => {
                 let offset = (addr - 0x4FFFE0) & !1;
                 let word = self.mcd212.read_reg(offset);
-                let mcd_int = (self.mcd212.csrr[1] & (crate::mcd212::CSR2R_IT1 | crate::mcd212::CSR2R_IT2)) != 0;
+                let mcd_int = self.mcd212.int_line();
                 self.scc_timer.int1_w(mcd_int);
                 word
             }
@@ -1646,6 +1646,17 @@ mod tests {
         assert_eq!(bus.mono4_iack(4), Some(0x5A));
         bus.dvc.set_fmv_word(crate::dvc::FMV_ISR, 0);
         assert_eq!(bus.mono4_iack(4), Some(0x3C));
+    }
+
+    #[test]
+    fn dma_error_byte_is_read_only_and_status_byte_clears_only_its_bits() {
+        let mut bus = CdiBus::new();
+        bus.dma.channels[0].channel_status = 0x90;
+        bus.dma.channels[0].channel_error = 0x02;
+        bus.write_byte(0x8000_4001, 0xFF);
+        assert_eq!((bus.dma.channels[0].channel_status, bus.dma.channels[0].channel_error), (0x90, 0x02));
+        bus.write_byte(0x8000_4000, 0x10);
+        assert_eq!(bus.dma.channels[0].channel_status, 0x80);
     }
 
     #[test]
