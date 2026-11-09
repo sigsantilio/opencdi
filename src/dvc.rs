@@ -2179,6 +2179,24 @@ mod timing_tests {
     }
 
     #[test]
+    fn a_state_saved_mid_schedule_decodes_the_same_frames() {
+        let mut a = dvc();
+        feed(&mut a, &stream(90_000, Some(99_000), 2));
+        let mut w = Vec::new();
+        opencdi::savestate::State::save(&a, &mut w);
+        let mut b = dvc();
+        let mut r = opencdi::savestate::Reader::new(&w);
+        opencdi::savestate::State::load(&mut b, &mut r).unwrap();
+        for d in [&mut a, &mut b] {
+            feed(d, &pack(99_800, 3528));
+            tick(d);
+        }
+        assert_eq!(a.audio_out, b.audio_out);
+        assert_eq!(a.get_fma_word(FMA_ISR), b.get_fma_word(FMA_ISR));
+        assert_eq!(a.fma_demux.due, b.fma_demux.due);
+    }
+
+    #[test]
     fn schedule_survives_the_timestamp_wrap() {
         let mut d = dvc();
         let wrap = 1u64 << 33;
@@ -2248,6 +2266,11 @@ mod impeg_tests {
         assert_eq!(d.fma_stream_fifo.len(), before);
         d.write_word(0xE0411E, 0xABCD);
         assert_eq!(d.fma_stream_fifo.len(), before + 2);
+        let mut buf = Vec::new();
+        opencdi::savestate::State::save(&d, &mut buf);
+        let mut e = Dvc::new();
+        opencdi::savestate::State::load(&mut e, &mut opencdi::savestate::Reader::new(&buf)).unwrap();
+        assert_eq!((e.impeg_pio, e.impeg_regs[0x11C], e.impeg_regs[0x11D]), (true, 0x3D, 0x14));
         d.reset();
         assert!(!d.impeg_pio && d.impeg_regs[..IMPEG_ATT].iter().all(|&b| b == 0) && d.impeg_regs[IMPEG_ATT..IMPEG_ATT + 4] == [0x3F; 4]);
     }
