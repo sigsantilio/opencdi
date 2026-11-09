@@ -4,7 +4,7 @@ use std::fmt;
 
 pub const MAGIC: [u8; 8] = *b"OPENCDI\x1a";
 // Bump whenever a saved field is added, removed, reordered or changes type.
-pub const VERSION: u32 = 10;
+pub const VERSION: u32 = 11;
 pub const HEADER_LEN: usize = 64;
 const CPU_BLOB_MAX: u64 = 1 << 20;
 

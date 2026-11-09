@@ -310,12 +310,13 @@ impl Cdic {
                 if (self.data_buffer & 0x4000) == 0 {
                     self.cancel_disc_read();
                 }
+                self.update_interrupt();
             }
             _ => {}
         }
     }
 
-    // Stop: the buffer playing finishes, unless the decoder holds an audio channel, then it stops at once without ABUF.
+// Stop: the buffer playing finishes, unless the decoder holds an audio channel, then it stops at once without ABUF.
     fn stop_audio_map(&mut self) {
         self.map_on = false;
         if self.dsp_achan != 0 {
@@ -336,10 +337,11 @@ impl Cdic {
         self.cdda_playing = on;
     }
 
-    // ABUF interrupts only while AUDCTL bit 13 is set.
+    // XBUF interrupts only while DBUF bit 14 (disc read enabled) is set; ABUF interrupts only while AUDCTL bit 13 is set.
     fn update_interrupt(&mut self) {
+        let xbuf = (self.x_buffer & 0x8000) != 0 && (self.data_buffer & 0x4000) != 0;
         let abuf = (self.audio_buffer & 0x8000) != 0 && (self.z_buffer & 0x2000) != 0;
-        self.irq_pending = (self.x_buffer & 0x8000) != 0 || abuf;
+        self.irq_pending = xbuf || abuf;
     }
 
     fn lba_from_time(&self) -> u32 {
@@ -1171,5 +1173,14 @@ mod tests {
         c.write_reg(0x3FA, 0x0800);
         c.write_reg(0x3FE, 0x0000);
         assert!(!c.cdda_playing);
+    #[test]
+    fn clearing_dbuf_bit_14_drops_a_pending_sector_interrupt() {
+        let mut c = Cdic::new();
+        c.x_buffer = 0x8000;
+        c.write_reg(0x3FE, 0x4001);
+        assert!(c.irq_pending);
+        c.write_reg(0x3FE, 0x0001);
+        assert!(!c.irq_pending);
+        assert_eq!(c.read_reg(0x3F6), 0x8000);
     }
 }
