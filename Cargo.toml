@@ -2,6 +2,9 @@
 name = "opencdi"
 version = "0.3.0"
 edition = "2024"
+authors = ["Gianluca \"sigsantilio\" <https://github.com/sigsantilio>", "OpenCDi contributors"]
+description = "A standalone & Libretro Philips CD-i emulator in Rust"
+repository = "https://github.com/sigsantilio/opencdi"
 
 [features]
 default = ["host"]

@@ -117,6 +117,12 @@ The dynamic library `opencdi_libretro.dll` (or `.so` on Linux) will be generated
 
 ---
 
+## Author & Project Lead
+
+- **Gianluca ("sigsantilio")** — Creator & Project Lead
+  - YouTube: [L'Archivio del Sig. Santilio](https://www.youtube.com/@sigsantilio) (Italian retrogaming channel)
+  - GitHub: [@sigsantilio](https://github.com/sigsantilio)
+
 ## Special Acknowledgments
 
 Heartfelt thanks to everyone who contributed to the development and preservation goals of OpenCDi:

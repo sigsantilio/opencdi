@@ -114,6 +114,12 @@ La libreria `opencdi_libretro.dll` (o `.so` su Linux) viene generata in `target/
 
 ---
 
+## Autore & Project Lead
+
+- **Gianluca ("sigsantilio")** — Ideatore e Project Lead
+  - Canale YouTube: [L'Archivio del Sig. Santilio](https://www.youtube.com/@sigsantilio)
+  - GitHub: [@sigsantilio](https://github.com/sigsantilio)
+
 ## Ringraziamenti Speciali
 
 Un sincero ringraziamento a tutti coloro che hanno reso possibile lo sviluppo e l'evoluzione di OpenCDi:
