@@ -60,7 +60,7 @@ const fn option_values(list: &[(&CStr, &CStr)]) -> [retro_core_option_value; RET
 }
 
 // Core options v1, terminated by an empty entry; frontends without v1 get VARIABLES below.
-static OPTIONS: Table<[retro_core_option_definition; 3]> = Table([
+static OPTIONS: Table<[retro_core_option_definition; 4]> = Table([
     retro_core_option_definition {
         key: OPT_DVC.as_ptr(),
         desc: c"DVC cartridge (restart)".as_ptr(),
