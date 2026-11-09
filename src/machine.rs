@@ -274,10 +274,16 @@ impl Machine {
             0 => Ok(()),
             n => Err(StateError::Trailing(n)),
         });
+        // The Mono-IV chips must be present exactly when the board is Mono-IV.
+        let res = res.and_then(|_| match self.bus.mono4.is_some() == (self.bus.board == BoardKind::Mono4) {
+            true => Ok(()),
+            false => Err(StateError::Invalid("mono4")),
+        });
         if let Err(e) = res {
             let _ = self.load(&mut Reader::new(&backup));
             return Err(e);
         }
+        self.bus.counters.halted = false;
         Ok(frontend)
     }
 }
