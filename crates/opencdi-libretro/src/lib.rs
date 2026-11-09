@@ -45,6 +45,7 @@ struct LoadSpec {
 
 const OPT_DVC: &CStr = c"opencdi_dvc";
 const OPT_MONO4: &CStr = c"opencdi_mono4";
+const OPT_LEVELS: &CStr = c"opencdi_video_levels";
 const NO_VALUE: retro_core_option_value = retro_core_option_value { value: std::ptr::null(), label: std::ptr::null() };
 
 const fn option_values(list: &[(&CStr, &CStr)]) -> [retro_core_option_value; RETRO_NUM_CORE_OPTION_VALUES_MAX] {
@@ -73,11 +74,19 @@ static OPTIONS: Table<[retro_core_option_definition; 3]> = Table([
         values: option_values(&[(c"off", c"off"), (c"on", c"on")]),
         default_value: c"off".as_ptr(),
     },
+    retro_core_option_definition {
+        key: OPT_LEVELS.as_ptr(),
+        desc: c"Video levels".as_ptr(),
+        info: c"studio passes the CD-i video levels through unchanged (black 16, white 235), as the hardware outputs them. full stretches them to 0-255 (black 0), as PC displays expect. Takes effect at once.".as_ptr(),
+        values: option_values(&[(c"studio", c"studio (black 16)"), (c"full", c"full (black 0)")]),
+        default_value: c"studio".as_ptr(),
+    },
     retro_core_option_definition { key: std::ptr::null(), desc: std::ptr::null(), info: std::ptr::null(), values: [NO_VALUE; RETRO_NUM_CORE_OPTION_VALUES_MAX], default_value: std::ptr::null() },
 ]);
-static VARIABLES: Table<[retro_variable; 3]> = Table([
+static VARIABLES: Table<[retro_variable; 4]> = Table([
     retro_variable { key: OPT_DVC.as_ptr(), value: c"DVC cartridge (restart); auto|off".as_ptr() },
     retro_variable { key: OPT_MONO4.as_ptr(), value: c"CD-i 490 BIOS, experimental (restart); off|on".as_ptr() },
+    retro_variable { key: OPT_LEVELS.as_ptr(), value: c"Video levels; studio|full".as_ptr() },
     retro_variable { key: std::ptr::null(), value: std::ptr::null() },
 ]);
 
@@ -248,6 +257,14 @@ fn option_value(key: &CStr) -> Option<String> {
     let ok = unsafe { env_call(RETRO_ENVIRONMENT_GET_VARIABLE, &mut v as *mut retro_variable as *mut c_void) };
     // SAFETY: non-null NUL-terminated string owned by the frontend.
     (ok && !v.value.is_null()).then(|| unsafe { CStr::from_ptr(v.value) }.to_string_lossy().into_owned())
+}
+
+// True when the frontend reports changed core options since the last call.
+fn options_updated() -> bool {
+    let mut changed = false;
+    // SAFETY: GET_VARIABLE_UPDATE writes one bool.
+    let ok = unsafe { env_call(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &mut changed as *mut bool as *mut c_void) };
+    ok && changed
 }
 
 // The IMPEG cartridge for the 490 board; only the known dump is fitted.
@@ -552,6 +569,9 @@ pub extern "C" fn retro_run() {
         let mut core = lock(&CORE);
         let Core { machine, input, uart_line, .. } = &mut *core;
         let Some(m) = machine.as_mut() else { return };
+        if options_updated() {
+            opencdi::mcd212::set_studio_levels(option_value(OPT_LEVELS).as_deref() != Some("full"));
+        }
         input.apply(cb.input_state, &mut m.bus);
         m.run_frame();
         if let Some(buf) = m.bus.uart_capture.as_mut() {
@@ -653,6 +673,7 @@ pub extern "C" fn retro_cheat_set(_index: c_uint, _enabled: bool, _code: *const 
 fn load(game: *const retro_game_info) -> Result<(), String> {
     unload();
     let dir = system_directory().ok_or("frontend gave no system directory")?;
+    opencdi::mcd212::set_studio_levels(option_value(OPT_LEVELS).as_deref() != Some("full"));
     let allow_mono4 = option_value(OPT_MONO4).as_deref() == Some("on");
     let bios = find_bios(&dir, allow_mono4).inspect_err(|e| show_message(e))?;
     let mut temp = None;

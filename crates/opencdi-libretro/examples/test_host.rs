@@ -141,9 +141,12 @@ unsafe extern "C" fn video_cb(data: *const c_void, width: c_uint, height: c_uint
         }
         h.video_all = all;
         h.video_last = v;
+        // Black level of the selected output range: 0 with full levels, 16 otherwise.
+        let full = h.options.iter().any(|(k, v)| k.as_bytes() == b"opencdi_video_levels" && v.as_bytes() == b"full");
+        let black = if full { 0 } else { 16 };
         h.nonblack = (0..height as usize)
             .map(|y| unsafe { std::slice::from_raw_parts((data as *const u8).add(y * pitch) as *const u32, width as usize) })
-            .map(|row| row.iter().filter(|&&p| p & 0x00FF_FFFF != 0).count())
+            .map(|row| row.iter().filter(|&&p| [16, 8, 0].iter().any(|&s| (p >> s) & 0xFF > black)).count())
             .sum();
         h.frames += 1;
     })
