@@ -24,12 +24,12 @@ jobs:
         run: cargo build --release -p opencdi-libretro
 
       - name: Stage Artifacts
-        shell: bash
+        shell: pwsh
         run: |
-          mkdir -p dist
-          cp target/release/opencdi_libretro.dll dist/opencdi_libretro.dll
-          cp crates/opencdi-libretro/opencdi_libretro.info dist/opencdi_libretro.info
-          cd dist && zip -9 opencdi-libretro-windows-x64.zip opencdi_libretro.dll opencdi_libretro.info
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item target/release/opencdi_libretro.dll dist/
+          Copy-Item crates/opencdi-libretro/opencdi_libretro.info dist/
+          Compress-Archive -Path dist/opencdi_libretro.dll, dist/opencdi_libretro.info -DestinationPath dist/opencdi-libretro-windows-x64.zip
 
       - name: Upload Windows Core Artifact
         uses: actions/upload-artifact@v4
