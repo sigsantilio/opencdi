@@ -1056,9 +1056,12 @@ pub fn show_about_dialog(owner: *mut std::ffi::c_void) {
     let text = to_wide(
         "OpenCDi - Philips CD-i Emulator\n\
         Version: 0.3.0 (High Performance Edition)\n\
-        Author & Project Lead: Gianluca \"sigsantilio\"\n\
-        (L'Archivio del Sig. Santilio - YouTube)\n\
         GitHub: https://github.com/sigsantilio/opencdi\n\n\
+        Project Lead & Maintainer:\n\
+        • Gianluca \"sigsantilio\"\n\n\
+        Core Contributors:\n\
+        • ArnoldDeRuiter (Libretro core, Mono-IV, Savestates)\n\
+        • OpenCDi Community\n\n\
         Built with Rust, winit & softbuffer\n\n\
         Key Emulation Features:\n\
         • Philips SCC68070 Microprocessor & OS-9 CD-RTOS kernel\n\

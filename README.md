@@ -117,11 +117,12 @@ The dynamic library `opencdi_libretro.dll` (or `.so` on Linux) will be generated
 
 ---
 
-## Author & Project Lead
+## Project Team & Credits
 
-- **Gianluca ("sigsantilio")** — Creator & Project Lead
-  - YouTube: [L'Archivio del Sig. Santilio](https://www.youtube.com/@sigsantilio) (Italian retrogaming channel)
-  - GitHub: [@sigsantilio](https://github.com/sigsantilio)
+- **Project Lead & Maintainer:**
+  - **Gianluca ("sigsantilio")** — Project management, testing, and Windows frontend curation. Creator of the Italian retrogaming channel [*L'Archivio del Sig. Santilio*](https://www.youtube.com/@sigsantilio).
+- **Core Contributors:**
+  - **ArnoldDeRuiter** — Core emulation architecture, Libretro core implementation, Mono-IV chips, and deterministic in-memory savestates.
 
 ## Special Acknowledgments
 

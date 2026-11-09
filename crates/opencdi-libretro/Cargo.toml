@@ -2,7 +2,7 @@
 name = "opencdi-libretro"
 version = "0.3.0"
 edition = "2024"
-authors = ["Gianluca \"sigsantilio\" <https://github.com/sigsantilio>", "OpenCDi contributors"]
+authors = ["Gianluca \"sigsantilio\" <https://github.com/sigsantilio>", "ArnoldDeRuiter", "OpenCDi contributors"]
 license = "MIT"
 
 [lib]

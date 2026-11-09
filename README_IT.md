@@ -114,11 +114,12 @@ La libreria `opencdi_libretro.dll` (o `.so` su Linux) viene generata in `target/
 
 ---
 
-## Autore & Project Lead
+## Team del Progetto & Crediti
 
-- **Gianluca ("sigsantilio")** — Ideatore e Project Lead
-  - Canale YouTube: [L'Archivio del Sig. Santilio](https://www.youtube.com/@sigsantilio)
-  - GitHub: [@sigsantilio](https://github.com/sigsantilio)
+- **Project Lead & Maintainer:**
+  - **Gianluca ("sigsantilio")** — Coordinamento progetto, test e cura del frontend Windows. Curatore del canale YouTube retrogaming [*L'Archivio del Sig. Santilio*](https://www.youtube.com/@sigsantilio).
+- **Contributori Principali:**
+  - **ArnoldDeRuiter** — Architettura del core, implementazione Libretro, emulazione chip Mono-IV e savestate deterministici in memoria.
 
 ## Ringraziamenti Speciali
 
