@@ -370,9 +370,10 @@ impl CdiAudio {
         left_state: &mut ChannelState,
         right_state: &mut ChannelState,
     ) -> Vec<(f32, f32)> {
-        let mut samples = Vec::with_capacity(18 * 224);
+        let groups = payload.len() / 128;
+        let mut samples = Vec::with_capacity(groups * 224);
 
-        for g in 0..18 {
+        for g in 0..groups {
             let group = &payload[g * 128..(g + 1) * 128];
 
             if is_8bit {
@@ -495,12 +496,31 @@ impl CdiAudio {
         self.main.push(&final_samples, ADPCM_LATENCY, k.bound(), &|| format!("main {}", k.level()));
     }
 
+    // A raw CD-DA sector (16-bit little-endian stereo at 44.1 kHz, the mixer rate) goes straight into the main stream.
+    pub fn push_cdda(&mut self, sector: &[u8]) {
+        let frames: Vec<Frame> = sector
+            .chunks_exact(4)
+            .map(|c| (i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0, i16::from_le_bytes([c[2], c[3]]) as f32 / 32768.0))
+            .collect();
+        let bound = ADPCM_LATENCY + 2 * frames.len();
+        self.main.push(&frames, ADPCM_LATENCY, bound, &|| "main cdda".to_string());
+    }
+
     pub fn decode_audio_map_sector(&mut self, payload: &[u8], is_stereo: bool, is_8bit: bool, sample_rate: u32) {
-        if payload.len() < 18 * 128 {
+        if payload.len() >= 18 * 128 {
+            self.decode_audio_map_groups(&payload[..18 * 128], true, is_stereo, is_8bit, sample_rate);
+        }
+    }
+
+    // Decodes sound groups of the audio map buffer that is playing; `first` marks the start of a buffer.
+    pub fn decode_audio_map_groups(&mut self, payload: &[u8], first: bool, is_stereo: bool, is_8bit: bool, sample_rate: u32) {
+        if payload.len() < 128 {
             return;
         }
 
-        self.total_sectors_decoded += 1;
+        if first {
+            self.total_sectors_decoded += 1;
+        }
 
         let samples = Self::decode_xa_payload(
             payload,
@@ -511,7 +531,7 @@ impl CdiAudio {
         );
         let final_samples = Self::resample(&mut self.map_resampler, &samples, sample_rate);
 
-        let k = SectorKind { frames: final_samples.len(), is_8bit, is_stereo, rate: sample_rate };
+        let k = SectorKind { frames: final_samples.len() * 18 / (payload.len() / 128), is_8bit, is_stereo, rate: sample_rate };
         self.sfx.push(&final_samples, ADPCM_LATENCY, k.bound(), &|| format!("sfx {}", k.level()));
     }
 }
