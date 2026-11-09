@@ -792,6 +792,16 @@ impl Dvc {
         // Screen blanking and plane transitions are managed by MCD-212.
     }
 
+    // Drops buffered compressed audio, the unplayed PCM and the decode schedule; the next decoded frame starts silent again.
+    fn reset_audio_parser(&mut self) {
+        self.fma_stream_fifo.clear();
+        self.fma_demux.clear();
+        self.mp2.reset();
+        self.audio_out.clear();
+        self.audio_stopped = true;
+        self.reset_fma_schedule();
+    }
+
     fn reset_fma_schedule(&mut self) {
         self.fma_started = false;
         self.fma_tick_accum = 0;
@@ -1290,12 +1300,7 @@ impl Dvc {
                 if value & 0x0001 != 0 { // STOP
                     self.audio_armed = false;
                     self.audio_enabled = false;
-                    self.fma_stream_fifo.clear();
-                    self.fma_demux.clear();
-                    self.mp2.reset();
-                    self.audio_out.clear();
-                    self.audio_stopped = true;
-                    self.reset_fma_schedule();
+                    self.reset_audio_parser();
                     self.set_fma_word(0x02, 0x0200);
                     self.set_fma_word(FMA_ISR, 0);
                 }
@@ -1381,6 +1386,10 @@ impl Dvc {
                 }
                 if value & 0x0100 != 0 { // RESET
                     self.reset_video_stream();
+                    // The system reset also resets the stream parser and its system clock reference; audio play and arm stay as they are.
+                    self.reset_audio_parser();
+                    self.dclk = 0;
+                    self.dclk_accum = 0;
                     self.set_fmv_word(FMV_ISR, 0);
                 }
                 if value & 0x1000 != 0 { // DEC_ON
@@ -2190,6 +2199,20 @@ mod timing_tests {
         feed(&mut d, &audio_packet(Some(5_000), &loud_frame()));
         feed(&mut d, &pack(6_000, 3528));
         assert_eq!(d.audio_out.len(), 2 * 1152);
+    }
+
+    #[test]
+    fn system_reset_clears_buffered_audio_and_the_clock_but_keeps_audio_playing() {
+        let mut d = Dvc::new();
+        d.audio_enabled = true;
+        d.fma_started = true;
+        d.fma_stream_fifo.extend_from_slice(&silent_frame());
+        d.audio_out.push_back((0.5, 0.5));
+        d.dclk = 1234;
+        d.set_fmv_word(FMV_SYSCMD, 0x0100);
+        d.handle_fmv_write(FMV_SYSCMD);
+        assert!(d.fma_stream_fifo.is_empty() && d.audio_out.is_empty());
+        assert!(!d.fma_started && d.audio_enabled && d.dclk == 0);
     }
 }
 
