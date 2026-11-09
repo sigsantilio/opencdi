@@ -6,6 +6,7 @@ pub struct Timekeeper {
     pub ram: [u8; 8192],
     pub dirty: bool,
     pub dirty_frames: u32,
+    // Empty: no persistence (harness, libretro); the GUI host sets the file.
     pub save_path: PathBuf,
     pub persist: bool, // false when the frontend keeps the RAM (libretro save RAM), so no file is written
 }
@@ -16,7 +17,7 @@ impl Timekeeper {
             ram: [0; 8192],
             dirty: false,
             dirty_frames: 0,
-            save_path: PathBuf::from("nvram_mk48t08.bin"),
+            save_path: PathBuf::new(),
             persist: true,
         };
         tk.init_default();
@@ -51,7 +52,7 @@ impl Timekeeper {
         if !self.persist {
             self.dirty = false;
             self.dirty_frames = 0;
-        } else if self.dirty {
+        } else if self.dirty && !self.save_path.as_os_str().is_empty() {
             if let Err(e) = self.save_to_file() {
                 warn!("Impossibile salvare NVRAM in {:?}: {}", self.save_path, e);
             }
@@ -62,7 +63,7 @@ impl Timekeeper {
         self.ram.fill(0);
         self.init_default();
         self.dirty = true;
-        self.save_to_file()?;
+        self.flush_if_dirty();
         Ok(())
     }
 
