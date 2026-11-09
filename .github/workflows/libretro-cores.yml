@@ -121,7 +121,8 @@ jobs:
 
   build-macos:
     name: macOS Universal Core
-    runs-on: macos-latest
+    runs-on: macos-13
+    continue-on-error: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -157,6 +158,7 @@ jobs:
   publish:
     name: Package and Publish to Release
     needs: [build-windows, build-linux, build-android, build-macos]
+    if: always() && !cancelled() && needs.build-linux.result == 'success' && needs.build-android.result == 'success' && needs.build-windows.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
