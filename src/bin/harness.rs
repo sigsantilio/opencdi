@@ -156,7 +156,7 @@ fn main() {
                 let mut buf = Vec::new();
                 m.save_state(&[], &mut buf);
                 saved = Some((buf, disc_launched, shell_ready_count, player.clone()));
-                (video_all, audio_all, audio_samples) = (FNV_OFFSET, FNV_OFFSET, 0);
+                (video_all, audio_all, audio_samples, audio_nonzero) = (FNV_OFFSET, FNV_OFFSET, 0, 0);
             }
             if autoplay && m.bus.cdrom.is_some() && !disc_launched {
                 let (bus, cpu) = (&mut m.bus, &m.cpu);
@@ -236,7 +236,7 @@ fn main() {
                     m.save_state(&[], &mut again);
                     eprintln!("ROUNDTRIP-RESAVE {} size={}", if &again == buf { "same" } else { "DIFF" }, buf.len());
                     (disc_launched, shell_ready_count, player) = (*dl, *src, pl.clone());
-                    (video_all, audio_all, audio_samples) = (FNV_OFFSET, FNV_OFFSET, 0);
+                    (video_all, audio_all, audio_samples, audio_nonzero) = (FNV_OFFSET, FNV_OFFSET, 0, 0);
                     start = at;
                     continue 'passes;
                 }
