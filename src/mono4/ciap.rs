@@ -1,6 +1,6 @@
 // CIAP disc and audio interface at 0x300000: RAM and program memory around a block of word registers at 0x2580.
 use super::Loud;
-use crate::audio::CdiAudio;
+use crate::audio::{CdiAudio, ADPCM_LATENCY};
 use crate::cdrom::{CdRom, CD_SECTOR_RAW_SIZE};
 
 /// Size of the CIAP window: RAM 0x0000-0x257F, registers 0x2580-0x25FF, program memory 0x2600-0x3FFF.
@@ -82,6 +82,7 @@ pub struct Ciap {
     pub q_mode: bool,
     pub lba: u32,
     pub drive_active: bool,
+    pub cdda: bool, // drive started with E0: delivered sectors also play as CD-DA
     pub audio_playing: bool, // CPU-fed playback started by APCR 0x140
     pub audio_wait: u8, // sector periods until the next audio-done step
     pub audio_next: usize, // audio buffer the next step looks at first
@@ -92,6 +93,7 @@ pub struct Ciap {
     pub audio_buffers: u64,
     pub audio_sectors: u64,
     pub audio_overlap: u64, // TACS sectors played while CPU-fed playback ran
+    pub cdda_sectors: u64,
     pub toc: bool, // table of contents read: Q reports carry lead-in entries
     pub toc_index: usize,
     pub start_delay: u8, // sector periods after a seek before the first sector
@@ -111,7 +113,7 @@ pub struct Ciap {
 
 impl Default for Ciap {
     fn default() -> Self {
-        Self { ram: vec![0; WINDOW_SIZE], regs: power_on_regs(), running: false, q_mode: false, lba: 0, drive_active: false, audio_playing: false, audio_wait: 0, audio_next: 0, audio_coding: [0; 2], event_armed: false, asel: false, selecting: false, audio_buffers: 0, audio_sectors: 0, audio_overlap: 0, toc: false, toc_index: 0, start_delay: 0, drive_stopped: false, cycles: 0, dma_request: None, seeks: 0, sectors: 0, skipped: 0, dmas: 0, byteswap: false, descrambled: 0, q_reports: 0, loud: Loud::default(), trace: false }
+        Self { ram: vec![0; WINDOW_SIZE], regs: power_on_regs(), running: false, q_mode: false, lba: 0, drive_active: false, cdda: false, audio_playing: false, audio_wait: 0, audio_next: 0, audio_coding: [0; 2], event_armed: false, asel: false, selecting: false, audio_buffers: 0, audio_sectors: 0, audio_overlap: 0, cdda_sectors: 0, toc: false, toc_index: 0, start_delay: 0, drive_stopped: false, cycles: 0, dma_request: None, seeks: 0, sectors: 0, skipped: 0, dmas: 0, byteswap: false, descrambled: 0, q_reports: 0, loud: Loud::default(), trace: false }
     }
 }
 
@@ -132,7 +134,7 @@ fn att_gain(v: u16) -> f32 {
 impl Ciap {
     pub fn reset(&mut self) {
         self.regs = power_on_regs();
-        (self.running, self.q_mode, self.lba, self.drive_active) = (false, false, 0, false);
+        (self.running, self.q_mode, self.lba, self.drive_active, self.cdda) = (false, false, 0, false, false);
         (self.start_delay, self.drive_stopped, self.toc, self.toc_index) = (0, false, false, 0);
         (self.dma_request, self.cycles) = (None, 0);
         (self.audio_playing, self.audio_wait, self.audio_next, self.audio_coding, self.asel, self.selecting) = (false, 0, 0, [0; 2], false, false);
@@ -142,14 +144,15 @@ impl Ciap {
     /// Drive request from IKAT port D: a seek positions the next sector and starts the drive, a stop halts delivery.
     pub fn drive(&mut self, ev: super::ikat::DriveEvent) {
         match ev {
-            super::ikat::DriveEvent::Seek(lba) => {
+            super::ikat::DriveEvent::Seek(lba) | super::ikat::DriveEvent::Play(lba) => {
                 (self.lba, self.drive_active, self.start_delay, self.toc) = (lba, true, 1, false);
+                self.cdda = matches!(ev, super::ikat::DriveEvent::Play(_));
                 self.seeks += 1;
             }
-            super::ikat::DriveEvent::Stop => (self.drive_active, self.toc) = (false, false),
+            super::ikat::DriveEvent::Stop => (self.drive_active, self.toc, self.cdda) = (false, false, false),
             // A table of contents read ends any running data read.
             super::ikat::DriveEvent::Toc => {
-                (self.toc, self.toc_index, self.drive_active) = (true, 0, false);
+                (self.toc, self.toc_index, self.drive_active, self.cdda) = (true, 0, false, false);
                 (self.start_delay, self.drive_stopped) = (0, false);
             }
         }
@@ -419,6 +422,17 @@ impl Ciap {
             }
             return;
         }
+        // CD-DA goes to the stream the chip-played disc audio uses, which cannot run during CD-DA; CPU-fed audio keeps its own.
+        if self.cdda {
+            let swap = self.byteswap;
+            let frames: Vec<_> = raw
+                .chunks_exact(4)
+                .map(|c| if swap { [c[1], c[0], c[3], c[2]] } else { [c[0], c[1], c[2], c[3]] })
+                .map(|c| (i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0, i16::from_le_bytes([c[2], c[3]]) as f32 / 32768.0))
+                .collect();
+            audio.sfx.push(&frames, ADPCM_LATENCY, ADPCM_LATENCY + 2 * frames.len(), &|| "sfx cdda".to_string());
+            self.cdda_sectors += 1;
+        }
         self.repair(lba, &mut raw);
         let (file, channel, submode) = (raw[16], raw[17], raw[18]);
         let selecting = std::mem::replace(&mut self.selecting, self.asel);
@@ -579,7 +593,7 @@ impl Ciap {
     }
 }
 
-opencdi::impl_state!(Ciap { ram, regs, running, q_mode, lba, drive_active, audio_playing, audio_wait, audio_next, audio_coding, event_armed, asel, selecting, toc, toc_index, start_delay, cycles, byteswap } skip { descrambled, q_reports, audio_buffers, audio_sectors, audio_overlap, drive_stopped, dma_request, seeks, sectors, skipped, dmas, loud, trace });
+opencdi::impl_state!(Ciap { ram, regs, running, q_mode, lba, drive_active, cdda, audio_playing, audio_wait, audio_next, audio_coding, event_armed, asel, selecting, toc, toc_index, start_delay, cycles, byteswap } skip { descrambled, q_reports, audio_buffers, audio_sectors, audio_overlap, cdda_sectors, drive_stopped, dma_request, seeks, sectors, skipped, dmas, loud, trace });
 
 #[cfg(test)]
 mod tests {
@@ -678,6 +692,36 @@ mod tests {
         assert!(c.toc && !c.drive_active);
         c.reset();
         assert!(!c.toc && c.toc_index == 0);
+    }
+
+    fn audio_disc(sectors: usize) -> CdRom {
+        let dir = std::env::temp_dir().join(format!("opencdi-ciap-cdda-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin: Vec<u8> = (0..sectors * 588).flat_map(|n| [(n as i16).to_le_bytes(), (-(n as i16)).to_le_bytes()].concat()).collect();
+        std::fs::write(dir.join("a.bin"), bin).unwrap();
+        std::fs::write(dir.join("a.cue"), "FILE \"a.bin\" BINARY\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n").unwrap();
+        let cd = CdRom::open(dir.join("a.cue")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        cd
+    }
+
+    #[test]
+    fn play_seek_plays_sectors_as_cdda_until_a_data_seek() {
+        let mut c = Ciap::default();
+        let mut audio = CdiAudio::new();
+        let mut cd = Some(audio_disc(8));
+        let period = crate::mcd212::VideoMode::Pal.cycles_per_sector();
+        c.write_reg(REG_CCR, 0x0094, 0);
+        c.drive(super::super::ikat::DriveEvent::Play(2));
+        c.tick(period * 3, period, &mut cd, &mut audio);
+        assert_eq!((c.cdda_sectors, audio.sfx.len(), audio.main.len()), (2, ADPCM_LATENCY + 2 * 588, 0));
+        c.drive(super::super::ikat::DriveEvent::Seek(2));
+        c.tick(period * 3, period, &mut cd, &mut audio);
+        assert_eq!((c.cdda, c.cdda_sectors), (false, 2));
+        c.drive(super::super::ikat::DriveEvent::Play(2));
+        c.drive(super::super::ikat::DriveEvent::Stop);
+        assert!(!c.cdda);
     }
 
     #[test]
