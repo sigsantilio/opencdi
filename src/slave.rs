@@ -141,8 +141,7 @@ impl SlaveHle {
         self.is_data = is_data;
         self.disc_timer = 0;
         self.disc_state = 0x41;
-        let final_state = if is_data { 0x02 } else { 0x01 };
-        info!("Slave: notify_disc_swapped (is_data={}) -> sending tray open (0x00) then spinup (0x41 -> 0x{:02X})", is_data, final_state);
+        info!("Slave: notify_disc_swapped (is_data={}) -> sending tray open (0x00) then spinup (0x41 -> 0x02)", is_data);
         self.prepare_readback(3, &[0xB0, 0x00, 0x00, 0x15], 0xB0, true);
     }
 
@@ -154,7 +153,8 @@ impl SlaveHle {
         if self.has_disc && self.disc_state == 0x41 {
             self.disc_timer += cycles;
             if self.disc_timer >= 4_500_000 {
-                self.disc_state = if self.is_data { 0x02 } else { 0x01 };
+                // The ready status is the same for every disc: a CD-i disc may list only audio tracks with its data in the track 1 pregap.
+                self.disc_state = 0x02;
                 let state = self.disc_state;
                 info!("Slave: disc TOC ready (0x41 -> 0x{:02X}) -> pushing status packet to Ch3 with IRQ2", state);
                 self.prepare_readback(3, &[0xB0, 0x00, state, 0x15], 0xB0, true);
@@ -472,3 +472,19 @@ opencdi::impl_state!(SlaveHle {
 } skip {
     debug_log,
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disc_ready_status_does_not_depend_on_the_track_types() {
+        for is_data in [true, false] {
+            let mut s = SlaveHle::new();
+            s.set_disc_inserted(true, is_data);
+            s.tick(4_500_000);
+            assert_eq!(s.disc_state, 0x02);
+            assert_eq!(&s.channels[3].out_buf[..4], &[0xB0, 0x00, 0x02, 0x15]);
+        }
+    }
+}
