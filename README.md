@@ -22,6 +22,7 @@ The goal of the project is to accurately preserve and run the complete software 
 - **High-Definition PNG Screenshots**: `F8` and `F12` hotkeys capture uncompressed PNG screenshots with game name and frame counter.
 - **Exclusive Gamepad / Mouse Isolation**: Strict separation between Gamepad mode (`F9`) and Mouse/Lightgun mode for precision rail shooters like *Mad Dog McCree*, *Mad Dog II*, and *Drug Wars*.
 - **Modern Display Pipeline**: Cross-platform windowing backed by `winit` and `softbuffer`, with Borderless Fullscreen (`F11` / `Alt+Enter`) and native aspect ratio preservation.
+- **Advanced Audio Architecture & CD-DA Playback**: Real-time continuous MPEG decode clock cutting startup latency down to 1.6 ms (zero FMV underrun gaps), hardware CDIC `AUDCTL` audio map modeling for flawless sound effects (*Zelda: Wand of Gamelon*, *Link: Faces of Evil*), and CD-DA streaming.
 
 ---
 

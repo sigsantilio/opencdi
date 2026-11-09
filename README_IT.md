@@ -19,6 +19,7 @@ L'obiettivo del progetto è preservare e rendere fruibile l'intera libreria soft
 - **Cattura Screenshot PNG ad Alta Definizione**: Scorciatoie `F8` e `F12` per salvare istantaneamente screenshot non compressi con nome del gioco e numero di frame.
 - **Isolamento Esclusivo Mouse / Gamepad**: Separazione rigorosa tra modalità Gamepad (`F9`) e modalità Mouse/Lightgun per giochi di tiro come *Mad Dog McCree*, *Mad Dog II* e *Drug Wars*.
 - **Display & Windowing Moderno**: Finestra fluida e multi-piattaforma basata su `winit` e `softbuffer`, supporto per Borderless Fullscreen (`F11` / `Alt+Enter`) e aspect ratio preservation a risoluzione nativa.
+- **Architettura Audio Avanzata & Supporto CD-DA**: Clock di decodifica audio MPEG in tempo reale sincronizzato alla CPU che riduce la latenza a soli 1.6 ms (eliminando buchi audio nei filmati FMV), modellazione fedele del registro `AUDCTL` del CDIC per effetti sonori perfetti (*Zelda: Wand of Gamelon*, *Link: Faces of Evil*) e riproduzione tracce CD-DA.
 
 ---
 
