@@ -1173,6 +1173,8 @@ mod tests {
         c.write_reg(0x3FA, 0x0800);
         c.write_reg(0x3FE, 0x0000);
         assert!(!c.cdda_playing);
+    }
+
     #[test]
     fn clearing_dbuf_bit_14_drops_a_pending_sector_interrupt() {
         let mut c = Cdic::new();
