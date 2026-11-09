@@ -1,0 +1,186 @@
+name: Build Multi-Platform Libretro Cores
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Windows x64 Core
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Windows Libretro Core
+        run: cargo build --release -p opencdi-libretro
+
+      - name: Stage Artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/opencdi_libretro.dll dist/opencdi_libretro.dll
+          cp crates/opencdi-libretro/opencdi_libretro.info dist/opencdi_libretro.info
+          cd dist && zip -9 opencdi-libretro-windows-x64.zip opencdi_libretro.dll opencdi_libretro.info
+
+      - name: Upload Windows Core Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencdi-libretro-windows-x64
+          path: dist/opencdi-libretro-windows-x64.zip
+
+  build-linux:
+    name: Linux Cores (x86_64, aarch64, armv7)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, armv7-unknown-linux-gnueabihf
+
+      - name: Install zig & cargo-zigbuild
+        run: |
+          python3 -m pip install --upgrade pip
+          pip3 install ziglang cargo-zigbuild
+
+      - name: Build Linux x86_64
+        run: cargo zigbuild --release -p opencdi-libretro --target x86_64-unknown-linux-gnu.2.17
+
+      - name: Build Linux aarch64 (Raspberry Pi 4/5)
+        run: cargo zigbuild --release -p opencdi-libretro --target aarch64-unknown-linux-gnu.2.17
+
+      - name: Build Linux armv7 (Raspberry Pi 2/3)
+        run: cargo zigbuild --release -p opencdi-libretro --target armv7-unknown-linux-gnueabihf.2.17
+
+      - name: Stage Linux Artifacts
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-gnu/release/libopencdi_libretro.so dist/opencdi_libretro_linux_x86_64.so
+          cp target/aarch64-unknown-linux-gnu/release/libopencdi_libretro.so dist/opencdi_libretro_linux_aarch64.so
+          cp target/armv7-unknown-linux-gnueabihf/release/libopencdi_libretro.so dist/opencdi_libretro_linux_armv7.so
+          cp crates/opencdi-libretro/opencdi_libretro.info dist/opencdi_libretro.info
+          cd dist
+          zip -9 opencdi-libretro-linux.zip *.so opencdi_libretro.info
+
+      - name: Upload Linux Cores Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencdi-libretro-linux
+          path: dist/opencdi-libretro-linux.zip
+
+  build-android:
+    name: Android Cores (arm64-v8a, armeabi-v7a)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, armv7-linux-androideabi
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Set NDK Environment
+        run: |
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> $GITHUB_ENV
+
+      - name: Build Android arm64-v8a
+        run: cargo ndk -t arm64-v8a -o ./android_libs build --release -p opencdi-libretro
+
+      - name: Build Android armeabi-v7a
+        run: cargo ndk -t armeabi-v7a -o ./android_libs build --release -p opencdi-libretro
+
+      - name: Stage Android Artifacts
+        run: |
+          mkdir -p dist/arm64-v8a dist/armeabi-v7a
+          cp android_libs/arm64-v8a/libopencdi_libretro.so dist/arm64-v8a/opencdi_libretro_android.so
+          cp android_libs/armeabi-v7a/libopencdi_libretro.so dist/armeabi-v7a/opencdi_libretro_android.so
+          cp crates/opencdi-libretro/opencdi_libretro.info dist/opencdi_libretro.info
+          cd dist
+          zip -9 -r opencdi-libretro-android.zip arm64-v8a armeabi-v7a opencdi_libretro.info
+
+      - name: Upload Android Cores Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencdi-libretro-android
+          path: dist/opencdi-libretro-android.zip
+
+  build-macos:
+    name: macOS Universal Core
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Build Apple Silicon (ARM64)
+        run: cargo build --release -p opencdi-libretro --target aarch64-apple-darwin
+
+      - name: Build Intel (x86_64)
+        run: cargo build --release -p opencdi-libretro --target x86_64-apple-darwin
+
+      - name: Create Universal Binary
+        run: |
+          mkdir -p dist
+          lipo -create \
+            target/aarch64-apple-darwin/release/libopencdi_libretro.dylib \
+            target/x86_64-apple-darwin/release/libopencdi_libretro.dylib \
+            -output dist/opencdi_libretro.dylib
+          cp crates/opencdi-libretro/opencdi_libretro.info dist/opencdi_libretro.info
+          cd dist
+          zip -9 opencdi-libretro-macos-universal.zip opencdi_libretro.dylib opencdi_libretro.info
+
+      - name: Upload macOS Core Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencdi-libretro-macos-universal
+          path: dist/opencdi-libretro-macos-universal.zip
+
+  publish:
+    name: Package and Publish to Release
+    needs: [build-windows, build-linux, build-android, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_artifacts
+
+      - name: Organize Packages
+        run: |
+          mkdir -p release_assets
+          cp all_artifacts/opencdi-libretro-windows-x64/*.zip release_assets/
+          cp all_artifacts/opencdi-libretro-linux/*.zip release_assets/
+          cp all_artifacts/opencdi-libretro-android/*.zip release_assets/
+          cp all_artifacts/opencdi-libretro-macos-universal/*.zip release_assets/
+          ls -la release_assets/
+
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          echo "Uploading assets to release $TAG_NAME..."
+          gh release upload "$TAG_NAME" release_assets/*.zip --clobber
