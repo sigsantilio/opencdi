@@ -3,6 +3,7 @@ pub mod libretro;
 
 use input::{Input, Table};
 use libretro::*;
+use opencdi::audio;
 use opencdi::bios;
 use opencdi::machine::Machine;
 use opencdi::mcd212::{VideoMode, SCREEN_HEIGHT, SCREEN_WIDTH};
@@ -96,6 +97,7 @@ struct Core {
     temp_disc: Option<PathBuf>,
     mix: Vec<(f32, f32)>,
     pcm: Vec<i16>,
+    frames_out: u64,
     input: Input,
     uart_line: Vec<u8>,
     state_buf: Vec<u8>,
@@ -117,6 +119,7 @@ static CORE: Mutex<Core> = Mutex::new(Core {
     mix: Vec::new(),
     uart_line: Vec::new(),
     pcm: Vec::new(),
+    frames_out: 0,
     input: Input::new(),
     state_buf: Vec::new(),
     state_size: 0,
@@ -527,21 +530,22 @@ pub extern "C" fn retro_reset() {
                 }
                 core.machine = Some(m);
                 core.input.reset();
+                core.frames_out = 0;
             }
             Err(e) => log(RETRO_LOG_ERROR, &format!("reset failed: {}", e)),
         }
     })
 }
 
+// Sends the frames the emulation made this frame, hard-clipped to 16 bits.
 fn send_audio(core: &mut Core, batch: retro_audio_sample_batch_t) {
-    let Core { machine, mix, pcm, .. } = core;
+    let Core { machine, mix, pcm, frames_out, .. } = core;
     let Some(m) = machine.as_mut() else { return };
     mix.clear();
-    m.drain_audio(mix);
+    *frames_out += m.drain_audio(mix) as u64;
     let Some(f) = batch else { return };
     pcm.clear();
-    let to_i16 = |x: f32| (x.clamp(-1.0, 1.0) * 32767.0) as i16;
-    pcm.extend(mix.iter().flat_map(|&(l, r)| [to_i16(l), to_i16(r)]));
+    pcm.extend(mix.iter().flat_map(|&(l, r)| [audio::to_i16(l), audio::to_i16(r)]));
     let mut done = 0;
     let frames = pcm.len() / 2;
     while done < frames {
@@ -731,6 +735,7 @@ fn load(game: *const retro_game_info) -> Result<(), String> {
     core.spec = Some(spec);
     core.temp_disc = temp;
     core.input.reset();
+    core.frames_out = 0;
     core.state_size = 0;
     Ok(())
 }
@@ -738,6 +743,13 @@ fn load(game: *const retro_game_info) -> Result<(), String> {
 fn unload() {
     let mut core = lock(&CORE);
     flush_uart_line(&mut core.uart_line);
+    if let Some(m) = core.machine.as_ref() {
+        let a = &m.bus.cdic.audio;
+        log(RETRO_LOG_INFO, &format!(
+            "audio: {} frames sent; received main={} sfx={} mpeg={}; prefill restarts main={} sfx={} mpeg={}; hold warnings main={} sfx={} mpeg={}",
+            core.frames_out, a.main.frames_in, a.sfx.frames_in, a.mpeg.frames_in, a.main.restarts, a.sfx.restarts, a.mpeg.restarts, a.main.warnings, a.sfx.warnings, a.mpeg.warnings
+        ));
+    }
     core.machine = None;
     core.spec = None;
     core.state_size = 0;
