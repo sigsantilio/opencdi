@@ -1308,7 +1308,6 @@ impl Dvc {
                     self.audio_armed = true;
                     self.audio_enabled = true;
                     self.or_fma_word(0x02, 0x0010);
-                    self.or_fma_word(FMA_ISR, 0x0010);
                 }
                 if value & 0x8000 != 0 { // DMA request Audio
                     self.dma_requested = true;
@@ -2144,6 +2143,15 @@ mod timing_tests {
         assert_eq!(d.get_fma_word(FMA_ISR) & 0x14, 0);
         tick(&mut d);
         assert_eq!(d.get_fma_word(FMA_ISR) & 0x14, 0x14);
+    }
+
+    #[test]
+    fn play_arm_command_does_not_set_interrupt_in_isr() {
+        let mut d = Dvc::new();
+        d.set_fma_word(FMA_CMD, 0x0002);
+        d.handle_fma_write(FMA_CMD);
+        assert_eq!(d.get_fma_word(FMA_ISR) & FMA_IRQ_PLAY, 0, "PLAY ARM must not immediately trigger PLAY interrupt in ISR");
+        assert_ne!(d.get_fma_word(0x02) & FMA_IRQ_PLAY, 0, "PLAY ARM sets playback status bit in register 2");
     }
 
     #[test]
