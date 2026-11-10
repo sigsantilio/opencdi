@@ -21,6 +21,8 @@ pub struct Port {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriveEvent {
     Seek(u32),
+    Play(u32), // E0: seek and play the sectors as CD-DA
+
     Stop,
     Toc,
 }
@@ -340,8 +342,8 @@ impl Ikat {
             // Seek to a BCD time; the next sector delivered is that time minus 150 frames. No reply.
             0xE0 | 0xE1 => {
                 let bcd = |b: u8| ((b >> 4) * 10 + (b & 0x0F)) as u32;
-                let frames = (bcd(cmd[1]) * 60 + bcd(cmd[2])) * 75 + bcd(cmd[3]);
-                self.drive_event = Some(DriveEvent::Seek(frames.saturating_sub(150)));
+                let lba = ((bcd(cmd[1]) * 60 + bcd(cmd[2])) * 75 + bcd(cmd[3])).saturating_sub(150);
+                self.drive_event = Some(if cmd[0] == 0xE0 { DriveEvent::Play(lba) } else { DriveEvent::Seek(lba) });
             }
             0xC2 | 0xC3 => self.drive_event = Some(DriveEvent::Stop),
             // Table of contents read: the next status reply ends the transition, then the CIAP reports the entries.
@@ -479,6 +481,10 @@ mod tests {
             k.write(0x07, b, 0);
         }
         assert_eq!(k.drive_event, Some(DriveEvent::Seek(13)));
+        for b in [0xE0, 0x00, 0x02, 0x13] {
+            k.write(0x07, b, 0);
+        }
+        assert_eq!(k.drive_event, Some(DriveEvent::Play(13)));
         k.drive_busy = true;
         for b in [0xB0, 0, 0, 0] {
             k.write(0x07, b, 0);
