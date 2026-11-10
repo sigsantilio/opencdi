@@ -1837,7 +1837,7 @@ impl App {
                     self.pad_y_f = mouse_y as f32;
                     send_pointer(&mut m.bus, self.pad_x, self.pad_y, mouse_btn | key_btn);
                     if let Some(m4) = m.bus.mono4.as_deref_mut() {
-                        m4.ikat.push_pointer(self.rel_over.0 as i32, self.rel_over.1 as i32);
+                        m4.ikat.push_pointer(rel_over.0 as i32, rel_over.1 as i32);
                     }
                 }
             }
