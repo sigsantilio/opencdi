@@ -172,10 +172,11 @@ jobs:
       - name: Organize Packages
         run: |
           mkdir -p release_assets
-          cp all_artifacts/opencdi-libretro-windows-x64/*.zip release_assets/
-          cp all_artifacts/opencdi-libretro-linux/*.zip release_assets/
-          cp all_artifacts/opencdi-libretro-android/*.zip release_assets/
-          cp all_artifacts/opencdi-libretro-macos-universal/*.zip release_assets/
+          for d in opencdi-libretro-windows-x64 opencdi-libretro-linux opencdi-libretro-android opencdi-libretro-macos-universal; do
+            if [ -d "all_artifacts/$d" ]; then
+              cp all_artifacts/$d/*.zip release_assets/
+            fi
+          done
           ls -la release_assets/
 
       - name: Upload to GitHub Release
