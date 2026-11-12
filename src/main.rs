@@ -359,25 +359,40 @@ fn resolve_or_guide_bios(rom_arg: Option<PathBuf>) -> Option<PathBuf> {
     None
 }
 
-// First candidate that passes the cartridge check; refused files are logged with the reason.
-fn find_dvc_rom() -> Option<PathBuf> {
-    const DVC_CANDIDATES: &[&str] = &[
-        "dvc/vmpega.rom",
-        "bios/vmpega.rom",
-        "vmpega.rom",
-        "dvc/impega.rom",
-        "bios/impega.rom",
-        "impega.rom",
-    ];
-    for &name in DVC_CANDIDATES {
-        let Some(p) = find_file(name) else { continue };
-        match Machine::read_dvc(&p) {
-            Ok((_, img)) if img.report.status != bios::Status::Error => return Some(p),
-            Ok((_, img)) => warn!("DVC ROM {:?} refused: {}", p, img.report.message),
-            Err(e) => warn!("DVC ROM {:?}: {}", p, e),
+// Each board has its own cartridge: VMPEG on Mono-I, IMPEG on Mono-IV.
+fn dvc_candidates(board: BoardKind) -> &'static [&'static str] {
+    match board {
+        BoardKind::Mono1 => &["dvc/vmpega.rom", "bios/vmpega.rom", "vmpega.rom"],
+        BoardKind::Mono4 => &["dvc/impega.rom", "bios/impega.rom", "impega.rom"],
+    }
+}
+
+// First candidate that passes the cartridge check for the board; refused files are logged with the reason.
+fn find_dvc_rom(board: BoardKind) -> Option<PathBuf> {
+    dvc_candidates(board).iter().filter_map(|&n| find_file(n)).find(|p| dvc_fits(p, board))
+}
+
+fn dvc_fits(p: &std::path::Path, board: BoardKind) -> bool {
+    match Machine::read_dvc_for(p, board) {
+        Ok((_, img)) if img.report.status != bios::Status::Error => true,
+        Ok((_, img)) => {
+            warn!("DVC ROM {:?} does not fit the {:?} board, not mapped: {}", p, board, img.report.message);
+            false
+        }
+        Err(e) => {
+            warn!("DVC ROM {:?}: {}", p, e);
+            false
         }
     }
-    None
+}
+
+// Cartridge for the board: --dvc, the saved choice for that board, then the board's own file names.
+fn resolve_dvc(board: BoardKind, arg: Option<&std::path::Path>) -> Option<PathBuf> {
+    arg.map(PathBuf::from)
+        .into_iter()
+        .chain(opencdi::frontend::load_saved_dvc(board))
+        .find(|p| dvc_fits(p, board))
+        .or_else(|| find_dvc_rom(board))
 }
 
 // Fits a cartridge ROM and logs the check verdict: refused images say so, unknown ones warn.
@@ -646,16 +661,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dvc_arg = flag_value("--dvc").map(PathBuf::from);
     let mut resolved_dvc_path = None;
     if !dvc_disabled {
-        let dvc_candidate = dvc_arg.clone()
-            .or_else(opencdi::frontend::load_saved_dvc)
-            .or_else(find_dvc_rom);
+        let dvc_candidate = resolve_dvc(m.bus.board, dvc_arg.as_deref());
         if let Some(dvc_path) = dvc_candidate {
             if load_dvc_logged(&mut m, &dvc_path) {
                 info!("Loaded Digital Video Cartridge (DVC) ROM from {:?}", dvc_path);
                 resolved_dvc_path = Some(dvc_path);
             }
         } else {
-            info!("No DVC ROM (vmpega.rom) found: booting in Base CD-i mode (MPEG video disabled).");
+            info!("No DVC ROM for the {:?} board found: booting in Base CD-i mode (MPEG video disabled).", m.bus.board);
         }
     } else {
         info!("Forced boot without DVC (--no-dvc): Base CD-i mode");
@@ -1118,9 +1131,11 @@ impl App {
         }
         self.nvram_path = Some(new_nvram);
 
-        // Load DVC ROM if enabled
+        // The old board's cartridge never carries over; resolve the new board's own
+        self.m.bus.dvc = opencdi::dvc::Dvc::new();
+        self.dvc_path = None;
         if !self.dvc_disabled {
-            if let Some(dvc_p) = self.dvc_arg.clone().or_else(opencdi::frontend::load_saved_dvc).or_else(find_dvc_rom) {
+            if let Some(dvc_p) = resolve_dvc(target_board, self.dvc_arg.as_deref()) {
                 if load_dvc_logged(&mut self.m, &dvc_p) {
                     self.dvc_path = Some(dvc_p);
                 }
@@ -1348,7 +1363,7 @@ impl App {
                             info!("Disc loaded successfully: {}", self.current_game_name);
 
                             if !self.dvc_disabled && !self.m.bus.dvc.is_fitted() {
-                                if let Some(dvc_path) = self.dvc_arg.clone().or_else(find_dvc_rom) {
+                                if let Some(dvc_path) = resolve_dvc(self.m.bus.board, self.dvc_arg.as_deref()) {
                                     if load_dvc_logged(&mut self.m, &dvc_path) {
                                         info!("Loaded Digital Video Cartridge (DVC) extension from {:?}", dvc_path);
                                         #[cfg(target_os = "windows")]
@@ -1498,14 +1513,14 @@ impl App {
                         #[cfg(target_os = "windows")]
                         gui::update_dvc_menu(false);
                     } else {
-                        if let Some(dvc_path) = self.dvc_arg.clone().or_else(find_dvc_rom) {
+                        if let Some(dvc_path) = resolve_dvc(self.m.bus.board, self.dvc_arg.as_deref()) {
                             if load_dvc_logged(&mut self.m, &dvc_path) {
                                 info!("Inserted Digital Video Cartridge (DVC) from {:?}", dvc_path);
                                 #[cfg(target_os = "windows")]
                                 gui::update_dvc_menu(true);
                             }
                         } else {
-                            error!("Cannot enable DVC: vmpega.rom not found in dvc/, bios/, or root directory");
+                            error!("Cannot enable DVC: no cartridge ROM for the {:?} board in dvc/, bios/, or root directory", self.m.bus.board);
                         }
                     }
                     self.m.bus.reset_system();
@@ -1580,7 +1595,7 @@ impl App {
                     info!("Loading user-selected DVC ROM: {:?}", path);
                     if load_dvc_logged(&mut self.m, &path) {
                         self.dvc_path = Some(path.clone());
-                        opencdi::frontend::save_dvc_preference(&path);
+                        opencdi::frontend::save_dvc_preference(self.m.bus.board, &path);
                         #[cfg(target_os = "windows")]
                         gui::update_dvc_menu(true);
                         info!("DVC ROM loaded successfully: {:?}", path);
@@ -2275,6 +2290,12 @@ mod tests {
         assert_eq!(BoardKind::parse("mono1"), Some(BoardKind::Mono1));
         assert_eq!(BoardKind::parse("mono4"), Some(BoardKind::Mono4));
         assert_eq!(BoardKind::parse("490"), None);
+    }
+
+    #[test]
+    fn each_board_looks_only_for_its_own_cartridge() {
+        assert!(dvc_candidates(BoardKind::Mono1).iter().all(|n| n.ends_with("vmpega.rom")));
+        assert!(dvc_candidates(BoardKind::Mono4).iter().all(|n| n.ends_with("impega.rom")));
     }
 
     #[test]

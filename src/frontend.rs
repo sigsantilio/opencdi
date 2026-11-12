@@ -450,32 +450,35 @@ pub fn save_bios_preference(path: &std::path::Path) {
     let _ = std::fs::write(CONFIG_FILE, lines.join("\n") + "\n");
 }
 
-pub fn load_saved_dvc() -> Option<PathBuf> {
-    if let Ok(content) = std::fs::read_to_string(CONFIG_FILE) {
-        for line in content.lines().map(str::trim) {
-            if line.starts_with('#') || line.starts_with(';') { continue; }
-            if let Some((k, v)) = line.split_once('=') {
-                if k.trim().eq_ignore_ascii_case("dvc_path") || k.trim().eq_ignore_ascii_case("dvc") {
-                    let p = PathBuf::from(v.trim());
-                    if p.is_file() {
-                        return Some(p);
-                    }
-                }
-            }
-        }
+fn dvc_key(board: crate::bus::BoardKind) -> &'static str {
+    match board {
+        crate::bus::BoardKind::Mono1 => "dvc_path_mono1",
+        crate::bus::BoardKind::Mono4 => "dvc_path_mono4",
     }
-    None
 }
 
-pub fn save_dvc_preference(path: &std::path::Path) {
+// Per-board key first, then the legacy shared `dvc_path`; the caller checks the ROM fits the board.
+pub fn load_saved_dvc(board: crate::bus::BoardKind) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(CONFIG_FILE).ok()?;
+    let find = |names: &[&str]| {
+        content.lines().map(str::trim).filter(|l| !l.starts_with('#') && !l.starts_with(';')).find_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            let p = PathBuf::from(v.trim());
+            (names.iter().any(|n| k.trim().eq_ignore_ascii_case(n)) && p.is_file()).then_some(p)
+        })
+    };
+    find(&[dvc_key(board)]).or_else(|| find(&["dvc_path", "dvc"]))
+}
+
+pub fn save_dvc_preference(board: crate::bus::BoardKind, path: &std::path::Path) {
+    let key = dvc_key(board);
     let mut lines = Vec::new();
     let mut found = false;
     if let Ok(content) = std::fs::read_to_string(CONFIG_FILE) {
         for line in content.lines() {
-            let trimmed = line.trim();
-            if let Some((k, _)) = trimmed.split_once('=') {
-                if k.trim().eq_ignore_ascii_case("dvc_path") || k.trim().eq_ignore_ascii_case("dvc") {
-                    lines.push(format!("dvc_path={}", path.display()));
+            if let Some((k, _)) = line.trim().split_once('=') {
+                if k.trim().eq_ignore_ascii_case(key) {
+                    lines.push(format!("{}={}", key, path.display()));
                     found = true;
                     continue;
                 }
@@ -487,7 +490,7 @@ pub fn save_dvc_preference(path: &std::path::Path) {
         if lines.is_empty() {
             lines.push("# OpenCDi Emulator Configuration".to_string());
         }
-        lines.push(format!("dvc_path={}", path.display()));
+        lines.push(format!("{}={}", key, path.display()));
     }
     let _ = std::fs::write(CONFIG_FILE, lines.join("\n") + "\n");
 }
