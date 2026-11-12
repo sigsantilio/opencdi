@@ -7,6 +7,38 @@ use log::{info, error};
 pub const CD_SECTOR_RAW_SIZE: usize = 2352;
 pub const CD_SUBCHANNEL_SIZE: usize = 96;
 pub const CD_FRAME_SIZE: usize = CD_SECTOR_RAW_SIZE + CD_SUBCHANNEL_SIZE; // 2448
+pub const CD_SCRAMBLE_SIZE: usize = 2340;
+pub const CD_SYNC_HEADER: [u8; 12] = [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00];
+
+static CD_SCRAMBLE_TABLE: std::sync::LazyLock<[u8; CD_SCRAMBLE_SIZE]> = std::sync::LazyLock::new(|| {
+    let mut table = [0u8; CD_SCRAMBLE_SIZE];
+    let mut reg = 0x0001u16;
+    for i in 0..CD_SCRAMBLE_SIZE {
+        let mut b = 0u8;
+        for bit in 0..8 {
+            b |= ((reg & 1) as u8) << bit;
+            let new_bit = (reg & 1) ^ ((reg >> 1) & 1);
+            reg = (reg >> 1) | (new_bit << 14);
+        }
+        table[i] = b;
+    }
+    table
+});
+
+/// Descrambles standard Yellow/Green Book Mode 1 / Mode 2 sectors if they were ripped raw
+/// (e.g. CD-i Ready discs where Track 1 is dumped as an audio track without hardware descrambling).
+pub fn maybe_descramble_sector(sector: &mut [u8; CD_SECTOR_RAW_SIZE]) {
+    if sector[0..12] != CD_SYNC_HEADER {
+        return;
+    }
+    let mode_byte = sector[15];
+    if (mode_byte == 0x62 || mode_byte == 0x61 || mode_byte == 0x60) && (sector[13] & 0x80) != 0 {
+        let table = &*CD_SCRAMBLE_TABLE;
+        for i in 0..CD_SCRAMBLE_SIZE {
+            sector[12 + i] ^= table[i];
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct CdTrack {
@@ -630,7 +662,7 @@ impl CdRom {
             return false;
         }
 
-        match &mut self.source {
+        let success = match &mut self.source {
             CdSource::Chd { chd, hunk_buf, comp_buf, current_hunk, hunk_size, sectors_per_hunk } => {
                 let hunk_idx = lba / *sectors_per_hunk;
                 let sector_in_hunk = (lba % *sectors_per_hunk) as usize;
@@ -706,6 +738,7 @@ impl CdRom {
                     &[1, 0, 2] // XAForm2, YellowMode2, CDDA
                 };
 
+                let mut raw_read_success = false;
                 for &mode in modes_to_try {
                     let mut raw_info = RawReadInfo {
                         disk_offset: (lba as i64) * 2048,
@@ -726,48 +759,61 @@ impl CdRom {
                         )
                     };
                     if ok != 0 && bytes_ret == CD_SECTOR_RAW_SIZE as u32 {
-                        return true;
+                        raw_read_success = true;
+                        break;
                     }
                 }
 
-                // 2. Fallback: Cooked 2048-byte read via SetFilePointerEx + ReadFile
-                let byte_offset = (lba as i64) * 2048;
-                let mut new_pos = 0i64;
-                let seek_ok = unsafe {
-                    SetFilePointerEx(handle.0, byte_offset, &mut new_pos, 0)
-                };
-                if seek_ok != 0 {
-                    out_sector.fill(0);
-                    let mut bytes_read = 0u32;
-                    let read_ok = unsafe {
-                        ReadFile(
-                            handle.0,
-                            out_sector[24..24 + 2048].as_mut_ptr() as *mut std::ffi::c_void,
-                            2048,
-                            &mut bytes_read,
-                            std::ptr::null_mut(),
-                        )
+                if raw_read_success {
+                    true
+                } else {
+                    // 2. Fallback: Cooked 2048-byte read via SetFilePointerEx + ReadFile
+                    let byte_offset = (lba as i64) * 2048;
+                    let mut new_pos = 0i64;
+                    let seek_ok = unsafe {
+                        SetFilePointerEx(handle.0, byte_offset, &mut new_pos, 0)
                     };
-                    if read_ok != 0 && bytes_read == 2048 {
-                        // Synthesize standard Mode 2 sync header
-                        out_sector[0] = 0x00;
-                        out_sector[1..11].fill(0xFF);
-                        out_sector[11] = 0x00;
-                        let m = (lba + 150) / 75 / 60;
-                        let s = ((lba + 150) / 75) % 60;
-                        let f = (lba + 150) % 75;
-                        out_sector[12] = ((m / 10) << 4 | (m % 10)) as u8;
-                        out_sector[13] = ((s / 10) << 4 | (s % 10)) as u8;
-                        out_sector[14] = ((f / 10) << 4 | (f % 10)) as u8;
-                        out_sector[15] = 2; // Mode 2
-                        return true;
+                    if seek_ok != 0 {
+                        out_sector.fill(0);
+                        let mut bytes_read = 0u32;
+                        let read_ok = unsafe {
+                            ReadFile(
+                                handle.0,
+                                out_sector[24..24 + 2048].as_mut_ptr() as *mut std::ffi::c_void,
+                                2048,
+                                &mut bytes_read,
+                                std::ptr::null_mut(),
+                            )
+                        };
+                        if read_ok != 0 && bytes_read == 2048 {
+                            // Synthesize standard Mode 2 sync header
+                            out_sector[0] = 0x00;
+                            out_sector[1..11].fill(0xFF);
+                            out_sector[11] = 0x00;
+                            let m = (lba + 150) / 75 / 60;
+                            let s = ((lba + 150) / 75) % 60;
+                            let f = (lba + 150) % 75;
+                            out_sector[12] = ((m / 10) << 4 | (m % 10)) as u8;
+                            out_sector[13] = ((s / 10) << 4 | (s % 10)) as u8;
+                            out_sector[14] = ((f / 10) << 4 | (f % 10)) as u8;
+                            out_sector[15] = 2; // Mode 2
+                            true
+                        } else {
+                            error!("CD-ROM Fisico: Fallita lettura settore LBA {}", lba);
+                            false
+                        }
+                    } else {
+                        error!("CD-ROM Fisico: Fallita lettura settore LBA {}", lba);
+                        false
                     }
                 }
-
-                error!("CD-ROM Fisico: Fallita lettura settore LBA {}", lba);
-                false
             }
+        };
+
+        if success {
+            maybe_descramble_sector(out_sector);
         }
+        success
     }
 }
 
