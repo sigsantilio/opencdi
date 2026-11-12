@@ -793,7 +793,8 @@ impl Mcd212 {
         }
 
         // LCT depends on current frame parity
-        let mut addr = if (self.csrr[0] & CSR1R_PA) != 0 {
+        let is_interlaced = (self.dcr[0] & DCR_SM_BIT) != 0;
+        let mut addr = if is_interlaced && (self.csrr[0] & CSR1R_PA) != 0 {
             0x202
         } else {
             0x200
@@ -1390,6 +1391,33 @@ mod tests {
         assert!(m.vblank_irq && m.int_line());
         m.read_reg(0x00);
         assert!(!m.int_line());
+    }
+
+    #[test]
+    fn non_interlaced_process_ica_ignores_field_parity() {
+        let mut m = Mcd212::new();
+        m.dcr[0] = DCR_ICA_BIT; // SM = 0 (non-interlaced)
+        m.dcr[1] = DCR_ICA_BIT;
+        // Field 1 (0x400) branches to 0x500 (sets DCP=0x001234 / 0x00ABCD);
+        // Field 2 (0x404) branches to 0x600 (sets DCP=0x005678 / 0x00EF01).
+        m.plane_a[0x400..0x408].copy_from_slice(&[0x40, 0x00, 0x05, 0x00, 0x40, 0x00, 0x06, 0x00]);
+        m.plane_b[0x400..0x408].copy_from_slice(&[0x40, 0x00, 0x05, 0x00, 0x40, 0x00, 0x06, 0x00]);
+        m.plane_a[0x500..0x504].copy_from_slice(&[0x30, 0x00, 0x12, 0x34]);
+        m.plane_a[0x600..0x604].copy_from_slice(&[0x30, 0x00, 0x56, 0x78]);
+        m.plane_b[0x500..0x504].copy_from_slice(&[0x30, 0x00, 0xAB, 0xC0]);
+        m.plane_b[0x600..0x604].copy_from_slice(&[0x30, 0x00, 0xEF, 0x00]);
+
+        m.csrr[0] = CSR1R_PA;
+        m.tick_scanline(0);
+        assert_eq!(m.get_dcp::<0>(), 0x001234);
+        assert_eq!(m.get_dcp::<1>(), 0x00ABC0);
+
+        // Interlaced (SM = 1) selects 0x202 (0x404) when CSR1R_PA is set.
+        m.dcr[0] |= DCR_SM_BIT;
+        m.csrr[0] = CSR1R_PA;
+        m.tick_scanline(0);
+        assert_eq!(m.get_dcp::<0>(), 0x005678);
+        assert_eq!(m.get_dcp::<1>(), 0x00EF00);
     }
 }
 
