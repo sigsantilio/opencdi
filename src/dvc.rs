@@ -1640,6 +1640,10 @@ impl Dvc {
                     *s = (0.0, 0.0);
                 }
             }
+            // A frame decoded after an underflow means playback is active again.
+            if self.get_fma_word(0x02) & FMA_IRQ_PLAY == 0 && (self.audio_enabled || self.audio_armed) {
+                self.or_fma_word(0x02, FMA_IRQ_PLAY);
+            }
             let header = u32::from_be_bytes(f.header) & !0x0300;
             if header != std::mem::replace(&mut self.fma_last_header, header) {
                 self.fma_pending |= FMA_IRQ_DEC;
@@ -2202,6 +2206,23 @@ mod timing_tests {
         let stat = d.get_fma_word(0x02);
         assert_eq!(stat & FMA_IRQ_PLAY, 0, "Playback active bit 4 must be cleared on underflow");
         assert_ne!(stat & FMA_IRQ_UNF, 0, "Underflow bit 3 must be set on underflow");
+    }
+
+    #[test]
+    fn playback_active_bit_returns_when_decoding_resumes_after_underflow() {
+        let mut d = dvc();
+        feed(&mut d, &stream(90_000, Some(99_000), 1));
+        feed(&mut d, &pack(99_800, 3528));
+        tick(&mut d);
+        feed(&mut d, &pack(120_000, 3528));
+        feed(&mut d, &pack(140_000, 3528));
+        tick(&mut d);
+        assert_eq!(d.get_fma_word(0x02) & FMA_IRQ_PLAY, 0);
+
+        feed(&mut d, &stream(140_500, Some(141_000), 1));
+        feed(&mut d, &pack(142_000, 3528));
+        tick(&mut d);
+        assert_ne!(d.get_fma_word(0x02) & FMA_IRQ_PLAY, 0, "a frame decoded after an underflow sets the playback active bit again");
     }
 
     #[test]
