@@ -5,7 +5,7 @@
 OpenCDi è un emulatore open source moderno per **Philips CD-i** scritto in **Rust**.
 L'obiettivo del progetto è preservare e rendere fruibile l'intera libreria software e multimediale del sistema Philips CD-i con un'architettura moderna, accurata e veloce.
 
-![OpenCDi Showcase](opencdi_showcase_v016.png)
+![OpenCDi](opencdi_banner.png)
 
 ---
 

@@ -15,5 +15,6 @@ Invia_a_GitHub.bat
 *.sv
 *.py
 *.png
+!opencdi_banner.png
 *.bin
 *.mon
