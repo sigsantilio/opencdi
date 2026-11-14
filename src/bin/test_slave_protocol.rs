@@ -1,29 +1,4 @@
-#[path = "../audio.rs"]
-mod audio;
-#[path = "../bus.rs"]
-mod bus;
-#[path = "../cdic.rs"]
-mod cdic;
-#[path = "../cdrom.rs"]
-mod cdrom;
-#[path = "../dma.rs"]
-mod dma;
-#[path = "../dvc.rs"]
-mod dvc;
-#[path = "../mcd212.rs"]
-mod mcd212;
-#[path = "../mono4/mod.rs"]
-mod mono4;
-#[path = "../nvram.rs"]
-mod nvram;
-#[path = "../scc_timer.rs"]
-mod scc_timer;
-#[path = "../slave.rs"]
-mod slave;
-#[path = "../tap.rs"]
-mod tap;
-
-use crate::bus::CdiBus;
+use opencdi::bus::CdiBus;
 
 fn expect(cond: bool, name: impl std::fmt::Display, detail: String) {
     if cond {

@@ -429,7 +429,11 @@ impl SlaveHle {
             ch.pending_cmd = 0;
         }
         if assert_irq {
-            self.irq_deferred = true;
+            if ch_idx == 0 {
+                self.irq_pending = true;
+            } else {
+                self.irq_deferred = true;
+            }
         }
     }
 
@@ -486,5 +490,40 @@ mod tests {
             assert_eq!(s.disc_state, 0x02);
             assert_eq!(&s.channels[3].out_buf[..4], &[0xB0, 0x00, 0x02, 0x15]);
         }
+    }
+
+    #[test]
+    fn ch0_mouse_protocol_and_immediate_irq() {
+        let mut s = SlaveHle::new();
+        s.update_mouse(300, 280, 0);
+        assert!(s.irq_pending, "ch0 mouse packet must raise IRQ2 immediately without waiting for tick()");
+
+        let read_byte = |slave: &mut SlaveHle| (slave.read(0) & 0xFF) as u8;
+        let expected_hdr = (((300 & 0x380) >> 7) as u8) | (0x01 << 3);
+        assert_eq!(read_byte(&mut s), expected_hdr);
+        assert!(!s.irq_pending, "reading first byte clears irq_pending");
+
+        // Update mid-transfer stages in pending_buf without corrupting remaining bytes.
+        s.update_mouse(340, 280, 0);
+        assert!(!s.irq_pending);
+        assert_eq!(read_byte(&mut s), (300 & 0x7F) as u8);
+        assert_eq!(read_byte(&mut s), ((280 & 0x380) >> 7) as u8);
+        assert_eq!(read_byte(&mut s), (280 & 0x7F) as u8);
+        assert!(s.irq_pending, "promoting staged packet at end of read reasserts irq_pending");
+        assert_eq!(read_byte(&mut s), (((340 & 0x380) >> 7) as u8) | (0x01 << 3));
+        assert_eq!(read_byte(&mut s), (340 & 0x7F) as u8);
+        let _ = read_byte(&mut s);
+        let _ = read_byte(&mut s);
+
+        // Quick click (press then release before CPU reads byte 0) preserves both packets in order.
+        s.update_mouse(400, 250, 1);
+        s.update_mouse(400, 250, 0);
+        assert!(s.irq_pending);
+        let b0_down = read_byte(&mut s);
+        assert_ne!(b0_down & 0x38, 0x08, "first packet must retain button press");
+        for _ in 0..3 { let _ = read_byte(&mut s); }
+        assert!(s.irq_pending, "release packet promoted with IRQ");
+        let b0_up = read_byte(&mut s);
+        assert_eq!(b0_up & 0x38, 0x08, "second packet must deliver button release");
     }
 }

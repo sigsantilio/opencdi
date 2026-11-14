@@ -17,7 +17,6 @@ const START_SLICE_LAST: i32 = 0xAF;
 const START_PICTURE: i32 = 0x00;
 const START_EXTENSION: i32 = 0xB5;
 const START_USER_DATA: i32 = 0xB2;
-const SEQUENCE_HEADER_MAX_BITS: usize = 64 + 2 * 64 * 8;
 const START_GOP: i32 = 0xB8;
 
 fn is_slice_start_code(c: i32) -> bool {
@@ -756,7 +755,14 @@ pub struct Video {
     pub non_intra_quant_matrix: [u8; 64],
 
     pub has_reference_frame: bool,
+    pub has_fwd_reference: bool,
     pub assume_no_b_frames: bool,
+    pub emitted_initial_ref: bool,
+    pub flush_single: bool,
+    pub fallback_width: usize,
+    pub fallback_height: usize,
+    pub fallback_fps: f64,
+    pub fallback_par: f64,
     /// Set when an MPEG-1 sequence_end_code (00 00 01 B7) has been received
     /// and not yet reported to the host.
     pub sequence_end_seen: bool,
@@ -770,6 +776,16 @@ impl Video {
     /// Create a decoder over a video elementary stream and parse the sequence
     /// header if present.
     pub fn new(video_es: Vec<u8>) -> Self {
+        Self::new_with_fallback(video_es, 0, 0, 0.0, 1.0)
+    }
+
+    pub fn new_with_fallback(
+        video_es: Vec<u8>,
+        fallback_width: usize,
+        fallback_height: usize,
+        fallback_fps: f64,
+        fallback_par: f64,
+    ) -> Self {
         let mut s = Self {
             buffer: Buffer::new(video_es),
             framerate: 0.0,
@@ -807,7 +823,14 @@ impl Video {
             intra_quant_matrix: [0; 64],
             non_intra_quant_matrix: [0; 64],
             has_reference_frame: false,
+            has_fwd_reference: false,
             assume_no_b_frames: false,
+            emitted_initial_ref: false,
+            flush_single: false,
+            fallback_width,
+            fallback_height,
+            fallback_fps,
+            fallback_par,
             sequence_end_seen: false,
             sequence_header_seen: false,
             gop_header_seen: false,
@@ -815,10 +838,7 @@ impl Video {
             prpa: 0x0023,
         };
         s.sequence_end_seen = s.buffer.contains_start_code_from(0, 0xB7);
-        s.start_code = s.buffer.find_start_code(START_SEQUENCE);
-        if s.start_code != -1 {
-            s.decode_sequence_header();
-        }
+        s.try_seek_initial_header();
         s
     }
 
@@ -844,6 +864,13 @@ impl Video {
         self.buffer.has_ended()
     }
 
+    pub fn set_fallback_sequence(&mut self, width: usize, height: usize, framerate: f64, pixel_aspect_ratio: f64) {
+        self.fallback_width = width;
+        self.fallback_height = height;
+        self.fallback_fps = framerate;
+        self.fallback_par = pixel_aspect_ratio;
+    }
+
     pub fn append(&mut self, data: &[u8]) {
         let old_len = self.buffer.len_bytes();
         self.buffer.append(data);
@@ -851,26 +878,47 @@ impl Video {
             self.sequence_end_seen = true;
         }
         if !self.has_sequence_header {
-            if self.start_code != START_SEQUENCE {
-                self.start_code = self.buffer.find_start_code(START_SEQUENCE);
-            }
-            if self.start_code != -1 {
-                self.decode_sequence_header();
-            }
+            self.try_seek_initial_header();
         }
     }
 
-    pub fn has_header(&mut self) -> bool {
+    fn try_seek_initial_header(&mut self) -> bool {
         if self.has_sequence_header {
             return true;
         }
-        if self.start_code != START_SEQUENCE {
+        let seq_off = self.buffer.start_code_offset(START_SEQUENCE as u8);
+        let gop_off = self.buffer.start_code_offset(START_GOP as u8);
+        let pic_off = self.buffer.start_code_offset(START_PICTURE as u8);
+        if let Some(s) = seq_off {
+            if gop_off.is_none_or(|g| s <= g) && pic_off.is_none_or(|p| s <= p) {
+                if self.start_code != START_SEQUENCE {
+                    self.start_code = self.buffer.find_start_code(START_SEQUENCE);
+                }
+                return self.start_code != -1 && self.decode_sequence_header();
+            }
+        }
+        // Mid-GOP chapter seek fallback: only when sequence geometry was already learned on this disc
+        // and a complete GOP header precedes the first picture ahead of any 0xB3 Sequence Header.
+        if self.fallback_width > 0 && self.fallback_height > 0 {
+            if let (Some(g), Some(p)) = (gop_off, pic_off) {
+                if p > g && seq_off.is_none_or(|s| g < s) {
+                    self.start_code = self.buffer.find_start_code(START_GOP);
+                    self.apply_fallback_sequence_header();
+                    return true;
+                }
+            }
+        }
+        if seq_off.is_some() {
             self.start_code = self.buffer.find_start_code(START_SEQUENCE);
+            if self.start_code != -1 {
+                return self.decode_sequence_header();
+            }
         }
-        if self.start_code == -1 {
-            return false;
-        }
-        self.decode_sequence_header()
+        false
+    }
+
+    pub fn has_header(&mut self) -> bool {
+        self.try_seek_initial_header()
     }
 
     pub fn width(&self) -> usize {
@@ -900,21 +948,31 @@ impl Video {
     /// Decode the next frame in display order. Returns the index of the frame
     /// to display, or `None` if no more frames are available.
     pub fn decode(&mut self) -> Option<usize> {
+        self.decode_with_flush(false)
+    }
+
+    pub fn decode_with_flush(&mut self, flush: bool) -> Option<usize> {
+        if !self.has_sequence_header {
+            self.try_seek_initial_header();
+        }
         if !self.has_header() {
             return None;
         }
         loop {
             while self.start_code != START_PICTURE && self.start_code != -1 {
                 if self.start_code == START_SEQUENCE {
-                    if !self.buffer.has(SEQUENCE_HEADER_MAX_BITS) {
+                    if !self.buffer.has(64) {
                         return None;
                     }
                     if self.sequence_size_changes() && self.has_reference_frame && !self.assume_no_b_frames {
                         // Show the held reference picture before the new size drops it.
                         self.has_reference_frame = false;
+                        self.has_fwd_reference = false;
                         return Some(self.emit(self.bwd));
                     }
-                    self.decode_sequence_header();
+                    if !self.decode_sequence_header() && self.start_code == START_SEQUENCE {
+                        return None;
+                    }
                 } else if self.start_code == START_GOP {
                     if !self.buffer.has(27) {
                         return None;
@@ -937,30 +995,72 @@ impl Video {
                         || self.picture_type == PICTURE_TYPE_PREDICTIVE)
                 {
                     self.has_reference_frame = false;
+                    self.has_fwd_reference = false;
                     return Some(self.bwd);
                 }
                 return None;
             }
 
-            // Need a full picture buffered before decoding it.
+            // Need a full picture buffered before decoding it (unless flushing a single frame).
+            let allow_flush = flush || self.flush_single;
             if self.buffer.has_start_code(START_PICTURE) == -1
+                && self.buffer.has_start_code(START_GOP) == -1
+                && self.buffer.has_start_code(START_SEQUENCE) == -1
                 && self.buffer.has_start_code(START_SEQUENCE_END) == -1
                 && !self.buffer.has_ended()
+                && !allow_flush
+            {
+                return None;
+            }
+            // Wait until at least the first macroblock slice of a flushed I-frame has arrived
+            // before decoding mid-stream, unless the stream has ended cleanly.
+            if allow_flush
+                && self.buffer.has_start_code(START_PICTURE) == -1
+                && self.buffer.has_start_code(START_GOP) == -1
+                && self.buffer.has_start_code(START_SEQUENCE) == -1
+                && self.buffer.has_start_code(START_SEQUENCE_END) == -1
+                && !self.buffer.has_ended()
+                && self.buffer.has_start_code(0x01) == -1
             {
                 return None;
             }
 
-            self.decode_picture();
+            if !self.decode_picture() {
+                continue;
+            }
 
             let frame = if self.assume_no_b_frames {
                 Some(self.bwd)
             } else if self.picture_type == PICTURE_TYPE_B {
-                Some(self.cur)
+                // Leading B-frames in an open GOP reference the previous GOP's forward picture,
+                // which is blank right after a stream reset; emit the clean I-frame on flush
+                // or suppress until a second reference frame populates `fwd`.
+                if !self.has_fwd_reference {
+                    if allow_flush && self.has_reference_frame && !self.emitted_initial_ref {
+                        self.emitted_initial_ref = true;
+                        Some(self.bwd)
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(self.cur)
+                }
             } else if self.has_reference_frame {
-                Some(self.fwd)
+                self.has_fwd_reference = true;
+                if self.emitted_initial_ref {
+                    self.emitted_initial_ref = false;
+                    None
+                } else {
+                    Some(self.fwd)
+                }
             } else {
                 self.has_reference_frame = true;
-                None
+                if allow_flush {
+                    self.emitted_initial_ref = true;
+                    Some(self.bwd)
+                } else {
+                    None
+                }
             };
 
             if let Some(idx) = frame {
@@ -1002,13 +1102,15 @@ impl Video {
     }
 
     fn decode_sequence_header(&mut self) -> bool {
-        if !self.buffer.has(SEQUENCE_HEADER_MAX_BITS) {
+        let saved_bit_index = self.buffer.bit_index;
+        if !self.buffer.has(64) {
             return false;
         }
 
         let width = self.buffer.read(12) as usize;
         let height = self.buffer.read(12) as usize;
         if width == 0 || height == 0 {
+            self.start_code = -1;
             return false;
         }
         self.width = width;
@@ -1035,6 +1137,11 @@ impl Video {
 
         // Custom intra quant matrix?
         if self.buffer.read(1) != 0 {
+            if !self.buffer.has(64 * 8 + 1) {
+                self.buffer.bit_index = saved_bit_index;
+                self.start_code = START_SEQUENCE;
+                return false;
+            }
             for i in 0..64 {
                 let idx = ZIG_ZAG[i];
                 self.intra_quant_matrix[idx] = self.buffer.read(8) as u8;
@@ -1045,6 +1152,11 @@ impl Video {
 
         // Custom non-intra quant matrix?
         if self.buffer.read(1) != 0 {
+            if !self.buffer.has(64 * 8) {
+                self.buffer.bit_index = saved_bit_index;
+                self.start_code = START_SEQUENCE;
+                return false;
+            }
             for i in 0..64 {
                 let idx = ZIG_ZAG[i];
                 self.non_intra_quant_matrix[idx] = self.buffer.read(8) as u8;
@@ -1059,7 +1171,24 @@ impl Video {
         if self.has_sequence_header && self.frames.first().map_or(false, |f| f.width == self.width && f.height == self.height) {
             return true;
         }
+        self.init_sequence_buffers();
+        true
+    }
+
+    fn apply_fallback_sequence_header(&mut self) {
+        self.width = self.fallback_width;
+        self.height = self.fallback_height;
+        self.framerate = if self.fallback_fps > 0.0 { self.fallback_fps } else { 25.0 };
+        self.pixel_aspect_ratio = if self.fallback_par > 0.0 { self.fallback_par } else { 1.0 };
+        self.intra_quant_matrix = INTRA_QUANT_MATRIX;
+        self.non_intra_quant_matrix = NON_INTRA_QUANT_MATRIX;
+        self.sequence_header_seen = true;
+        self.init_sequence_buffers();
+    }
+
+    fn init_sequence_buffers(&mut self) {
         self.has_reference_frame = false;
+        self.has_fwd_reference = false;
         self.mb_width = (self.width + 15) >> 4;
         self.mb_height = (self.height + 15) >> 4;
         self.mb_size = self.mb_width * self.mb_height;
@@ -1074,7 +1203,6 @@ impl Video {
         self.bwd = 2;
 
         self.has_sequence_header = true;
-        true
     }
 
     fn make_frame(&self) -> Frame {
@@ -1103,22 +1231,35 @@ impl Video {
 }
 
 impl Video {
-    fn decode_picture(&mut self) {
+    fn skip_picture_slices(&mut self) {
+        loop {
+            self.start_code = self.buffer.next_start_code();
+            if self.start_code != START_EXTENSION
+                && self.start_code != START_USER_DATA
+                && !is_slice_start_code(self.start_code)
+            {
+                break;
+            }
+        }
+    }
+
+    fn decode_picture(&mut self) -> bool {
         self.buffer.skip(10); // temporal_reference
         self.picture_type = self.buffer.read(3) as i32;
         self.buffer.skip(16); // vbv_delay
 
         // D frames or unknown coding type.
         if self.picture_type <= 0 || self.picture_type > PICTURE_TYPE_B {
-            return;
+            self.skip_picture_slices();
+            return false;
         }
 
         if self.picture_type == PICTURE_TYPE_PREDICTIVE || self.picture_type == PICTURE_TYPE_B {
             self.motion_forward.full_px = self.buffer.read(1) != 0;
             let f_code = self.buffer.read(3) as i32;
             if f_code == 0 {
-
-return;
+                self.skip_picture_slices();
+                return false;
             }
             self.motion_forward.r_size = f_code - 1;
         }
@@ -1127,9 +1268,15 @@ return;
             self.motion_backward.full_px = self.buffer.read(1) != 0;
             let f_code = self.buffer.read(3) as i32;
             if f_code == 0 {
-                return;
+                self.skip_picture_slices();
+                return false;
             }
             self.motion_backward.r_size = f_code - 1;
+        }
+
+        if !self.has_reference_frame && !self.assume_no_b_frames && self.picture_type != PICTURE_TYPE_INTRA {
+            self.skip_picture_slices();
+            return false;
         }
 
         let frame_temp = self.fwd;
@@ -1158,6 +1305,7 @@ return;
             self.bwd = self.cur;
             self.cur = frame_temp;
         }
+        true
     }
 
     fn decode_slice(&mut self, slice: i32) {
@@ -1798,6 +1946,74 @@ mod edge_mc_tests {
         assert!(v.take_sequence_seen());
     }
 
+    fn gop_header() -> [u8; 8] {
+        [0, 0, 1, 0xB8, 0x00, 0x08, 0x00, 0x00]
+    }
+
+    fn picture_and_slice(pic_type: u8) -> Vec<u8> {
+        vec![
+            0, 0, 1, 0x00, 0x00, pic_type << 3, 0xFF, 0xF8, 0x90, 0x00,
+            0, 0, 1, 0x01, 0x08, 0x00, 0x00, 0x00,
+        ]
+    }
+
+    #[test]
+    fn midstream_gop_without_sequence_header_uses_fallback_and_emits_once() {
+        let mut es = Vec::new();
+        es.extend(gop_header());
+        es.extend(picture_and_slice(1)); // I-frame without leading 0xB3
+        let mut v = Video::new_with_fallback(es, 16, 16, 25.0, 1.0);
+        assert_eq!((v.width(), v.height()), (16, 16));
+        assert!(v.decode_with_flush(false).is_none());
+        assert!(v.decode_with_flush(true).is_some());
+        assert!(v.emitted_initial_ref);
+        // Subsequent P-frame must not re-emit the already-flushed initial I-frame.
+        v.append(&picture_and_slice(2));
+        v.append(&[0, 0, 1, 0x00, 0x00, 0x10]); // Starts next picture without reaching EOF.
+        assert!(v.decode_with_flush(false).is_none());
+        assert!(!v.emitted_initial_ref);
+    }
+
+    #[test]
+    fn leading_b_frame_before_second_reference_is_suppressed() {
+        let mut es = sequence_header(16, 16);
+        es.extend(gop_header());
+        es.extend(picture_and_slice(1)); // I-frame (fwd ref still blank)
+        es.extend(picture_and_slice(3)); // Open-GOP leading B-frame
+        es.extend(picture_and_slice(2)); // P-frame
+        es.extend(gop_header()); // Terminates the P-frame
+        let mut v = Video::new(es);
+        // Suppressed B-frame is skipped; P-frame rotates `fwd` and emits the clean I-frame.
+        assert!(v.decode_with_flush(false).is_some());
+        assert!(v.has_fwd_reference);
+    }
+
+    #[test]
+    fn real_sequence_header_not_bypassed_by_fallback_when_picture_present() {
+        let mut es = sequence_header(48, 32);
+        es.extend(gop_header());
+        es.extend(picture_and_slice(1));
+        let v = Video::new_with_fallback(es, 352, 288, 25.0, 1.0);
+        assert_eq!((v.width(), v.height()), (48, 32));
+    }
+
+    #[test]
+    fn orphan_p_and_b_frames_before_first_intra_are_skipped() {
+        let mut es = sequence_header(16, 16);
+        es.extend(picture_and_slice(2)); // Orphan P-frame without reference
+        es.extend(picture_and_slice(3)); // Orphan B-frame without reference
+        es.extend(gop_header());
+        let mut v = Video::new(es);
+        assert!(v.decode_with_flush(false).is_none());
+        assert!(!v.has_reference_frame);
+
+        let mut intra = picture_and_slice(1); // First valid I-frame
+        intra.extend(gop_header());
+        v.append(&intra);
+        assert!(v.decode_with_flush(true).is_some());
+        assert!(v.has_reference_frame);
+    }
+
     #[test]
     fn half_pel_at_bottom_right_edge_repeats_edge_sample() {
         // 2x2 macroblocks of 16x16 luma; vector points to the last block with +1/2 pel both ways.
@@ -1827,6 +2043,8 @@ opencdi::impl_state!(Video {
     start_code, picture_type, motion_forward, motion_backward, has_sequence_header,
     quantizer_scale, slice_begin, macroblock_address, mb_row, mb_col, macroblock_type, macroblock_intra,
     dc_predictor, frames, cur, fwd, bwd, block_data, intra_quant_matrix, non_intra_quant_matrix,
-    has_reference_frame, assume_no_b_frames, sequence_end_seen, sequence_header_seen,
+    has_reference_frame, has_fwd_reference, assume_no_b_frames, emitted_initial_ref, flush_single,
+    fallback_width, fallback_height, fallback_fps, fallback_par,
+    sequence_end_seen, sequence_header_seen,
     gop_header_seen, last_gop_timecode, prpa,
 } skip {});

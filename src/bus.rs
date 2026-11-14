@@ -449,7 +449,8 @@ impl CdiBus {
         let mcd_int = self.mcd212.int_line();
         self.scc_timer.int1_w(mcd_int);
         if line == 0 && self.dvc.is_fitted() {
-            self.dvc.vsync_hz = if self.mcd212.video_mode == crate::mcd212::VideoMode::Pal { 50.0 } else { 60.0 };
+            self.dvc.vsync_hz = crate::audio::frame_rate(self.mcd212.video_mode);
+            self.dvc.audio_buffered_hint = self.cdic.audio.mpeg.len();
             self.dvc.on_vsync();
         }
         self.cdic.audio.push_mpeg(&mut self.dvc.audio_out, self.dvc.audio_sample_rate);
@@ -459,6 +460,8 @@ impl CdiBus {
     #[inline(always)]
     pub fn render_scanline(&mut self, line: usize) {
         self.mcd212.render_line(line);
+        let mcd_int = self.mcd212.int_line();
+        self.scc_timer.int1_w(mcd_int);
     }
 
     pub fn perform_dvc_dma(&mut self) {

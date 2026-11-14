@@ -12,6 +12,29 @@ The goal of the project is to accurately preserve and run the complete software 
 
 ---
 
+## What's New in Version 0.4.0
+
+- **MPEG-1 / DVC Engine Overhaul**:
+  - Completely resolved macroblock and graphic artifacts during VideoCD playback (*Black Rain*) and transparent FMV overlays (*The 7th Guest*).
+  - Robust Fast-Forward / Rewind (FF/REW) and chapter seek handling on MPEG streams without video freezes or NVRAM corruption.
+  - Accurate `VSYNC` synchronization and deterministic skipping of orphan P/B frames prior to the first Intra frame.
+- **MCD-212 Display Controller Accuracy**:
+  - Timed execution of `DCA` display instructions during HBLANK after `VSR` scanout, aligning matte key activation and boundary edges.
+  - Authentic screen stride and geometry handling (720 vs 768 pixels): eliminated corrupted top line in menus and perfectly centered cutscenes in *Flashback*.
+  - Fixed horizontal border offset for external video plane matte keying.
+- **Audio Continuity & Room Transitions**:
+  - Preserved `dclk` across FMV reset commands, fixing background music dropouts and restarts during room transitions in *Lost Eden*.
+  - Eliminated duplicate decoding of Mode 2 ADPCM sound maps on the CDIC channel.
+- **Zero-Latency Slave MCU Mouse Input**:
+  - Immediate IRQ2 assertion on Channel 0 mouse packets: silky smooth, highly responsive cursor movement with zero input lag.
+  - Configurable mouse sensitivity multiplier and input profiles in `opencdi_controls.ini`.
+- **Mono-IV Audio & Multi-Platform Libretro Cores**:
+  - Added CD-DA audio streaming support on Mono-IV (CD-i 490) boards via command E0.
+  - Updated `opencdi_libretro.info` metadata to fully comply with the upstream Libretro-Super schema.
+  - Automated continuous regression suite with savestate roundtrip determinism verification.
+
+---
+
 ## What's New in Version 0.3.0
 
 - **Libretro Core (`crates/opencdi-libretro`)**: OpenCDi can now be built as a native core for **RetroArch** (`opencdi_libretro.dll` / `.so`), featuring zero-lag Runahead and deterministic Rewind support.

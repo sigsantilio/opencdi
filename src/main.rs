@@ -1819,7 +1819,7 @@ impl App {
         } else {
             match self.input_device_mode {
                 InputDeviceMode::Gamepad => {
-                    const PAD_SPEED: f32 = 2.5;
+                    const PAD_SPEED: f32 = 5.0;
                     let mut moved = false;
                     let mut over = (0.0f32, 0.0f32);
                     if dir_x != 0 {

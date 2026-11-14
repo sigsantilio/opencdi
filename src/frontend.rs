@@ -161,7 +161,7 @@ impl KeyBindings {
         let mut bindings = Self {
             profile: InputProfile::Standard,
             input_device: InputDeviceMode::Gamepad,
-            mouse_sensitivity: 0.50,
+            mouse_sensitivity: 1.00,
             up: Key::ArrowUp,
             down: Key::ArrowDown,
             left: Key::ArrowLeft,

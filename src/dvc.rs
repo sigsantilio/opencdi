@@ -594,6 +594,23 @@ pub struct Dvc {
     pub decoder_frame_counter: u32,
     pub fps: f64,
     pub frame_accum: f64,
+    pub last_seq_width: usize,
+    pub last_seq_height: usize,
+    pub last_seq_fps: f64,
+    pub last_seq_par: f64,
+    pub video_bytes_this_vsync: usize,
+    pub video_idle_vsyncs: u32,
+    pub has_pending_frame: bool,
+    pub pending_frame_idx: usize,
+    pub pending_frame_pts: u64,
+    pub video_pts_base: u64,
+    pub video_pts_valid: bool,
+    pub min_video_pts_seen: u64,
+    pub has_min_video_pts: bool,
+    pub audio_pts_base: u64,
+    pub audio_pts_valid: bool,
+    pub audio_real_samples_decoded: u64,
+    pub audio_buffered_hint: usize,
     pub vsync_hz: f64,
     // CPU clock the cycle counts are measured in (set by the bus from the video standard).
     pub cpu_hz: u64,
@@ -686,6 +703,23 @@ impl Dvc {
             decoder_frame_counter: 0,
             fps: 25.0,
             frame_accum: 0.0,
+            last_seq_width: 0,
+            last_seq_height: 0,
+            last_seq_fps: 0.0,
+            last_seq_par: 1.0,
+            video_bytes_this_vsync: 0,
+            video_idle_vsyncs: 0,
+            has_pending_frame: false,
+            pending_frame_idx: 0,
+            pending_frame_pts: 0,
+            video_pts_base: 0,
+            video_pts_valid: false,
+            min_video_pts_seen: 0,
+            has_min_video_pts: false,
+            audio_pts_base: 0,
+            audio_pts_valid: false,
+            audio_real_samples_decoded: 0,
+            audio_buffered_hint: 0,
             vsync_hz: 50.0,
             cpu_hz: 15_000_000,
 
@@ -732,6 +766,10 @@ impl Dvc {
         self.border_color = 0xFF00_0000;
         self.has_valid_frame = false;
         self.ram2_enabled = false;
+        self.last_seq_width = 0;
+        self.last_seq_height = 0;
+        self.last_seq_fps = 0.0;
+        self.last_seq_par = 1.0;
         self.reg_write_count = 0;
         self.reg_read_count = 0;
         self.rom_read_count = 0;
@@ -755,6 +793,15 @@ impl Dvc {
         self.frames_presented_count = 0;
         self.underflow_count = 0;
         self.frame_accum = 0.0;
+        self.video_bytes_this_vsync = 0;
+        self.video_idle_vsyncs = 0;
+        self.has_pending_frame = false;
+        self.pending_frame_idx = 0;
+        self.pending_frame_pts = 0;
+        self.video_pts_base = 0;
+        self.video_pts_valid = false;
+        self.min_video_pts_seen = 0;
+        self.has_min_video_pts = false;
         self.display_timecode = 0;
         self.decoder_timecode = 0;
         self.display_frame_counter = 0;
@@ -805,6 +852,8 @@ impl Dvc {
     fn reset_fma_schedule(&mut self) {
         self.fma_started = false;
         self.fma_tick_accum = 0;
+        self.audio_pts_valid = false;
+        self.audio_real_samples_decoded = 0;
         self.fma_pending = 0;
         self.fma_last_header = 0;
     }
@@ -1340,6 +1389,14 @@ impl Dvc {
                     self.decoder_enabled = true;
                     self.frames_presented_count = 0;
                     self.underflow_count = 0;
+                    self.video_idle_vsyncs = 0;
+                    self.has_pending_frame = false;
+                    self.pending_frame_idx = 0;
+                    self.pending_frame_pts = 0;
+                    self.video_pts_base = 0;
+                    self.video_pts_valid = false;
+                    self.min_video_pts_seen = 0;
+                    self.has_min_video_pts = false;
                     self.display_frame_counter = 0;
                     self.decoder_frame_counter = 0;
                     self.display_timecode = 0;
@@ -1364,35 +1421,17 @@ impl Dvc {
                 if value & 0x0080 != 0 { // STOP
                     // NOTE: Real DVC hardware keeps the last decoded picture in DRAM.
                     // Retaining has_valid_frame prevents black flash during scene transitions.
-                    self.video_armed = false;
-                    self.video_playing = false;
-                    self.decoder_enabled = false;
-                    self.underflow_count = 0;
-                    self.video_decoder = None;
-                    self.frames_presented_count = 0;
-                    self.frames_decoded_count = 0;
-                    self.frame_accum = 0.0;
-                    self.display_frame_counter = 0;
-                    self.decoder_frame_counter = 0;
-                    self.display_timecode = 0;
-                    self.decoder_timecode = 0;
-                    self.set_fmv_word(0x58, 0);
-                    self.set_fmv_word(0x5A, 0);
-                    self.set_fmv_word(0x08, 0);
-                    self.set_fmv_word(0x0A, 0);
-                    self.dvc_stream_fifo.clear();
-                    self.demux.clear();
-                    self.set_fmv_word(0x5C, 0x0000);
+                    self.reset_video_stream();
                 }
                 if value & 0x0100 != 0 { // RESET
                     self.reset_video_stream();
                     // The system reset also resets the stream parser and its system clock reference; audio play and arm stay as they are.
-                    // Dedicated FMA audio streams (DMA/PIO) are independent of FMV video resets and must not be flushed.
+                    // Dedicated FMA audio streams (DMA/PIO) are independent of FMV video resets and must preserve the audio clock.
                     if !self.fma_dma_seen {
                         self.reset_audio_parser();
+                        self.dclk = 0;
+                        self.dclk_accum = 0;
                     }
-                    self.dclk = 0;
-                    self.dclk_accum = 0;
                     self.set_fmv_word(FMV_ISR, 0);
                 }
                 if value & 0x1000 != 0 { // DEC_ON
@@ -1400,13 +1439,7 @@ impl Dvc {
                 }
                 if value & 0x2000 != 0 { // DEC_OFF
                     // NOTE: Real DVC hardware keeps the last decoded picture in DRAM.
-                    self.decoder_enabled = false;
-                    self.video_playing = false;
-                    self.underflow_count = 0;
-                    self.video_decoder = None;
-                    self.frames_presented_count = 0;
-                    self.frames_decoded_count = 0;
-                    self.frame_accum = 0.0;
+                    self.reset_video_stream();
                 }
                 if value & 0x8000 != 0 { // DMA request Video
                     self.dma_requested = true;
@@ -1473,9 +1506,23 @@ impl Dvc {
             }
         }
         if !video_data.is_empty() {
+            self.video_bytes_this_vsync += video_data.len();
+            self.video_idle_vsyncs = 0;
+            if self.frames_decoded_count == 0 {
+                if let Some(pts) = self.demux.last_video_pts.or(self.demux.first_video_pts) {
+                    if !self.has_min_video_pts
+                        || (Self::pts_diff_i64(pts, self.min_video_pts_seen) < 0
+                            && Self::pts_diff_i64(pts, self.min_video_pts_seen) > -90_000)
+                    {
+                        self.min_video_pts_seen = pts;
+                        self.has_min_video_pts = true;
+                    }
+                }
+            }
             if self.video_decoder.is_none() {
                 trace!(">>> [DVC] INITIALIZING VIDEO DECODER WITH FIRST PACKET (len={})", video_data.len());
-                self.video_decoder = Some(Video::new(video_data));
+                let fb = self.fallback_seq_params();
+                self.video_decoder = Some(Video::new_with_fallback(video_data, fb.0, fb.1, fb.2, fb.3));
             } else {
                 self.video_decoder.as_mut().unwrap().append(&video_data);
             }
@@ -1485,6 +1532,12 @@ impl Dvc {
                     let h = dec.height() as u16;
                     let prpa = dec.prpa();
                     if w > 0 && h > 0 {
+                        if dec.framerate() > 0.0 {
+                            self.last_seq_width = dec.width();
+                            self.last_seq_height = dec.height();
+                            self.last_seq_fps = dec.framerate();
+                            self.last_seq_par = dec.pixel_aspect_ratio();
+                        }
                         self.set_fmv_word(0x02, w);
                         self.set_fmv_word(0x04, h);
                         self.set_fmv_word(0x06, prpa);
@@ -1636,7 +1689,8 @@ impl Dvc {
             };
             self.audio_demux(which).interval = Mp2Decoder::interval_units(f.samples as u32, f.rate);
             self.audio_sample_rate = self.mp2.last_sample_rate;
-            if !self.fma_started {
+            let first_silent_frame = !self.fma_started;
+            if first_silent_frame {
                 self.fma_started = true;
                 self.fma_pending |= FMA_IRQ_PLAY;
                 // The first frame decoded after a parser reset plays as silence.
@@ -1653,8 +1707,224 @@ impl Dvc {
                 self.fma_pending |= FMA_IRQ_DEC;
             }
             self.audio_out.extend(self.mp2.pcm.drain(..));
+            if !self.audio_pts_valid {
+                if let Some(fap) = self.audio_demux(which).first_audio_pts {
+                    self.audio_pts_base = fap;
+                    self.audio_pts_valid = true;
+                    self.audio_real_samples_decoded = 0;
+                }
+            }
+            if self.audio_pts_valid && !first_silent_frame {
+                self.audio_real_samples_decoded += f.samples as u64;
+            }
         }
         self.audio_demux(which).audio = audio;
+    }
+
+    fn pts_diff_i64(a: u64, b: u64) -> i64 {
+        let diff = a.wrapping_sub(b) & 0x1_FFFF_FFFF;
+        if diff >= 0x1_0000_0000 {
+            diff as i64 - 0x2_0000_0000
+        } else {
+            diff as i64
+        }
+    }
+
+    fn fallback_seq_params(&self) -> (usize, usize, f64, f64) {
+        if self.last_seq_width > 0 && self.last_seq_height > 0 {
+            (
+                self.last_seq_width,
+                self.last_seq_height,
+                if self.last_seq_fps > 0.0 { self.last_seq_fps } else { 25.0 },
+                if self.last_seq_par > 0.0 { self.last_seq_par } else { 1.0 },
+            )
+        } else {
+            (0, 0, 0.0, 0.0)
+        }
+    }
+
+    fn has_live_audio_clock(&self) -> bool {
+        // Only sync video to an audio clock belonging to the muxed FMV stream (or a standalone
+        // AV stream when FMA BGM DMA is not active), and never while FMA is in underflow.
+        self.audio_pts_valid
+            && self.audio_enabled
+            && !self.audio_stopped
+            && self.audio_real_samples_decoded > 0
+            && (!self.fma_dma_seen || self.demux.first_audio_pts.is_some())
+            && (self.fma_pending & FMA_IRQ_UNF) == 0
+    }
+
+    fn current_master_pts_90k(&self) -> Option<u64> {
+        if self.has_live_audio_clock() {
+            // Audio sample timeline: subtract queued stereo sample-frames in DVC + CDIC MPEG buffer.
+            let buffered = self.audio_out.len().saturating_add(self.audio_buffered_hint);
+            let heard_samples = self.audio_real_samples_decoded.saturating_sub(buffered as u64);
+            let ticks = (heard_samples.saturating_mul(90_000)) / 44_100;
+            return Some(self.audio_pts_base.wrapping_add(ticks) & 0x1_FFFF_FFFF);
+        }
+        self.demux.last_scr
+    }
+
+    fn is_pending_frame_due(&self) -> bool {
+        if !self.has_pending_frame || !self.video_pts_valid {
+            return true;
+        }
+        let fps = if self.fps > 0.0 { self.fps } else { 25.0 };
+        if let Some(master_pts) = self.current_master_pts_90k() {
+            let diff = Self::pts_diff_i64(self.pending_frame_pts, master_pts);
+            let frame_ticks = (90_000.0 / fps).round() as i64;
+            let lead_threshold = if self.has_live_audio_clock() {
+                (frame_ticks * 3) / 4
+            } else {
+                // Without live audio, SCR trails PES video PTS by ~250-415ms (VBV mux lead);
+                // only hold genuinely large pre-roll gaps (> 500ms) so FF/REW scan bursts never stall.
+                45_000
+            };
+            if diff.abs() < 5 * 90_000 && diff > lead_threshold {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn cache_sequence_params(&mut self) {
+        if let Some(ref decoder) = self.video_decoder {
+            if decoder.has_sequence_header && decoder.width() > 0 && decoder.height() > 0 {
+                self.last_seq_width = decoder.width();
+                self.last_seq_height = decoder.height();
+                self.last_seq_fps = decoder.framerate();
+                self.last_seq_par = decoder.pixel_aspect_ratio();
+                if self.last_seq_fps > 0.0 {
+                    self.fps = self.last_seq_fps;
+                }
+            }
+        }
+    }
+
+    fn present_decoded_frame(&mut self, frame_idx: usize) -> bool {
+        let (decoded_w, decoded_h, decoded_prpa, gop_seen, seq_seen, gop_tc) = {
+            let Some(ref mut decoder) = self.video_decoder else {
+                return false;
+            };
+            self.frame_accum = (self.frame_accum - 1.0).max(0.0).min(1.0);
+            self.frames_decoded_count += 1;
+            self.frames_presented_count += 1;
+            let gop_seen = decoder.take_gop_seen();
+            let seq_seen = decoder.take_sequence_seen();
+            let gop_tc = decoder.take_gop_timecode();
+            if self.frames_decoded_count % 30 == 1 {
+                trace!(">>> [DVC] DECODED MPEG FRAME #{} (idx={})", self.frames_decoded_count, frame_idx);
+            }
+            let decoded_w = decoder.width();
+            let decoded_h = decoder.height();
+            let decoded_prpa = decoder.prpa();
+            let target_w = (decoded_w as usize).min(FB_MAX_W).max(1);
+            let target_h = (decoded_h as usize).min(FB_MAX_H).max(1);
+            decoder.frame(frame_idx).write_rgb_scaled(&mut *self.framebuffer, target_w, target_h);
+            self.video_width = target_w;
+            self.video_height = target_h;
+            self.has_valid_frame = true;
+            (decoded_w, decoded_h, decoded_prpa, gop_seen, seq_seen, gop_tc)
+        };
+
+        self.underflow_count = 0;
+        // Update frame geometry & timing registers
+        self.set_fmv_word(0x02, decoded_w as u16);
+        self.set_fmv_word(0x04, decoded_h as u16);
+        self.set_fmv_word(0x52, decoded_w as u16);
+        self.set_fmv_word(0x54, decoded_h as u16);
+        self.set_fmv_word(0x06, decoded_prpa); // PRPA (Decoder)
+        self.set_fmv_word(0x56, 1800); // Frame rate ratio
+
+        // Synchronize with embedded MPEG-1 GOP timecode if present, otherwise advance by 1 frame
+        if let Some(tc) = gop_tc {
+            let fps = if self.fps > 0.0 { self.fps.round() as u32 } else { 25 };
+            let pictures = tc & 0x3F;
+            let seconds = (tc >> 6) & 0x3F;
+            let minutes = (tc >> 16) & 0x3F;
+            let hours = (tc >> 22) & 0x1F;
+            let frame_count = ((hours * 3600 + minutes * 60 + seconds) * fps) + pictures;
+            self.display_frame_counter = frame_count;
+            self.decoder_frame_counter = frame_count;
+            self.display_timecode = tc;
+            self.decoder_timecode = tc;
+            let sec_pic = (tc & 0xFFFF) as u16;
+            let hr_min = (tc >> 16) as u16;
+            self.set_fmv_word(0x58, sec_pic);
+            self.set_fmv_word(0x5A, hr_min);
+            self.set_fmv_word(0x08, sec_pic);
+            self.set_fmv_word(0x0A, hr_min);
+        } else {
+            self.advance_display_timecode();
+            self.advance_decoder_timecode();
+        }
+
+        // Display status: active picture
+        self.set_fmv_word(0x5C, 0x0001);
+
+        // Set FMV ISR bits
+        self.or_fmv_word(FMV_ISR, FMV_IRQ_PIC);
+        if gop_seen || self.frames_presented_count == 1 {
+            self.or_fmv_word(FMV_ISR, FMV_IRQ_GOP);
+        }
+        if seq_seen || self.frames_presented_count == 1 {
+            self.or_fmv_word(FMV_ISR, FMV_IRQ_SEQ);
+        }
+        true
+    }
+
+    fn try_decode_synced_frame(&mut self) -> Option<usize> {
+        let fb = self.fallback_seq_params();
+        let should_flush = !self.video_playing
+            && !self.video_armed
+            && self.decoder_enabled
+            && self.video_idle_vsyncs >= 3;
+        if !self.has_pending_frame {
+            let decoded_idx = {
+                let decoder = self.video_decoder.as_mut()?;
+                decoder.set_fallback_sequence(fb.0, fb.1, fb.2, fb.3);
+                decoder.decode_with_flush(should_flush)?
+            };
+            self.cache_sequence_params();
+            let fps = if self.fps > 0.0 { self.fps } else { 25.0 };
+            if !self.video_pts_valid {
+                if let Some(base) = if self.has_min_video_pts {
+                    Some(self.min_video_pts_seen)
+                } else {
+                    self.demux.first_video_pts
+                } {
+                    self.video_pts_base = base;
+                    self.video_pts_valid = true;
+                }
+            }
+            let frame_pts = if self.video_pts_valid {
+                let ticks = ((self.frames_presented_count as f64) * 90_000.0 / fps).round() as u64;
+                self.video_pts_base.wrapping_add(ticks) & 0x1_FFFF_FFFF
+            } else {
+                0
+            };
+            self.has_pending_frame = true;
+            self.pending_frame_idx = decoded_idx;
+            self.pending_frame_pts = frame_pts;
+        }
+
+        let fps = if self.fps > 0.0 { self.fps } else { 25.0 };
+        if !should_flush && !self.is_pending_frame_due() {
+            self.frame_accum = 1.0;
+            return None;
+        }
+        if !should_flush && self.video_pts_valid && self.has_live_audio_clock() {
+            if let Some(master_pts) = self.current_master_pts_90k() {
+                let diff = Self::pts_diff_i64(self.pending_frame_pts, master_pts);
+                let frame_ticks = (90_000.0 / fps).round() as i64;
+                if diff.abs() < 5 * 90_000 && diff < -(frame_ticks * 3) / 2 {
+                    self.frame_accum = (self.frame_accum + 1.0).min(2.0);
+                }
+            }
+        }
+
+        self.has_pending_frame = false;
+        Some(self.pending_frame_idx)
     }
 
     pub fn on_vsync(&mut self) {
@@ -1672,92 +1942,40 @@ impl Dvc {
         }
 
         // Fractional frame presentation
+        if self.video_bytes_this_vsync == 0 && self.dvc_stream_fifo.is_empty() {
+            self.video_idle_vsyncs = self.video_idle_vsyncs.saturating_add(1);
+        } else {
+            self.video_idle_vsyncs = 0;
+        }
+        self.video_bytes_this_vsync = 0;
+
         let fps = if self.fps > 0.0 { self.fps } else { 25.0 };
         let vsync_hz = if self.vsync_hz > 0.0 { self.vsync_hz } else { 50.0 };
         if self.video_playing {
             self.frame_accum += fps / vsync_hz;
+        } else if self.decoder_enabled
+            && !self.video_armed
+            && self.video_idle_vsyncs >= 3
+            && self.frames_decoded_count == 0
+            && self.video_decoder.is_some()
+        {
+            self.frame_accum = 1.0;
         } else {
             self.frame_accum = 0.0;
         }
 
-        if self.frame_accum >= 1.0 {
-            let mut decoded_w = 0;
-            let mut decoded_h = 0;
-            let mut decoded_prpa = 0x0023;
+        if self.has_pending_frame && !self.is_pending_frame_due() {
+            self.frame_accum = 1.0;
+        }
+        if self.frame_accum >= 1.0 && (!self.has_pending_frame || self.is_pending_frame_due()) {
             let mut got_frame = false;
-            let mut gop_seen = false;
-            let mut seq_seen = false;
-            let mut gop_tc = None;
-            if let Some(ref mut decoder) = self.video_decoder {
-                if let Some(frame_idx) = decoder.decode() {
-                    self.frame_accum = (self.frame_accum - 1.0).max(0.0).min(1.0);
-                    self.frames_decoded_count += 1;
-                    self.frames_presented_count += 1;
-                    gop_seen = decoder.take_gop_seen();
-                    seq_seen = decoder.take_sequence_seen();
-                    gop_tc = decoder.take_gop_timecode();
-                    if self.frames_decoded_count % 30 == 1 {
-                        trace!(">>> [DVC] DECODED MPEG FRAME #{} (idx={})", self.frames_decoded_count, frame_idx);
-                    }
-                    decoded_w = decoder.width();
-                    decoded_h = decoder.height();
-                    decoded_prpa = decoder.prpa();
-                    let target_w = (decoded_w as usize).min(FB_MAX_W).max(1);
-                    let target_h = (decoded_h as usize).min(FB_MAX_H).max(1);
-                    decoder.frame(frame_idx).write_rgb_scaled(&mut *self.framebuffer, target_w, target_h);
-                    self.video_width = target_w;
-                    self.video_height = target_h;
-                    self.has_valid_frame = true;
-                    got_frame = true;
-                } else {
-                    self.frame_accum = self.frame_accum.min(1.5);
-                }
+            if let Some(frame_idx) = self.try_decode_synced_frame() {
+                got_frame = self.present_decoded_frame(frame_idx);
+            } else if self.video_decoder.is_some() {
+                self.frame_accum = self.frame_accum.min(1.5);
             }
 
             if got_frame {
-                self.underflow_count = 0;
-                // Update frame geometry & timing registers
-                self.set_fmv_word(0x02, decoded_w as u16);
-                self.set_fmv_word(0x04, decoded_h as u16);
-                self.set_fmv_word(0x52, decoded_w as u16);
-                self.set_fmv_word(0x54, decoded_h as u16);
-                self.set_fmv_word(0x06, decoded_prpa);  // PRPA (Decoder)
-                self.set_fmv_word(0x56, 1800);  // Frame rate ratio
-
-                // Synchronize with embedded MPEG-1 GOP timecode if present, otherwise advance by 1 frame
-                if let Some(tc) = gop_tc {
-                    let fps = if self.fps > 0.0 { self.fps.round() as u32 } else { 25 };
-                    let pictures = tc & 0x3F;
-                    let seconds = (tc >> 6) & 0x3F;
-                    let minutes = (tc >> 16) & 0x3F;
-                    let hours = (tc >> 22) & 0x1F;
-                    let frame_count = ((hours * 3600 + minutes * 60 + seconds) * fps) + pictures;
-                    self.display_frame_counter = frame_count;
-                    self.decoder_frame_counter = frame_count;
-                    self.display_timecode = tc;
-                    self.decoder_timecode = tc;
-                    let sec_pic = (tc & 0xFFFF) as u16;
-                    let hr_min = (tc >> 16) as u16;
-                    self.set_fmv_word(0x58, sec_pic);
-                    self.set_fmv_word(0x5A, hr_min);
-                    self.set_fmv_word(0x08, sec_pic);
-                    self.set_fmv_word(0x0A, hr_min);
-                } else {
-                    self.advance_display_timecode();
-                    self.advance_decoder_timecode();
-                }
-
-                // Display status: active picture
-                self.set_fmv_word(0x5C, 0x0001);
-
-                // Set FMV ISR bits
-                self.or_fmv_word(FMV_ISR, FMV_IRQ_PIC);
-                if gop_seen || self.frames_presented_count == 1 {
-                    self.or_fmv_word(FMV_ISR, FMV_IRQ_GOP);
-                }
-                if seq_seen || self.frames_presented_count == 1 {
-                    self.or_fmv_word(FMV_ISR, FMV_IRQ_SEQ);
-                }
             } else if self.frames_decoded_count > 0 && (self.video_playing || self.video_armed) {
                 let sequence_ended = self
                     .video_decoder
@@ -1839,7 +2057,7 @@ impl Dvc {
             out.fill(crate::mcd212::fixed_color_out(0xFF00_0000));
             return;
         }
-        out.fill(self.border_color);
+        out.fill(crate::mcd212::fixed_color_out(0xFF00_0000));
         let [pos_y, pos_x, raw_win_h, raw_win_w, off_y, off_x] = self.window.map(usize::from);
         let (pic_w, pic_h) = (self.video_width, self.video_height);
         // The window is clipped to the decoded picture (mv_window adapts its size the same way).
@@ -1853,11 +2071,11 @@ impl Dvc {
         // fallback to standard centered full-screen placement.
         let mut pos_x = pos_x;
         let mut pos_y = pos_y;
-        if raw_win_w >= 0x7FFF || pos_x + win_w > 384 {
+        if raw_win_w >= 0x7FFF || pos_x >= 384 {
             pos_x = (384usize.saturating_sub(pic_w)) / 2;
         }
         let total_active = if self.vsync_hz < 55.0 { 280 } else { 240 };
-        if raw_win_h >= 0x7FFF || pos_y + win_h > total_active {
+        if raw_win_h >= 0x7FFF || pos_y >= total_active {
             pos_y = (total_active.saturating_sub(pic_h)) / 2;
         }
 
@@ -1888,6 +2106,10 @@ opencdi::impl_state!(Dvc {
     total_cycles, dclk, dclk_accum, timer_accum, timer_counter,
     video_playing, video_armed, decoder_enabled, audio_armed, audio_enabled, vcd_pixel_clock_13_5,
     display_timecode, decoder_timecode, display_frame_counter, decoder_frame_counter, fps, frame_accum, vsync_hz,
+    last_seq_width, last_seq_height, last_seq_fps, last_seq_par,
+    video_bytes_this_vsync, video_idle_vsyncs, has_pending_frame, pending_frame_idx, pending_frame_pts,
+    video_pts_base, video_pts_valid, min_video_pts_seen, has_min_video_pts,
+    audio_pts_base, audio_pts_valid, audio_real_samples_decoded, audio_buffered_hint,
     dvc_stream_fifo, fma_stream_fifo, transfer_for_fma, fma_dma_seen, dma_requested, framebuffer, window, border_color,
     demux, fma_demux, mp2, audio_sample_rate, audio_out,
     video_decoder, video_width, video_height, frames_decoded_count, frames_presented_count, vsync_counter,
@@ -2308,7 +2530,7 @@ mod timing_tests {
         assert!(!d.fma_stream_fifo.is_empty());
         assert_eq!(d.audio_out.len(), 1);
         assert!(d.fma_started && !d.audio_stopped && d.audio_enabled);
-        assert_eq!(d.dclk, 0);
+        assert_eq!(d.dclk, 1234);
     }
 }
 
@@ -2388,5 +2610,51 @@ mod impeg_tests {
         d.write_word(0xE0420C, 0x0A3F);
         let g = d.audio_gains().unwrap();
         assert!((g[0] - 0.1).abs() < 1e-4 && g[1] == 0.0 && g[2] == 1.0 && g[3] == 0.0);
+    }
+}
+
+#[cfg(test)]
+mod trick_and_sync_tests {
+    use super::*;
+
+    #[test]
+    fn live_audio_clock_tracks_decoded_samples_minus_buffered_hint() {
+        let mut d = Dvc::new();
+        assert!(!d.has_live_audio_clock());
+        assert_eq!(d.current_master_pts_90k(), None);
+        d.audio_pts_valid = true;
+        d.audio_enabled = true;
+        d.audio_stopped = false;
+        d.audio_pts_base = 90_000;
+        d.audio_real_samples_decoded = 44_100; // +1s -> 180_000 in 90kHz
+        assert!(d.has_live_audio_clock());
+        assert_eq!(d.current_master_pts_90k(), Some(180_000));
+        // Subtract queued CDIC audio sample-frames (4_410 frames = 100ms = 9_000 ticks).
+        d.audio_buffered_hint = 4_410;
+        assert_eq!(d.current_master_pts_90k(), Some(171_000));
+    }
+
+    #[test]
+    fn paused_idle_flush_waits_for_three_idle_vsyncs_before_flushing_single_frame() {
+        let mut d = Dvc::new();
+        d.decoder_enabled = true;
+        d.video_playing = false;
+        let mut es = vec![0, 0, 1, 0xB3, 0x01, 0x00, 0x10, 0x13, 0xFF, 0xFF, 0xE0, 0x00];
+        es.extend(std::iter::repeat(0).take(32));
+        es.extend([0, 0, 1, 0x00, 0x00, 0x08, 0xFF, 0xF8, 0x90, 0x00]);
+        es.extend([0, 0, 1, 0x01, 0x08, 0x00, 0x00, 0x00]);
+        d.video_decoder = Some(Video::new(es));
+        d.cache_sequence_params();
+
+        // First two idle vsyncs must not flush a potentially incomplete buffered frame.
+        d.on_vsync();
+        d.on_vsync();
+        assert_eq!(d.frames_decoded_count, 0);
+        assert_eq!(d.frames_presented_count, 0);
+
+        // Third idle vsync flushes and displays the buffered still/seek frame even while paused.
+        d.on_vsync();
+        assert_eq!(d.frames_decoded_count, 1);
+        assert_eq!(d.frames_presented_count, 1);
     }
 }

@@ -203,6 +203,10 @@ impl Machine {
             cycle_debt = (line_cycles - cyc_per_line as i32).clamp(0, 100);
 
             bus.render_scanline(line);
+            if bus.mcd212.vblank_irq {
+                bus.scc_timer.raise_int1();
+                bus.mcd212.vblank_irq = false;
+            }
 
             bus.tick_board(cyc_per_line);
             bus.tick_audio(cyc_per_line);

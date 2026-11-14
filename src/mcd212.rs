@@ -738,15 +738,8 @@ impl Mcd212 {
 
             frame_completed = true;
         } else if line >= vblank_lines && line < vblank_lines + active_lines {
-            // Active display lines
+            // Active display lines (DCA runs during HBLANK after VSR scanout in render_scanline)
             self.csrr[0] |= CSR1R_DA;
-
-            if (self.dcr[1] & DCR_DCA_BIT) != 0 {
-                self.process_dca::<1>();
-            }
-            if (self.dcr[0] & DCR_DCA_BIT) != 0 {
-                self.process_dca::<0>();
-            }
         } else {
             // VBLANK lines
             self.csrr[0] &= !CSR1R_DA;
@@ -979,6 +972,7 @@ impl Mcd212 {
         let icm = self.get_icm::<PATH>();
         let tp_ctrl = self.get_transparency_control::<PATH>();
         let width = self.get_screen_width();
+        let border_width = self.get_border_width();
 
         let mut vsr = self.get_vsr::<PATH>();
         let _other_path = if PATH == 0 { 1 } else { 0 };
@@ -1055,7 +1049,7 @@ impl Mcd212 {
 
             if use_matte_flag && !tp_always {
                 for i in 0..width {
-                    transparent[i] = self.matte_flag[matte_flag_index][i] == tp_check_parity && (!ext_keys || self.external_video_present[i]);
+                    transparent[i] = self.matte_flag[matte_flag_index][i] == tp_check_parity && (!ext_keys || self.external_video_present[(border_width + i).min(767)]);
                 }
             } else {
                 transparent.fill(tp_always);
@@ -1112,9 +1106,9 @@ impl Mcd212 {
                         pixels[rl_index + 1] = color1;
                     }
                     if !fixed_tp {
-                        transparent[rl_index] = rgb_tp_bit || (use_color_key && color_match0) || (use_matte_flag && (self.matte_flag[matte_flag_index][rl_index] == tp_check_parity) && (!ext_keys || self.external_video_present[rl_index]));
+                        transparent[rl_index] = rgb_tp_bit || (use_color_key && color_match0) || (use_matte_flag && (self.matte_flag[matte_flag_index][rl_index] == tp_check_parity) && (!ext_keys || self.external_video_present[(border_width + rl_index).min(767)]));
                         if rl_index + 1 < width {
-                            transparent[rl_index + 1] = rgb_tp_bit || (use_color_key && color_match1) || (use_matte_flag && (self.matte_flag[matte_flag_index][rl_index + 1] == tp_check_parity) && (!ext_keys || self.external_video_present[rl_index + 1]));
+                            transparent[rl_index + 1] = rgb_tp_bit || (use_color_key && color_match1) || (use_matte_flag && (self.matte_flag[matte_flag_index][rl_index + 1] == tp_check_parity) && (!ext_keys || self.external_video_present[(border_width + rl_index + 1).min(767)]));
                         }
                     }
                     rl_index += 2;
@@ -1273,32 +1267,27 @@ impl Mcd212 {
     }
 
     pub fn render_scanline(&mut self, active_line: usize) {
-        let is_pal = self.video_mode == VideoMode::Pal && (self.dcr[0] & DCR_FD_BIT) == 0;
-        let mut draw_line = true;
-        if is_pal && (self.csrw[0] & CSR1W_ST_BIT) != 0 {
-            // In PAL with Standard Screen enabled, top 20 lines and bottom 20 lines are blank borders
-            if active_line < 20 || active_line >= (280 - 20) {
-                draw_line = false;
-            }
-        }
-
         self.csrr[0] |= CSR1R_DA;
 
         let mut mixed_line = [0u32; 768];
-        if draw_line {
-            let mut plane_a = [0u32; 768];
-            let mut plane_b = [0u32; 768];
-            let mut transparent_a = [false; 768];
-            let mut transparent_b = [false; 768];
+        let mut plane_a = [0u32; 768];
+        let mut plane_b = [0u32; 768];
+        let mut transparent_a = [false; 768];
+        let mut transparent_b = [false; 768];
 
-            self.process_vsr::<0>(&mut plane_a, &mut transparent_a);
-            self.process_vsr::<1>(&mut plane_b, &mut transparent_b);
-            self.mix_lines(&plane_a, &transparent_a, &plane_b, &transparent_b, &mut mixed_line);
-            self.draw_cursor(self.scanline, &mut mixed_line);
-        } else {
-            mixed_line.fill(0xFF00_0000);
+        self.process_vsr::<0>(&mut plane_a, &mut transparent_a);
+        self.process_vsr::<1>(&mut plane_b, &mut transparent_b);
+        self.mix_lines(&plane_a, &transparent_a, &plane_b, &transparent_b, &mut mixed_line);
+        self.draw_cursor(self.scanline, &mut mixed_line);
+
+        // Execute DCA during horizontal blanking at the end of the active scanline so register
+        // and VSR updates apply starting on the next scanline.
+        if (self.dcr[1] & DCR_DCA_BIT) != 0 {
+            self.process_dca::<1>();
         }
-
+        if (self.dcr[0] & DCR_DCA_BIT) != 0 {
+            self.process_dca::<0>();
+        }
 
         let active_lines = self.effective_active_scanlines();
         let is_interlaced = (self.dcr[0] & DCR_SM_BIT) != 0;
@@ -1418,6 +1407,48 @@ mod tests {
         m.tick_scanline(0);
         assert_eq!(m.get_dcp::<0>(), 0x005678);
         assert_eq!(m.get_dcp::<1>(), 0x00EF00);
+    }
+
+    #[test]
+    fn dca_executes_after_vsr_scanout_for_next_scanline() {
+        let mut m = Mcd212::new();
+        m.video_mode = VideoMode::Pal;
+        m.dcr[0] = DCR_DE_BIT | DCR_ICA_BIT | DCR_DCA_BIT; // CF=0 -> 720px active + 24px borders
+
+        let ica = [
+            0xC000_0001u32, // Plane A CLUT8
+            0xC100_0008,    // Plane A always opaque
+            0xC300_0000,    // CLUT bank 0
+            0x8100_FC00,    // CLUT[1] = green
+            0x82FC_0000,    // CLUT[2] = red
+            0xDB00_003F,    // Weight A = max
+            0x2000_1000,    // DCP = 0x1000
+            0x5000_2000,    // VSR = 0x2000 and stop
+        ];
+        for (i, &w) in ica.iter().enumerate() {
+            let off = 0x400 + i * 4;
+            m.plane_a[off..off + 4].copy_from_slice(&w.to_be_bytes());
+        }
+        // Line 32 HBLANK DCA at 0x1000 reloads VSR to 0x3000 for line 33.
+        m.plane_a[0x1000..0x1004].copy_from_slice(&0x4000_3000u32.to_be_bytes());
+        m.plane_a[0x1004..0x1008].copy_from_slice(&0x0000_0000u32.to_be_bytes());
+        m.plane_a[0x2000..0x2168].fill(1);
+        m.plane_a[0x3000..0x3168].fill(2);
+
+        m.tick_scanline(0);
+        assert_eq!(m.get_vsr::<0>(), 0x2000);
+
+        m.tick_scanline(32);
+        m.render_line(32);
+        let p0 = m.framebuffer[24];
+        assert!(((p0 >> 8) & 0xFF) > 200 && ((p0 >> 16) & 0xFF) < 30, "line 32 must scan out 0x2000 (green), got {p0:08X}");
+        assert_eq!(m.framebuffer[0] & 0x00FF_FFFF, 0, "left 24px border must be black");
+        assert_eq!(m.get_vsr::<0>(), 0x3000, "DCA must reload VSR during line 32 HBLANK");
+
+        m.tick_scanline(33);
+        m.render_line(33);
+        let p1 = m.framebuffer[2 * SCREEN_WIDTH + 24];
+        assert!(((p1 >> 16) & 0xFF) > 200 && ((p1 >> 8) & 0xFF) < 30, "line 33 must scan out 0x3000 (red), got {p1:08X}");
     }
 }
 

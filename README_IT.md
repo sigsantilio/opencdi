@@ -9,6 +9,29 @@ L'obiettivo del progetto è preservare e rendere fruibile l'intera libreria soft
 
 ---
 
+## Novità Versione 0.4.0
+
+- **Perfezionamento Engine MPEG-1 / DVC**:
+  - Risolti completamente gli artefatti grafici e macroblock sui VideoCD (*Black Rain*) e sui filmati con trasparenze/chroma-key (*The 7th Guest*).
+  - Gestione robusta dell'avanzamento e riavvolgimento rapido (FF/REW) e salto capitolo su flussi MPEG senza corruzione del video né blocchi di sistema.
+  - Sincronizzazione precisa `VSYNC` e scarto deterministico dei frame P/B orfani prima dell'Intra frame.
+- **Accuratezza Video Controller Philips MCD-212**:
+  - Esecuzione temporizzata delle istruzioni `DCA` in HBLANK dopo la scansione `VSR`, correggendo il timing di attivazione/chiusura dei matte.
+  - Risoluzione geometrica e stride autentici (720 vs 768 pixel) con allineamento perfetto dei bordi: eliminata la linea corrotta nei menu e centrate perfettamente le cutscene di *Flashback*.
+  - Corretto l'offset orizzontale del piano video esterno in modalità matte keying.
+- **Continuità Audio & Transizioni Ambienti**:
+  - Preservazione del clock `dclk` attraverso i comandi di reset FMV, eliminando le interruzioni e il riavvio della musica durante i cambi di stanza in *Lost Eden*.
+  - Prevenzione del doppio decoding di mappe audio ADPCM Mode 2 sul canale CDIC.
+- **Input Slave MCU a Latenza Zero**:
+  - Asserzione immediata dell'interrupt IRQ2 sui pacchetti mouse del canale CH0: puntatore reattivo e fluido senza scatti né perdita di campioni.
+  - Sensibilità configurabile e profili comandi persistenti in `opencdi_controls.ini`.
+- **Audio Mono-IV & Libretro Multi-Piattaforma**:
+  - Supporto riproduzione CD-DA su schede Mono-IV (CD-i 490) con comando disco E0.
+  - File metadati `opencdi_libretro.info` pienamente allineato alle specifiche Libretro-Super.
+  - Suite di regressione automatica con verifica deterministica dei savestate (`--roundtrip`).
+
+---
+
 ## Novità Versione 0.3.0
 
 - **Libretro Core (`crates/opencdi-libretro`)**: OpenCDi è ora disponibile come core per **RetroArch** (`opencdi_libretro.dll`) e frontend compatibili, con supporto nativo a Runahead a zero latenza e Rewind deterministico.

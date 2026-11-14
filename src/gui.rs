@@ -1055,7 +1055,7 @@ pub fn show_disc_error(owner: *mut std::ffi::c_void, text: &str) {
 pub fn show_about_dialog(owner: *mut std::ffi::c_void) {
     let text = to_wide(
         "OpenCDi - Philips CD-i Emulator\n\
-        Version: 0.3.0 (High Performance Edition)\n\
+        Version: 0.4.0 (High Performance Edition)\n\
         GitHub: https://github.com/sigsantilio/opencdi\n\n\
         Project Lead & Maintainer:\n\
         • Gianluca \"sigsantilio\"\n\n\

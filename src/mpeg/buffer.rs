@@ -136,6 +136,19 @@ impl Buffer {
         current
     }
 
+    /// Byte offset of the first `00 00 01 <code>` at or after the current byte-aligned read position.
+    pub fn start_code_offset(&self, code: u8) -> Option<usize> {
+        let b = &self.bytes;
+        let mut i = (self.bit_index + 7) >> 3;
+        while i + 4 <= b.len() {
+            if b[i] == 0x00 && b[i + 1] == 0x00 && b[i + 2] == 0x01 && b[i + 3] == code {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
     /// Current read position in bytes (rounded down).
     pub fn tell(&self) -> usize {
         self.bit_index >> 3
