@@ -594,8 +594,8 @@ impl CdiBus {
             } else {
                 let b0 = self.read_byte(mem_addr as u32);
                 let b1 = self.read_byte((mem_addr + 1) as u32);
-                self.cdic.ram[dev_addr] = b0;
-                self.cdic.ram[(dev_addr + 1) % CDIC_RAM_SIZE] = b1;
+                self.cdic.write_ram_byte(dev_addr, b0);
+                self.cdic.write_ram_byte((dev_addr + 1) % CDIC_RAM_SIZE, b1);
             }
 
             device_index = (device_index + 2) % CDIC_RAM_SIZE;
@@ -996,7 +996,7 @@ impl CdiBus {
         match addr {
 
             // CDIC RAM
-            0x300000..=0x303BFF => self.cdic.ram[(addr - 0x300000) as usize] = value,
+            0x300000..=0x303BFF => self.cdic.write_ram_byte((addr - 0x300000) as usize, value),
 
             // CDIC Registers
             0x303C00..=0x303FFF => {
@@ -1135,8 +1135,7 @@ impl CdiBus {
             }
             0x300000..=0x303BFE => {
                 let idx = (addr - 0x300000) as usize;
-                self.cdic.ram[idx] = (value >> 8) as u8;
-                self.cdic.ram[idx + 1] = value as u8;
+                self.cdic.write_ram_word(idx, value);
                 return;
             }
             0x303C00..=0x303FFF => {

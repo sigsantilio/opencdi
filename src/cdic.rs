@@ -99,6 +99,8 @@ pub struct Cdic {
     pub buf_elapsed: u32,
     pub map_finished: bool,
     pub map_sector_cycles: u32,
+    // Set when Mode 2 real-time disc audio is routed to 0x2800/0x3200 (already decoded into `audio.main`), cleared on host writes to map RAM.
+    pub disc_audio_in_map_ram: bool,
     // Audio channel the decoder took over with the last command 0x2E.
     pub dsp_achan: u16,
     pub cdda_playing: bool,
@@ -144,6 +146,7 @@ impl Cdic {
             buf_elapsed: 0,
             map_finished: false,
             map_sector_cycles: crate::mcd212::VideoMode::Pal.cycles_per_sector(),
+            disc_audio_in_map_ram: false,
             dsp_achan: 0,
             cdda_playing: false,
 
@@ -186,12 +189,29 @@ impl Cdic {
         self.buf_group = 0;
         self.buf_elapsed = 0;
         self.map_finished = false;
+        self.disc_audio_in_map_ram = false;
         self.dsp_achan = 0;
         self.cdda_playing = false;
 
         self.cycle_accumulator = 0;
         self.irq_pending = false;
         self.dma_triggered = false;
+    }
+
+    // Host/DMA writes into CDIC RAM 0x2800..0x3C00 supply a sound map rather than mirroring disc Mode 2 sectors.
+    pub fn write_ram_byte(&mut self, addr: usize, value: u8) {
+        self.ram[addr] = value;
+        if addr >= 0x2800 {
+            self.disc_audio_in_map_ram = false;
+        }
+    }
+
+    pub fn write_ram_word(&mut self, addr: usize, value: u16) {
+        self.ram[addr] = (value >> 8) as u8;
+        self.ram[addr + 1] = value as u8;
+        if addr + 1 >= 0x2800 {
+            self.disc_audio_in_map_ram = false;
+        }
     }
 
     pub fn read_reg(&mut self, offset: u32) -> u16 {
@@ -281,8 +301,11 @@ impl Cdic {
                     self.update_interrupt();
                     return;
                 }
-                // Bit 11 alone starts the map only with no audio channel; an empty map on an idle decoder ends at once with the finished flag.
-                let bit11_start = (val & 0x0800) != 0 && (self.audio_channel == 0 || self.ram[0x2800 + 11] != 0xFF) && (val & 0x2000) == 0;
+                // Bit 11 alone starts a host sound map (unless Mode 2 disc audio owns 0x2800/0x3200); an empty map on an idle decoder ends at once with the finished flag.
+                let bit11_start = (val & 0x0800) != 0
+                    && !self.disc_audio_in_map_ram
+                    && (self.audio_channel == 0 || self.ram[0x2800 + 11] != 0xFF)
+                    && (val & 0x2000) == 0;
                 if bit11_start || (val & 0x2000) != 0 {
                     // A start while a map plays is ignored; over a stopped buffer still playing it waits for that buffer.
                     if !self.map_on {
@@ -884,6 +907,7 @@ impl Cdic {
         // If Mode 2 audio selected with command 0x2A: route to ADPCM Sound Map buffer (+0x1400 words = +0x2800 bytes)
         if self.command == 0x2A && is_audio_sel {
             self.data_buffer |= 0x0004;
+            self.disc_audio_in_map_ram = true;
             dev_idx += 0x2800;
         }
 
@@ -924,7 +948,7 @@ opencdi::impl_state!(Cdic {
     ram, audio,
     command, time, file, channel, audio_channel, audio_buffer, x_buffer, dma_control, z_buffer, interrupt_vector, data_buffer,
     disc_command, disc_mode, disc_spinup_counter, curr_lba,
-    audio_sector_counter, map_on, map_next, buf_addr, buf_coding, buf_group, buf_elapsed, map_finished, map_sector_cycles, dsp_achan, cdda_playing,
+    audio_sector_counter, map_on, map_next, buf_addr, buf_coding, buf_group, buf_elapsed, map_finished, map_sector_cycles, disc_audio_in_map_ram, dsp_achan, cdda_playing,
     cycle_accumulator, irq_pending, dma_triggered,
     cd_byteswap,
 } skip {
@@ -1112,6 +1136,54 @@ mod tests {
         let mut c = Cdic::new();
         c.audio_channel = 1;
         c.ram[0x2800 + 11] = 0x10;
+        c.write_reg(0x3FA, 0x0800);
+        assert!(c.map_on);
+        assert_eq!(c.buf_addr, 0x2800);
+    }
+
+    #[test]
+    fn audctl_bit11_ignores_disc_mode2_buffer_and_re_enables_on_host_write() {
+        let mut sector = vec![0u8; 2352];
+        sector[15] = 0x02;
+        // Subheader (duplicated at 16..20 and 20..24): file=1, channel=5, submode=0x64 (RT+audio+EOR), coding=0x04 (level B mono)
+        for base in [16usize, 20] {
+            sector[base] = 0x01;
+            sector[base + 1] = 0x05;
+            sector[base + 2] = 0x64;
+            sector[base + 3] = 0x04;
+        }
+        let mut bin = Vec::with_capacity(sector.len() * 2);
+        bin.extend_from_slice(&sector);
+        bin.extend_from_slice(&sector);
+        let dir = std::env::temp_dir().join(format!("opencdi-mode2-audctl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("m.bin"), &bin).unwrap();
+        std::fs::write(dir.join("m.cue"), "FILE \"m.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n").unwrap();
+        let mut cd = Some(CdRom::open(dir.join("m.cue")).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut c = Cdic::new();
+        c.command = 0x2A;
+        c.disc_command = 0x2A;
+        c.disc_mode = 2;
+        c.audio_channel = 1 << 5;
+        c.channel = 0xFFFF_FFFF;
+        c.process_sector(&mut cd);
+        c.curr_lba = 1;
+        c.process_sector(&mut cd);
+        assert!(c.disc_audio_in_map_ram);
+        assert_eq!(c.audio.total_sectors_decoded, 2);
+        assert_eq!((c.ram[0x2800 + 11], c.ram[0x3200 + 11]), (0x04, 0x04));
+
+        c.write_reg(0x3FA, 0x0800);
+        assert!(!c.map_on);
+        assert_eq!(c.buf_addr, 0xFFFF);
+        assert_eq!(c.audio.total_sectors_decoded, 2);
+
+        // Once host CPU/DMA writes a sound map descriptor into 0x2800..0x3C00, AUDCTL 0x0800 plays it.
+        c.write_ram_byte(0x2800 + 11, 0x10);
+        assert!(!c.disc_audio_in_map_ram);
         c.write_reg(0x3FA, 0x0800);
         assert!(c.map_on);
         assert_eq!(c.buf_addr, 0x2800);

@@ -1300,6 +1300,7 @@ impl Dvc {
                 if value & 0x0001 != 0 { // STOP
                     self.audio_armed = false;
                     self.audio_enabled = false;
+                    self.fma_dma_seen = false;
                     self.reset_audio_parser();
                     self.set_fma_word(0x02, 0x0200);
                     self.set_fma_word(FMA_ISR, 0);
@@ -1386,7 +1387,10 @@ impl Dvc {
                 if value & 0x0100 != 0 { // RESET
                     self.reset_video_stream();
                     // The system reset also resets the stream parser and its system clock reference; audio play and arm stay as they are.
-                    self.reset_audio_parser();
+                    // Dedicated FMA audio streams (DMA/PIO) are independent of FMV video resets and must not be flushed.
+                    if !self.fma_dma_seen {
+                        self.reset_audio_parser();
+                    }
                     self.dclk = 0;
                     self.dclk_accum = 0;
                     self.set_fmv_word(FMV_ISR, 0);
@@ -2286,6 +2290,25 @@ mod timing_tests {
         d.handle_fmv_write(FMV_SYSCMD);
         assert!(d.fma_stream_fifo.is_empty() && d.audio_out.is_empty());
         assert!(!d.fma_started && d.audio_enabled && d.dclk == 0);
+    }
+
+    #[test]
+    fn system_reset_preserves_dedicated_fma_audio_stream() {
+        let mut d = Dvc::new();
+        d.audio_enabled = true;
+        d.fma_started = true;
+        for &b in &silent_frame() {
+            d.push_fma_stream_byte(b);
+        }
+        d.audio_out.push_back((0.5, 0.5));
+        d.dclk = 1234;
+        d.set_fmv_word(FMV_SYSCMD, 0x0100);
+        d.handle_fmv_write(FMV_SYSCMD);
+        assert!(d.fma_dma_seen);
+        assert!(!d.fma_stream_fifo.is_empty());
+        assert_eq!(d.audio_out.len(), 1);
+        assert!(d.fma_started && !d.audio_stopped && d.audio_enabled);
+        assert_eq!(d.dclk, 0);
     }
 }
 
