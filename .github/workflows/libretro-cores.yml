@@ -121,7 +121,7 @@ jobs:
 
   build-macos:
     name: macOS Universal Core
-    runs-on: macos-13
+    runs-on: macos-latest
     continue-on-error: true
     steps:
       - name: Checkout repository
