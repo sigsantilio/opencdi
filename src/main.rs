@@ -24,6 +24,9 @@ use opencdi::machine::Machine;
 use opencdi::mcd212::{SCREEN_WIDTH, SCREEN_HEIGHT, VideoMode};
 use opencdi::savestate::{Reader, State, StateError};
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 #[cfg(target_os = "windows")]
 #[link(name = "winmm")]
 unsafe extern "system" {
@@ -355,7 +358,37 @@ fn resolve_or_guide_bios(rom_arg: Option<PathBuf>) -> Option<PathBuf> {
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    loop {
+        match macos::ask_bios_missing() {
+            macos::BiosMissingChoice::Browse => {
+                let Some(picked) = macos::pick_bios(None) else { continue };
+                match Machine::read_bios(&picked) {
+                    Ok((_, img)) if img.report.status != bios::Status::Error => {
+                        opencdi::frontend::save_bios_preference(&picked);
+                        return Some(picked);
+                    }
+                    Ok((_, img)) => macos::alert_error(None, &format!("The selected file was rejected as a CD-i BIOS:\n\n{}", img.report.message)),
+                    Err(e) => macos::alert_error(None, &format!("Cannot open the selected file:\n\n{}", e)),
+                }
+            }
+            macos::BiosMissingChoice::ShowFolder => {
+                let bios_dir = std::path::absolute("bios").unwrap_or_else(|_| PathBuf::from("bios"));
+                let _ = std::fs::create_dir_all(&bios_dir);
+                macos::open_in_finder_or_browser(bios_dir.as_os_str());
+                if macos::ask_bios_copied(&bios_dir) {
+                    if let Some(found) = find_bios_rom() {
+                        opencdi::frontend::save_bios_preference(&found);
+                        return Some(found);
+                    }
+                    macos::alert_error(None, "No valid BIOS was found in the BIOS folder. Copy a file such as cdi220b.rom there and try again.");
+                }
+            }
+            macos::BiosMissingChoice::Quit => return None,
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     None
 }
 
@@ -447,10 +480,19 @@ fn file_stem(game: &str) -> String {
 
 // Savestates go into states/ next to the binary
 fn states_dir() -> PathBuf {
+    beside_program("states")
+}
+
+// `name` next to the executable; inside a macOS app bundle, in the working directory (the data folder) instead
+fn beside_program(name: &str) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if macos::running_from_app_bundle() {
+        return PathBuf::from(name);
+    }
     std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("states")))
-        .unwrap_or_else(|| PathBuf::from("states"))
+        .and_then(|p| p.parent().map(|d| d.join(name)))
+        .unwrap_or_else(|| PathBuf::from(name))
 }
 
 // RetroArch naming: slot 0 is <name>.state, slot N is <name>.stateN
@@ -535,7 +577,23 @@ fn first_positional(args: &[String]) -> Option<String> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    #[allow(unused_mut)]
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Launched from OpenCDi.app: work in ~/Library/Application Support/OpenCDi, so the relative
+    // paths below (bios/, NVRAM, settings, states, screenshots) are writable and per-user.
+    // Path arguments are made absolute first so they still point where the user meant.
+    #[cfg(target_os = "macos")]
+    let mac_data_dir = {
+        if macos::running_from_app_bundle() {
+            for a in args.iter_mut() {
+                let p = Path::new(a.as_str());
+                if p.is_relative() && p.exists() && let Ok(abs) = std::path::absolute(p) {
+                    *a = abs.to_string_lossy().into_owned();
+                }
+            }
+        }
+        macos::enter_app_data_dir()
+    };
     let has_flag = |f: &str| args.iter().any(|a| a == f);
     let help = has_flag("--help") || has_flag("-h");
     #[cfg(target_os = "windows")]
@@ -566,6 +624,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     info!("=== OpenCDi - Philips CD-i Emulator ===");
+    #[cfg(target_os = "macos")]
+    if let Some(dir) = &mac_data_dir {
+        info!("Data folder: {:?}", dir);
+    }
 
     let flag_value = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
     let rom_arg = flag_value("--rom").map(PathBuf::from);
@@ -762,14 +824,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         n
     });
-    let screenshot_dir = flag_value("--screenshot-dir")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("screenshots")))
-                .unwrap_or_else(|| PathBuf::from("screenshots"))
-        });
+    let screenshot_dir = flag_value("--screenshot-dir").map(PathBuf::from).unwrap_or_else(|| beside_program("screenshots"));
 
     let (pad_x, pad_y) = if m.bus.cdrom.is_some() { (575, 335) } else { (384, 280) };
     let prev_vsr = (m.bus.mcd212.get_vsr::<0>(), m.bus.mcd212.get_vsr::<1>());
@@ -792,6 +847,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         no_menu,
         monitor_index,
         screenshot_dir,
+        #[cfg(target_os = "macos")]
+        mac_menu: None,
+        #[cfg(target_os = "macos")]
+        mac_data_dir,
         no_autoplay: has_flag("--no-autoplay"),
         window: None,
         surface: None,
@@ -951,6 +1010,10 @@ struct App {
     no_menu: bool,
     monitor_index: Option<usize>,
     screenshot_dir: PathBuf,
+    #[cfg(target_os = "macos")]
+    mac_menu: Option<macos::MenuBar>,
+    #[cfg(target_os = "macos")]
+    mac_data_dir: Option<PathBuf>,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     image_rect: (usize, usize, usize, usize),
@@ -1015,6 +1078,16 @@ struct App {
 impl App {
     fn key(&self, k: Key) -> bool {
         self.keys.contains(&k)
+    }
+
+    // Tells the user about a failed disc, BIOS or cartridge load; logged on platforms without dialogs
+    fn show_error(&self, text: &str) {
+        #[cfg(target_os = "windows")]
+        gui::show_disc_error(self.hwnd(), text);
+        #[cfg(target_os = "macos")]
+        macos::alert_error(self.window.as_deref(), text);
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        error!("{}", text);
     }
 
     #[cfg(target_os = "windows")]
@@ -1095,16 +1168,14 @@ impl App {
             Ok(res) => res,
             Err(e) => {
                 error!("Cannot read BIOS file {:?}: {}", new_path, e);
-                #[cfg(target_os = "windows")]
-                gui::show_disc_error(self.hwnd(), &format!("Cannot read BIOS file:\n\n{:?}\n\nError: {}", new_path, e));
+                self.show_error(&format!("Cannot read BIOS file:\n\n{:?}\n\nError: {}", new_path, e));
                 return false;
             }
         };
 
         if img.report.status == bios::Status::Error {
             error!("BIOS file {:?} is invalid: {}", new_path, img.report.message);
-            #[cfg(target_os = "windows")]
-            gui::show_disc_error(self.hwnd(), &format!("Selected BIOS file was rejected:\n\n{}", img.report.message));
+            self.show_error(&format!("Selected BIOS file was rejected:\n\n{}", img.report.message));
             return false;
         }
 
@@ -1209,10 +1280,17 @@ impl App {
     fn open_dialog_action(&self, open_and_reset: bool) {
         #[cfg(target_os = "windows")]
         gui::post_menu_command(self.hwnd(), if open_and_reset { gui::ID_FILE_OPEN } else { gui::ID_FILE_INSERT });
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
+        {
+            let title = if open_and_reset { "Open CD-i Disc Image" } else { "Insert CD-i Disc Image" };
+            if let Some(path) = macos::pick_disc(self.window.as_deref(), title) {
+                push_action(if open_and_reset { GuiAction::OpenDisc(path) } else { GuiAction::InsertDisc(path) });
+            }
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             let _ = open_and_reset;
-            info!("No file dialog on this platform: pass the disc path on the command line, or --recent <n>");
+            info!("No file dialog on this platform: pass the disc path on the command line, drag a disc onto the window, or use --recent <n>");
         }
     }
 
@@ -1271,6 +1349,70 @@ impl App {
         }
     }
 
+    fn toggle_pause(&mut self) {
+        self.paused = !self.paused;
+        info!("Emulation: {}", if self.paused { "PAUSED" } else { "RUNNING" });
+        self.reset_telemetry();
+        self.refresh_title();
+    }
+
+    fn toggle_mute(&mut self) {
+        self.muted = !self.muted;
+        self.publish_gain();
+        info!("Audio: {}", if self.muted { "MUTED" } else { "UNMUTED" });
+    }
+
+    // Runs the commands chosen from the macOS menu bar since the last loop iteration
+    #[cfg(target_os = "macos")]
+    fn handle_menu_commands(&mut self) {
+        use macos::MenuCommand as C;
+        let Some(menu) = &self.mac_menu else { return };
+        for command in menu.poll() {
+            match command {
+                C::About => macos::show_about(self.window.as_deref(), self.mac_data_dir.as_deref()),
+                C::Quit => push_action(GuiAction::Exit),
+                C::OpenDisc => self.open_dialog_action(true),
+                C::InsertDisc => self.open_dialog_action(false),
+                C::EjectDisc => push_action(GuiAction::EjectDisc),
+                C::Screenshot => self.take_screenshot(),
+                C::Reset => push_action(GuiAction::Reset),
+                C::Pause => self.toggle_pause(),
+                C::SaveState => self.save_state(),
+                C::LoadState => self.load_state(),
+                C::Mute => self.toggle_mute(),
+                C::Fullscreen => self.toggle_fullscreen(),
+                C::InputGamepad => push_action(GuiAction::SetInputDevice(InputDeviceMode::Gamepad)),
+                C::InputMouse => push_action(GuiAction::SetInputDevice(InputDeviceMode::Mouse)),
+                C::SelectBios => push_action(GuiAction::OpenBiosDialog),
+                C::ShowBiosFolder => push_action(GuiAction::OpenBiosFolder),
+                C::SelectDvc => {
+                    if let Some(path) = macos::pick_dvc(self.window.as_deref()) {
+                        push_action(GuiAction::SelectDvc(path));
+                    }
+                }
+                C::ToggleDvc => push_action(GuiAction::ToggleDvc),
+                C::ClearNvram => {
+                    if macos::confirm(
+                        self.window.as_deref(),
+                        "Clear Console Memory?",
+                        "This erases the CD-i console memory (NVRAM), including game saves and player settings, and restarts the console.",
+                        "Clear and Restart",
+                    ) {
+                        push_action(GuiAction::ClearNvram);
+                    }
+                }
+                C::ShowDataFolder => {
+                    let dir = self.mac_data_dir.clone().or_else(|| std::env::current_dir().ok());
+                    if let Some(dir) = dir {
+                        macos::open_in_finder_or_browser(dir.as_os_str());
+                    }
+                }
+                C::Controls => push_action(GuiAction::ShowHelp),
+                C::ReportIssue => push_action(GuiAction::OpenFeedback),
+            }
+        }
+    }
+
     fn on_key_pressed(&mut self, el: &ActiveEventLoop, code: Key) {
         let ctrl = self.mods.control_key();
         let alt = self.mods.alt_key();
@@ -1289,12 +1431,7 @@ impl App {
             Key::KeyB if ctrl => push_action(GuiAction::OpenBiosDialog),
             Key::F5 => push_action(GuiAction::Reset),
             Key::KeyH if !ctrl && !self.bound(code) => push_action(GuiAction::Reset),
-            Key::KeyP if !ctrl && !self.bound(code) => {
-                self.paused = !self.paused;
-                info!("Emulation: {}", if self.paused { "PAUSED" } else { "RUNNING" });
-                self.reset_telemetry();
-                self.refresh_title();
-            }
+            Key::KeyP if !ctrl && !self.bound(code) => self.toggle_pause(),
             Key::F11 => self.toggle_fullscreen(),
             Key::Enter | Key::NumpadEnter if alt => self.toggle_fullscreen(),
             Key::F8 | Key::F12 => self.take_screenshot(),
@@ -1310,11 +1447,7 @@ impl App {
                 opencdi::mcd212::set_studio_levels(studio);
                 info!("Video levels: {}", if studio { "studio (black 16)" } else { "full (black 0)" });
             }
-            Key::KeyM if !self.bound(code) => {
-                self.muted = !self.muted;
-                self.publish_gain();
-                info!("Audio: {}", if self.muted { "MUTED" } else { "UNMUTED" });
-            }
+            Key::KeyM if !self.bound(code) => self.toggle_mute(),
             _ => {}
         }
     }
@@ -1349,8 +1482,7 @@ impl App {
                         }
                         Err(e) => {
                             error!("Failed to hot-swap disc {:?}: {:?}", path, e);
-                            #[cfg(target_os = "windows")]
-                            gui::show_disc_error(self.hwnd(), &format!("Errore nell'inserimento del disco:\n\n{}", e));
+                            self.show_error(&format!("Errore nell'inserimento del disco:\n\n{}", e));
                         }
                     }
                 }
@@ -1400,8 +1532,7 @@ impl App {
                         }
                         Err(e) => {
                             error!("Failed to load disc {:?}: {:?}", path, e);
-                            #[cfg(target_os = "windows")]
-                            gui::show_disc_error(self.hwnd(), &format!("Errore nel caricamento del disco:\n\n{}", e));
+                            self.show_error(&format!("Errore nel caricamento del disco:\n\n{}", e));
                         }
                     }
                 }
@@ -1530,10 +1661,14 @@ impl App {
                 GuiAction::ShowHelp => {
                     #[cfg(target_os = "windows")]
                     gui::post_menu_command(self.hwnd(), gui::ID_HELP_CONTROLS);
+                    #[cfg(target_os = "macos")]
+                    macos::show_controls(self.window.as_deref());
                 }
                 GuiAction::ShowAbout => {
                     #[cfg(target_os = "windows")]
                     gui::post_menu_command(self.hwnd(), gui::ID_HELP_ABOUT);
+                    #[cfg(target_os = "macos")]
+                    macos::show_about(self.window.as_deref(), self.mac_data_dir.as_deref());
                 }
                 GuiAction::QuickSaveState | GuiAction::SaveState(_) | GuiAction::QuickLoadState | GuiAction::LoadState(_) => {
                     self.state_slot = match action {
@@ -1564,12 +1699,18 @@ impl App {
                 GuiAction::OpenFeedback => {
                     #[cfg(target_os = "windows")]
                     gui::open_feedback_url();
-                    #[cfg(not(target_os = "windows"))]
+                    #[cfg(target_os = "macos")]
+                    macos::open_in_finder_or_browser("https://github.com/sigsantilio/opencdi/issues".as_ref());
+                    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
                     let _ = std::process::Command::new("xdg-open").arg("https://github.com/sigsantilio/opencdi/issues").spawn();
                 }
                 GuiAction::OpenBiosDialog => {
                     #[cfg(target_os = "windows")]
                     gui::post_menu_command(self.hwnd(), gui::ID_BIOS_SELECT);
+                    #[cfg(target_os = "macos")]
+                    if let Some(path) = macos::pick_bios(self.window.as_deref()) {
+                        self.switch_bios(&path);
+                    }
                 }
                 GuiAction::SelectBios(path) => {
                     self.switch_bios(&path);
@@ -1579,6 +1720,8 @@ impl App {
                     let _ = std::fs::create_dir_all(bios_dir);
                     #[cfg(target_os = "windows")]
                     gui::open_folder(bios_dir);
+                    #[cfg(target_os = "macos")]
+                    macos::open_in_finder_or_browser(std::path::absolute(bios_dir).unwrap_or_else(|_| bios_dir.to_path_buf()).as_os_str());
                 }
                 GuiAction::ShowBiosInfo => {
                     #[cfg(target_os = "windows")]
@@ -1600,8 +1743,7 @@ impl App {
                         gui::update_dvc_menu(true);
                         info!("DVC ROM loaded successfully: {:?}", path);
                     } else {
-                        #[cfg(target_os = "windows")]
-                        gui::show_disc_error(self.hwnd(), &format!("The selected DVC ROM is invalid:\n\n{:?}", path));
+                        self.show_error(&format!("The selected DVC ROM is invalid:\n\n{:?}", path));
                     }
                 }
                 GuiAction::OpenDvcFolder => {
@@ -1609,6 +1751,8 @@ impl App {
                     let _ = std::fs::create_dir_all(dvc_dir);
                     #[cfg(target_os = "windows")]
                     gui::open_folder(dvc_dir);
+                    #[cfg(target_os = "macos")]
+                    macos::open_in_finder_or_browser(std::path::absolute(dvc_dir).unwrap_or_else(|_| dvc_dir.to_path_buf()).as_os_str());
                 }
             }
         }
@@ -2138,6 +2282,11 @@ impl ApplicationHandler for App {
                 }
             }
         }
+        #[cfg(target_os = "macos")]
+        match macos::MenuBar::install() {
+            Ok(menu) => self.mac_menu = Some(menu),
+            Err(e) => warn!("Cannot create the menu bar: {}", e),
+        }
         if self.start_fullscreen {
             self.set_fullscreen(true);
         }
@@ -2177,6 +2326,10 @@ impl ApplicationHandler for App {
                 self.apply_grab();
             }
             WindowEvent::Occluded(o) => self.occluded = o,
+            WindowEvent::DroppedFile(path) => {
+                info!("Disc image dropped on the window: {:?}", path);
+                push_action(GuiAction::OpenDisc(path));
+            }
             // --no-host-input: keyboard and mouse never reach the emulator or the shortcuts
             WindowEvent::KeyboardInput { .. } | WindowEvent::MouseInput { .. } if !self.host_input => {}
             WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
@@ -2236,6 +2389,8 @@ impl ApplicationHandler for App {
         if self.window.is_none() || el.exiting() {
             return;
         }
+        #[cfg(target_os = "macos")]
+        self.handle_menu_commands();
         let ff = self.host_input && self.focused && self.key(Key::Space) && !self.bound(Key::Space);
         if ff != self.fast_forward {
             self.fast_forward = ff;

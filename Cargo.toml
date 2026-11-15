@@ -9,7 +9,7 @@ autobins = false
 
 [features]
 default = ["host"]
-host = ["dep:winit", "dep:softbuffer", "dep:cpal", "dep:gilrs", "dep:env_logger", "dep:png"]
+host = ["dep:winit", "dep:softbuffer", "dep:cpal", "dep:gilrs", "dep:env_logger", "dep:png", "dep:rfd", "dep:muda"]
 
 [workspace]
 members = ["crates/opencdi-libretro"]
@@ -41,6 +41,11 @@ oxideav-mp2 = "0.0.10"
 png = { version = "0.18", optional = true }
 softbuffer = { version = "0.4.8", optional = true, default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
 winit = { version = "0.30.13", optional = true }
+
+# macOS standalone: native file dialogs, alerts and the menu bar
+[target.'cfg(target_os = "macos")'.dependencies]
+rfd = { version = "0.18", optional = true }
+muda = { version = "0.21", optional = true, default-features = false }
 
 [patch.crates-io]
 m68k = { path = "crates/m68k" }
