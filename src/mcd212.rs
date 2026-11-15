@@ -712,9 +712,8 @@ impl Mcd212 {
             // End of frame / Start of VBLANK
             self.csrr[0] &= !CSR1R_DA;
 
-            // Process ICA: Path 1 then Path 0 for correct hardware precedence (Path 0 wins)
-            self.process_ica::<1>();
-            self.process_ica::<0>();
+            // Process ICA: Path 1 and Path 0 run in lockstep (one instruction per step; Path 0 wins same-step ties)
+            self.process_ica();
 
             if (self.dcr[0] & DCR_DCA_BIT) != 0 {
                 self.dca[0] = self.get_dcp::<0>();
@@ -780,157 +779,168 @@ impl Mcd212 {
         frame_completed
     }
 
-    fn process_ica<const PATH: usize>(&mut self) {
-        if (self.dcr[PATH] & DCR_ICA_BIT) == 0 {
-            return;
-        }
+    #[inline(always)]
+    fn read_dc_word<const PATH: usize>(&self, byte_addr: usize) -> Option<u32> {
+        let plane = if PATH == 0 { &self.plane_a[..] } else { &self.plane_b[..] };
+        let bytes: [u8; 4] = plane.get(byte_addr..byte_addr + 4)?.try_into().ok()?;
+        Some(u32::from_be_bytes(bytes))
+    }
 
-        // LCT depends on current frame parity
-        let is_interlaced = (self.dcr[0] & DCR_SM_BIT) != 0;
-        let mut addr = if is_interlaced && (self.csrr[0] & CSR1R_PA) != 0 {
-            0x202
-        } else {
-            0x200
+    fn step_ica<const PATH: usize>(&mut self, addr: &mut u32) -> bool {
+        let Some(cmd) = self.read_dc_word::<PATH>((*addr as usize) * 2) else {
+            return false;
         };
+        *addr += 2;
+        if let Some(log) = self.dc_log.as_mut() { log.push((self.scanline as u16, PATH as u8, cmd)); }
 
-        let max_to_process = 32 * 120;
-        for _ in 0..max_to_process {
-            let byte_addr = (addr as usize) * 2;
-            let cmd = if PATH == 0 {
-                if byte_addr + 4 > self.plane_a.len() {
-                    break;
-                }
-                u32::from_be_bytes([
-                    self.plane_a[byte_addr],
-                    self.plane_a[byte_addr + 1],
-                    self.plane_a[byte_addr + 2],
-                    self.plane_a[byte_addr + 3],
-                ])
-            } else {
-                if byte_addr + 4 > self.plane_b.len() {
-                    break;
-                }
-                u32::from_be_bytes([
-                    self.plane_b[byte_addr],
-                    self.plane_b[byte_addr + 1],
-                    self.plane_b[byte_addr + 2],
-                    self.plane_b[byte_addr + 3],
-                ])
-            };
-            addr += 2;
-            if let Some(log) = self.dc_log.as_mut() { log.push((self.scanline as u16, PATH as u8, cmd)); }
-
-            match (cmd >> 24) as u8 {
-                0x00..=0x0F => return, // STOP
-                0x10..=0x1F => {}      // NOP
-                0x20..=0x2F => {
-                    // RELOAD DCP
-                    self.set_dcp::<PATH>(cmd & 0x003F_FFFC);
-                }
-                0x30..=0x3F => {
-                    // RELOAD DCP and STOP
-                    self.set_dcp::<PATH>(cmd & 0x003F_FFFC);
-                    return;
-                }
-                0x40..=0x4F => {
-                    // RELOAD VSR (ICA jump)
-                    addr = ((cmd & 0x0007_FFFF) / 2) as u32;
-                }
-                0x50..=0x5F => {
-                    // RELOAD VSR and STOP
-                    self.set_vsr::<PATH>(cmd & 0x003F_FFFF);
-                    return;
-                }
-                0x60..=0x6F => {
-                    // INTERRUPT
-                    self.csrr[1] |= 1 << (2 - PATH);
-                    self.vblank_irq |= (self.csrw[PATH] & CSRW_DI) == 0;
-                }
-                0x78..=0x7F => {
-                    // RELOAD DISPLAY PARAMETERS
-                    self.set_display_parameters::<PATH>((cmd & 0x1F) as u8);
-                }
-                reg => {
-                    self.set_register::<PATH>(reg, cmd & 0x00FF_FFFF);
-                }
+        match (cmd >> 24) as u8 {
+            0x00..=0x0F => false, // STOP
+            0x10..=0x1F => true,  // NOP
+            0x20..=0x2F => {
+                // RELOAD DCP
+                self.set_dcp::<PATH>(cmd & 0x003F_FFFC);
+                true
+            }
+            0x30..=0x3F => {
+                // RELOAD DCP and STOP
+                self.set_dcp::<PATH>(cmd & 0x003F_FFFC);
+                false
+            }
+            0x40..=0x4F => {
+                // RELOAD VSR (ICA jump)
+                *addr = ((cmd & 0x0007_FFFF) / 2) as u32;
+                true
+            }
+            0x50..=0x5F => {
+                // RELOAD VSR and STOP
+                self.set_vsr::<PATH>(cmd & 0x003F_FFFF);
+                false
+            }
+            0x60..=0x6F => {
+                // INTERRUPT
+                self.csrr[1] |= 1 << (2 - PATH);
+                self.vblank_irq |= (self.csrw[PATH] & CSRW_DI) == 0;
+                true
+            }
+            0x78..=0x7F => {
+                // RELOAD DISPLAY PARAMETERS
+                self.set_display_parameters::<PATH>((cmd & 0x1F) as u8);
+                true
+            }
+            reg => {
+                self.set_register::<PATH>(reg, cmd & 0x00FF_FFFF);
+                true
             }
         }
     }
 
-    fn process_dca<const PATH: usize>(&mut self) {
-        let trace_this = false;
-        let start_addr = ((self.dca[PATH] & 0x0007_FFFC) / 2) as usize;
-        let mut addr = start_addr;
-        let mut count = 0;
-        let max = 64;
-        let mut processing = true;
+    fn process_ica(&mut self) {
+        // LCT depends on current frame parity
+        let is_interlaced = (self.dcr[0] & DCR_SM_BIT) != 0;
+        let start = if is_interlaced && (self.csrr[0] & CSR1R_PA) != 0 {
+            0x202
+        } else {
+            0x200
+        };
+        let mut addr = [start, start];
+        let mut active = [
+            (self.dcr[0] & DCR_ICA_BIT) != 0,
+            (self.dcr[1] & DCR_ICA_BIT) != 0,
+        ];
 
-        while processing && count < max {
-            let byte_addr = addr * 2;
-            let cmd = if PATH == 0 {
-                if byte_addr + 4 > self.plane_a.len() {
-                    break;
-                }
-                u32::from_be_bytes([
-                    self.plane_a[byte_addr],
-                    self.plane_a[byte_addr + 1],
-                    self.plane_a[byte_addr + 2],
-                    self.plane_a[byte_addr + 3],
-                ])
-            } else {
-                if byte_addr + 4 > self.plane_b.len() {
-                    break;
-                }
-                u32::from_be_bytes([
-                    self.plane_b[byte_addr],
-                    self.plane_b[byte_addr + 1],
-                    self.plane_b[byte_addr + 2],
-                    self.plane_b[byte_addr + 3],
-                ])
-            };
-            addr += 2;
-            if let Some(log) = self.dc_log.as_mut() { log.push((self.scanline as u16, PATH as u8, cmd)); }
-            count += 4;
-
-            if trace_this {
-                println!("  [Scanline {} DCA{} cmd] 0x{:08X}", self.scanline, PATH, cmd);
+        let max_to_process = 32 * 120;
+        for _ in 0..max_to_process {
+            if !active[0] && !active[1] {
+                break;
             }
-            match (cmd >> 24) as u8 {
-                0x00..=0x0F => processing = false, // STOP
-                0x10..=0x1F => {}                  // NOP
-                0x20..=0x2F => {}                  // RELOAD DCP (NOP in DCA)
-                0x30..=0x3F => {
-                    // RELOAD DCP and STOP
-                    self.set_dcp::<PATH>(cmd & 0x003F_FFFC);
-                    self.dca[PATH] = cmd & 0x0007_FFFC;
-                    return;
-                }
-                0x40..=0x4F => {
-                    // RELOAD VSR
-                    self.set_vsr::<PATH>(cmd & 0x003F_FFFF);
-                }
-                0x50..=0x5F => {
-                    // RELOAD VSR and STOP
-                    self.set_vsr::<PATH>(cmd & 0x003F_FFFF);
-                    processing = false;
-                }
-                0x60..=0x6F => {
-                    // INTERRUPT
-                    self.csrr[1] |= 1 << (2 - PATH);
-                    self.vblank_irq |= (self.csrw[PATH] & CSRW_DI) == 0;
-                }
-                0x78..=0x7F => {
-                    // RELOAD DISPLAY PARAMETERS
-                    self.set_display_parameters::<PATH>((cmd & 0x1F) as u8);
-                }
-                reg => {
-                    self.set_register::<PATH>(reg, cmd & 0x00FF_FFFF);
-                }
+            if active[1] {
+                active[1] = self.step_ica::<1>(&mut addr[1]);
+            }
+            if active[0] {
+                active[0] = self.step_ica::<0>(&mut addr[0]);
+            }
+        }
+    }
+
+    fn step_dca<const PATH: usize>(&mut self, addr: &mut usize) -> (bool, bool) {
+        let Some(cmd) = self.read_dc_word::<PATH>(*addr * 2) else {
+            return (false, false);
+        };
+        *addr += 2;
+        if let Some(log) = self.dc_log.as_mut() { log.push((self.scanline as u16, PATH as u8, cmd)); }
+
+        match (cmd >> 24) as u8 {
+            0x00..=0x0F => (false, false), // STOP
+            0x10..=0x1F => (true, false),  // NOP
+            0x20..=0x2F => (true, false),  // RELOAD DCP (NOP in DCA)
+            0x30..=0x3F => {
+                // RELOAD DCP and STOP
+                self.set_dcp::<PATH>(cmd & 0x003F_FFFC);
+                self.dca[PATH] = cmd & 0x0007_FFFC;
+                (false, true)
+            }
+            0x40..=0x4F => {
+                // RELOAD VSR
+                self.set_vsr::<PATH>(cmd & 0x003F_FFFF);
+                (true, false)
+            }
+            0x50..=0x5F => {
+                // RELOAD VSR and STOP
+                self.set_vsr::<PATH>(cmd & 0x003F_FFFF);
+                (false, false)
+            }
+            0x60..=0x6F => {
+                // INTERRUPT
+                self.csrr[1] |= 1 << (2 - PATH);
+                self.vblank_irq |= (self.csrw[PATH] & CSRW_DI) == 0;
+                (true, false)
+            }
+            0x78..=0x7F => {
+                // RELOAD DISPLAY PARAMETERS
+                self.set_display_parameters::<PATH>((cmd & 0x1F) as u8);
+                (true, false)
+            }
+            reg => {
+                self.set_register::<PATH>(reg, cmd & 0x00FF_FFFF);
+                (true, false)
+            }
+        }
+    }
+
+    fn process_dca(&mut self) {
+        let start_addr = [
+            ((self.dca[0] & 0x0007_FFFC) / 2) as usize,
+            ((self.dca[1] & 0x0007_FFFC) / 2) as usize,
+        ];
+        let mut addr = start_addr;
+        let mut active = [
+            (self.dcr[0] & DCR_DCA_BIT) != 0,
+            (self.dcr[1] & DCR_DCA_BIT) != 0,
+        ];
+        let mut reloaded_dcp = [false, false];
+
+        for _ in 0..16 {
+            if !active[0] && !active[1] {
+                break;
+            }
+            if active[1] {
+                let (cont, rel) = self.step_dca::<1>(&mut addr[1]);
+                active[1] = cont;
+                reloaded_dcp[1] |= rel;
+            }
+            if active[0] {
+                let (cont, rel) = self.step_dca::<0>(&mut addr[0]);
+                active[0] = cont;
+                reloaded_dcp[0] |= rel;
             }
         }
 
-        addr += (max - count) >> 1;
-        self.dca[PATH] = (addr * 2) as u32;
+        if (self.dcr[0] & DCR_DCA_BIT) != 0 && !reloaded_dcp[0] {
+            self.dca[0] = ((start_addr[0] + 32) * 2) as u32;
+        }
+        if (self.dcr[1] & DCR_DCA_BIT) != 0 && !reloaded_dcp[1] {
+            self.dca[1] = ((start_addr[1] + 32) * 2) as u32;
+        }
     }
 
     #[inline(always)]
@@ -972,7 +982,6 @@ impl Mcd212 {
         let icm = self.get_icm::<PATH>();
         let tp_ctrl = self.get_transparency_control::<PATH>();
         let width = self.get_screen_width();
-        let border_width = self.get_border_width();
 
         let mut vsr = self.get_vsr::<PATH>();
         let _other_path = if PATH == 0 { 1 } else { 0 };
@@ -1007,8 +1016,6 @@ impl Mcd212 {
         let use_matte_flag = tp_ctrl_type >= TCR_MF0 && tp_ctrl_type <= TCR_MF1_KEY1;
         let is_dyuv_rgb = (icm == ICM_DYUV) || ((icm == ICM_RGB555) && (PATH == 1));
         let use_color_key = !is_dyuv_rgb && ((tp_ctrl_type == TCR_KEY) || (tp_ctrl_type == TCR_MF0_KEY1) || (tp_ctrl_type == TCR_MF1_KEY1));
-        // With external video on, a matte region keys the plane away only inside the DVC window.
-        let ext_keys = use_matte_flag && (self.image_coding_method & ICM_EV) != 0;
 
         if icm == ICM_DYUV {
             let mut x = 0;
@@ -1049,7 +1056,7 @@ impl Mcd212 {
 
             if use_matte_flag && !tp_always {
                 for i in 0..width {
-                    transparent[i] = self.matte_flag[matte_flag_index][i] == tp_check_parity && (!ext_keys || self.external_video_present[(border_width + i).min(767)]);
+                    transparent[i] = self.matte_flag[matte_flag_index][i] == tp_check_parity;
                 }
             } else {
                 transparent.fill(tp_always);
@@ -1106,9 +1113,9 @@ impl Mcd212 {
                         pixels[rl_index + 1] = color1;
                     }
                     if !fixed_tp {
-                        transparent[rl_index] = rgb_tp_bit || (use_color_key && color_match0) || (use_matte_flag && (self.matte_flag[matte_flag_index][rl_index] == tp_check_parity) && (!ext_keys || self.external_video_present[(border_width + rl_index).min(767)]));
+                        transparent[rl_index] = rgb_tp_bit || (use_color_key && color_match0) || (use_matte_flag && (self.matte_flag[matte_flag_index][rl_index] == tp_check_parity));
                         if rl_index + 1 < width {
-                            transparent[rl_index + 1] = rgb_tp_bit || (use_color_key && color_match1) || (use_matte_flag && (self.matte_flag[matte_flag_index][rl_index + 1] == tp_check_parity) && (!ext_keys || self.external_video_present[(border_width + rl_index + 1).min(767)]));
+                            transparent[rl_index + 1] = rgb_tp_bit || (use_color_key && color_match1) || (use_matte_flag && (self.matte_flag[matte_flag_index][rl_index + 1] == tp_check_parity));
                         }
                     }
                     rl_index += 2;
@@ -1282,12 +1289,7 @@ impl Mcd212 {
 
         // Execute DCA during horizontal blanking at the end of the active scanline so register
         // and VSR updates apply starting on the next scanline.
-        if (self.dcr[1] & DCR_DCA_BIT) != 0 {
-            self.process_dca::<1>();
-        }
-        if (self.dcr[0] & DCR_DCA_BIT) != 0 {
-            self.process_dca::<0>();
-        }
+        self.process_dca();
 
         let active_lines = self.effective_active_scanlines();
         let is_interlaced = (self.dcr[0] & DCR_SM_BIT) != 0;
@@ -1449,6 +1451,126 @@ mod tests {
         m.render_line(33);
         let p1 = m.framebuffer[2 * SCREEN_WIDTH + 24];
         assert!(((p1 >> 16) & 0xFF) > 200 && ((p1 >> 8) & 0xFF) < 30, "line 33 must scan out 0x3000 (red), got {p1:08X}");
+    }
+}
+
+#[cfg(test)]
+mod matte_and_dc_tests {
+    use super::*;
+
+    fn write_be32(mem: &mut [u8], addr: usize, val: u32) {
+        mem[addr..addr + 4].copy_from_slice(&val.to_be_bytes());
+    }
+
+    #[test]
+    fn interleaved_ica_preserves_later_path1_writes_and_path0_same_step_priority() {
+        let mut m = Mcd212::new();
+        m.dcr[0] = DCR_DE_BIT | DCR_ICA_BIT;
+        m.dcr[1] = DCR_DE_BIT | DCR_ICA_BIT;
+
+        // Path 0 sets startup matte control early, writes TCR on step 2, then stops.
+        let p0 = [0xD080_0000, 0xD180_0000, 0xC180_0808, 0x0000_0000];
+        for (i, &w) in p0.iter().enumerate() {
+            write_be32(&mut *m.plane_a, 0x0400 + i * 4, w);
+        }
+
+        // Path 1 runs NOPs past Path 0's matte resets, collides on step 2 (Path 0 must win),
+        // then writes shared matte control on steps 3..4 (Path 1 must persist).
+        let p1 = [
+            0x1000_0000,
+            0x1000_0000,
+            0xC180_0303,
+            0xD090_0000,
+            0xD180_02FF,
+            0x0000_0000,
+        ];
+        for (i, &w) in p1.iter().enumerate() {
+            write_be32(&mut *m.plane_b, 0x0400 + i * 4, w);
+        }
+
+        assert!(m.tick_scanline(0));
+        assert_eq!(m.transparency_control & 0x00FF_FFFF, 0x800808);
+        assert_eq!(m.matte_control[0], 0x90_0000);
+        assert_eq!(m.matte_control[1], 0x80_02FF);
+    }
+
+    #[test]
+    fn interleaved_dca_preserves_later_path1_writes_and_path0_same_step_priority() {
+        let mut m = Mcd212::new();
+        m.dcr[0] = DCR_DE_BIT | DCR_DCA_BIT | DCR_CF_BIT;
+        m.dcr[1] = DCR_DE_BIT | DCR_DCA_BIT | DCR_CF_BIT;
+        m.dca[0] = 0x1000;
+        m.dca[1] = 0x1000;
+
+        let dca0 = [0xD280_0000, 0xC180_0803, 0x0000_0000];
+        for (i, &w) in dca0.iter().enumerate() {
+            write_be32(&mut *m.plane_a, 0x1000 + i * 4, w);
+        }
+        let dca1 = [0x1000_0000, 0xC180_0303, 0xD290_0100, 0x0000_0000];
+        for (i, &w) in dca1.iter().enumerate() {
+            write_be32(&mut *m.plane_b, 0x1000 + i * 4, w);
+        }
+
+        // Active scanline HBLANK runs DCA right after VSR scanout in render_line.
+        let active_start = m.video_mode.vblank_lines();
+        m.tick_scanline(active_start);
+        m.render_line(active_start);
+        assert_eq!(m.transparency_control & 0x00FF_FFFF, 0x800803);
+        assert_eq!(m.matte_control[2], 0x90_0100);
+    }
+
+    #[test]
+    fn matte_transparency_keys_outside_dvc_window_with_icm_ev() {
+        let mut m = Mcd212::new();
+        m.dcr[0] = DCR_DE_BIT | DCR_CF_BIT;
+        m.dcr[1] = DCR_DE_BIT | DCR_CF_BIT;
+        m.csrr[0] = CSR1R_DA;
+        m.set_register::<0>(0xC0, ICM_EV | ((ICM_CLUT7 as u32) << 8) | (ICM_CLUT7 as u32));
+        m.set_register::<0>(0xC2, 0); // Plane A in front, Plane B behind
+
+        m.set_vsr::<0>(0x1000);
+        m.set_vsr::<1>(0x1000);
+        m.plane_a[0x1000..0x1000 + 768].fill(1);
+        m.plane_b[0x1000..0x1000 + 768].fill(1);
+        m.clut[1] = 0x00FF_1010; // Plane A: red
+        m.clut[129] = 0x0010_FF10; // Plane B (CLUT bank 2): green
+        m.set_register::<0>(0xDB, 63);
+        m.set_register::<1>(0xDC, 63);
+
+        // DVC active window only covers x=32..735; outer strips have external_video_present = false.
+        m.external_video_present.fill(false);
+        m.external_video_present[32..736].fill(true);
+        m.external_video_line.fill(0xFF00_0000);
+        m.external_video_line[32..736].fill(0xFF12_3456);
+
+        let y_off = (SCREEN_HEIGHT.saturating_sub(m.effective_active_scanlines() * 2)) / 2;
+        let row_start = y_off * SCREEN_WIDTH;
+
+        // Case 1: Horizontal wipe (Plane A = TCR_MF0, Plane B = opaque 0x08).
+        // Matte switches MF0 = 1 at x = 0x2C0 (704); x=736..767 must uncover Plane B, not stay Plane A.
+        m.set_register::<0>(0xC1, 0x0080_0800 | (TCR_MF0 as u32));
+        m.set_register::<0>(0xD0, 0x9002C0);
+        m.render_scanline(0);
+        let row = &m.framebuffer[row_start..row_start + 768];
+        let red_left = (row[700] >> 16) & 0xFF;
+        let green_mid = (row[720] >> 8) & 0xFF;
+        let green_edge = (row[750] >> 8) & 0xFF;
+        assert!(red_left > 150 && ((row[700] >> 8) & 0xFF) < 40, "x=700 should stay Plane A red: {:#010X}", row[700]);
+        assert_eq!(row[750], row[720], "x=750 outside DVC window must match Plane B at x=720");
+        assert!(green_mid > 150 && green_edge > 150, "x=750 should uncover Plane B green: {:#010X}", row[750]);
+
+        // Case 2: Full-screen matte for FMV (both planes = TCR_MF0, MF0 = 1 across 0..766).
+        // Outer DVC border x=0..31 and x=736..766 must show DVC border (black), not Plane A/B graphics.
+        m.set_vsr::<0>(0x1000);
+        m.set_vsr::<1>(0x1000);
+        m.set_register::<0>(0xC1, 0x0080_0000 | ((TCR_MF0 as u32) << 8) | (TCR_MF0 as u32));
+        m.set_register::<0>(0xD0, 0x900000);
+        m.set_register::<0>(0xD1, 0x8002FF);
+        m.render_scanline(0);
+        let row = &m.framebuffer[row_start..row_start + 768];
+        assert_eq!(row[10], 0xFF00_0000);
+        assert_eq!(row[384], 0xFF12_3456);
+        assert_eq!(row[750], 0xFF00_0000);
     }
 }
 
