@@ -136,6 +136,17 @@ La libreria `opencdi_libretro.dll` (o `.so` su Linux) viene generata in `target/
 
 ---
 
+## Timing Video e Frequenze di Refresh
+
+OpenCDi calcola le frequenze di riga e di quadro a partire dai clock hardware dell'MCD-212 (`960` cicli CPU per scanline, `75` settori CD/s). Per configurare risoluzioni personalizzate CRT / VRR / RetroArch, i valori di riferimento sono:
+
+| Standard | Clock CPU (`XTAL / 2`) | Scanline (Attive + VBlank) | Freq. Orizzontale | Freq. Verticale Esatta / Libretro | Pacing Standalone |
+|---|---|---|---|---|---|
+| **PAL** | `15.000.000 Hz` (`30 MHz / 2`) | `312` (`280 + 32`) | `15.625,00 Hz` | **`50.0801 Hz`** (`15.000.000 / 299.520`) | `50.00 Hz` (`20.00 ms`) |
+| **NTSC** | `15.104.900 Hz` (`30.2098 MHz / 2`) | `262` (`240 + 22`) | `15.734,27 Hz` | **`60.0543 Hz`** (`75 × 201.398 / 251.520`)* | `60.00 Hz` (`16.67 ms`) |
+
+*\*Il rapporto grezzo del quarzo NTSC è `15.104.900 / 251.520 = 60.0545 Hz`; il core Libretro espone `60.0543 Hz` (`audio::frame_rate`) per mantenere sincronizzato ogni quadro video con il clock audio dei settori CD a `44.100 Hz`. L'uscita nativa è `768×560` (o `720×560` senza bit `CF`, con raddoppio di riga sulle scanline attive).*
+
 ---
 
 ## Team del Progetto & Crediti

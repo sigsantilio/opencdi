@@ -139,6 +139,17 @@ The dynamic library `opencdi_libretro.dll` (or `.so` on Linux) will be generated
 
 ---
 
+## Video Timing & Exact Refresh Rates
+
+OpenCDi derives scanline and field timing from the Philips CD-i MCD-212 clocks (`960` CPU cycles per scanline, `75` CD sectors/s). For custom CRT / VRR / RetroArch display modes, use the following rates:
+
+| Standard | CPU Clock (`XTAL / 2`) | Scanlines (Active + VBlank) | Horizontal Rate | Exact / Libretro Field Rate | Standalone Pacing |
+|---|---|---|---|---|---|
+| **PAL** | `15,000,000 Hz` (`30 MHz / 2`) | `312` (`280 + 32`) | `15,625.00 Hz` | **`50.0801 Hz`** (`15,000,000 / 299,520`) | `50.00 Hz` (`20.00 ms`) |
+| **NTSC** | `15,104,900 Hz` (`30.2098 MHz / 2`) | `262` (`240 + 22`) | `15,734.27 Hz` | **`60.0543 Hz`** (`75 × 201,398 / 251,520`)* | `60.00 Hz` (`16.67 ms`) |
+
+*\*Raw NTSC crystal ratio is `15,104,900 / 251,520 = 60.0545 Hz`; the Libretro core reports `60.0543 Hz` (`audio::frame_rate`) so each emulated video field aligns with the `44,100 Hz` CD sector audio clock. Native resolution output is `768×560` (or `720×560` without `CF`, line-doubled from active lines).*
+
 ---
 
 ## Project Team & Credits
