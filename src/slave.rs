@@ -296,12 +296,16 @@ impl SlaveHle {
                     }
                 } else if ch.in_index == ch.in_count {
                     if (ch.in_buf[0] & 0xF0) == 0xC0 {
+                        // cdapdriv encodes the 4 mute flags (bit 7 of LL, LR, RR, RL) into bits 3..0
+                        // of the 0xC0..0xCF command byte and masks the 4 payload bytes with 0x7F.
+                        let mute_mask = ch.in_buf[0] & 0x0F;
                         for i in 0..4 {
-                            let idx = ch.in_buf[i + 1] as usize;
-                            self.attenuation[i] = if idx < ATTENUATION_TABLE.len() {
-                                ATTENUATION_TABLE[idx]
-                            } else {
+                            let muted = (mute_mask & (1 << (3 - i))) != 0;
+                            let idx = (ch.in_buf[i + 1] & 0x7F) as usize;
+                            self.attenuation[i] = if muted || idx >= ATTENUATION_TABLE.len() {
                                 0
+                            } else {
+                                ATTENUATION_TABLE[idx]
                             };
                         }
                     }
@@ -525,5 +529,31 @@ mod tests {
         assert!(s.irq_pending, "release packet promoted with IRQ");
         let b0_up = read_byte(&mut s);
         assert_eq!(b0_up & 0x38, 0x08, "second packet must deliver button release");
+    }
+
+    #[test]
+    fn ch2_attenuation_honors_mute_bits_in_command_nibble() {
+        let mut s = SlaveHle::new();
+        let send = |slave: &mut SlaveHle, pkt: [u8; 5]| {
+            for b in pkt {
+                slave.write(4, b as u16);
+            }
+        };
+
+        // SS_Atten(0x00800080) -> LL=0dB, LR=mute, RR=0dB, RL=mute -> cmd=0xC5, payload=[0,0,0,0]
+        send(&mut s, [0xC5, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(s.attenuation, [0xFF, 0, 0xFF, 0]);
+
+        // SS_Atten(0x01800180) -> LL=-1dB (0xE4), LR=mute, RR=-1dB (0xE4), RL=mute
+        send(&mut s, [0xC5, 0x01, 0x00, 0x01, 0x00]);
+        assert_eq!(s.attenuation, [0xE4, 0, 0xE4, 0]);
+
+        // SS_Atten(0x80808080) -> all 4 paths muted -> cmd=0xCF, payload=[0,0,0,0]
+        send(&mut s, [0xCF, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(s.attenuation, [0, 0, 0, 0]);
+
+        // Unmuted cross-mix -> cmd=0xC0, payload=[0, 6, 0, 6]
+        send(&mut s, [0xC0, 0x00, 0x06, 0x00, 0x06]);
+        assert_eq!(s.attenuation, [0xFF, 0x80, 0xFF, 0x80]);
     }
 }
