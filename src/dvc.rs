@@ -1550,7 +1550,7 @@ impl Dvc {
         if self.demux.program_ends > 0 {
             trace!(">>> [DVC FMV] PROGRAM END (0xB9) IN VIDEO STREAM (fma_dma_seen={})", self.fma_dma_seen);
             self.or_fmv_word(FMV_ISR, FMV_IRQ_EII | FMV_IRQ_ESI);
-            if !self.fma_dma_seen {
+            if !self.fma_dma_seen && (self.audio_enabled || self.audio_armed) {
                 self.or_fma_word(FMA_ISR, FMA_IRQ_EOI);
             }
             self.demux.program_ends = 0;
@@ -1559,8 +1559,10 @@ impl Dvc {
         // Check for program end in audio stream
         if self.fma_demux.program_ends > 0 {
             trace!(">>> [DVC FMA] PROGRAM END (0xB9) IN AUDIO STREAM");
-            self.or_fma_word(FMA_ISR, FMA_IRQ_EOI);
-            self.or_fma_word(0x02, FMA_IRQ_EOI);
+            if self.audio_enabled || self.audio_armed {
+                self.or_fma_word(FMA_ISR, FMA_IRQ_EOI);
+                self.or_fma_word(0x02, FMA_IRQ_EOI);
+            }
             self.fma_demux.program_ends = 0;
         }
 
@@ -1618,7 +1620,7 @@ impl Dvc {
     // Decode events reach the ISR and status words on the next 1/75 s tick.
     fn fma_tick(&mut self) {
         let bits = std::mem::take(&mut self.fma_pending);
-        if bits != 0 {
+        if bits != 0 && (self.audio_enabled || self.audio_armed) {
             self.or_fma_word(FMA_ISR, bits);
             if (bits & FMA_IRQ_PLAY) != 0 {
                 self.or_fma_word(0x02, FMA_IRQ_PLAY);
@@ -1992,7 +1994,7 @@ impl Dvc {
                 if sequence_ended {
                     trace!(">>> [DVC] END OF SEQUENCE (seq_end) after {} frames", self.frames_decoded_count);
                     self.or_fmv_word(FMV_ISR, FMV_IRQ_EOD | FMV_IRQ_ESI);
-                    if !self.fma_dma_seen {
+                    if !self.fma_dma_seen && (self.audio_enabled || self.audio_armed) {
                         self.or_fma_word(FMA_ISR, FMA_IRQ_EOI);
                     }
                     self.set_fmv_word(0x5C, 0x0000); // Return display status to idle
@@ -2531,6 +2533,44 @@ mod timing_tests {
         assert_eq!(d.audio_out.len(), 1);
         assert!(d.fma_started && !d.audio_stopped && d.audio_enabled);
         assert_eq!(d.dclk, 1234);
+    }
+
+    #[test]
+    fn video_end_does_not_latch_fma_eoi_when_audio_is_stopped() {
+        // Video-only ISO program end (0xB9) while FMA is stopped/unarmed must notify FMV only.
+        let mut d = Dvc::new();
+        assert!(!d.audio_enabled && !d.audio_armed);
+        d.demux.program_ends = 1;
+        d.process_stream();
+        assert_ne!(d.get_fmv_word(FMV_ISR) & (FMV_IRQ_EII | FMV_IRQ_ESI), 0);
+        assert_eq!(d.get_fma_word(FMA_ISR) & FMA_IRQ_EOI, 0);
+
+        // Video sequence_end (0xB7) while FMA is stopped must also leave FMA_ISR clean so a later
+        // SetStt enabling FMA_IER before starting audio does not fire a spurious FMA interrupt.
+        d.acknowledge_fmv_isr();
+        let mut es = vec![0, 0, 1, 0xB3, 0x01, 0x00, 0x10, 0x13, 0xFF, 0xFF, 0xE0, 0x00];
+        es.extend(std::iter::repeat(0).take(32));
+        es.extend([0, 0, 1, 0x00, 0x00, 0x08, 0xFF, 0xF8, 0x90, 0x00]);
+        es.extend([0, 0, 1, 0x01, 0x08, 0x00, 0x00, 0x00]);
+        es.extend([0, 0, 1, 0xB7]);
+        d.video_decoder = Some(Video::new(es));
+        d.video_playing = true;
+        d.video_armed = true;
+        d.decoder_enabled = true;
+        d.frames_decoded_count = 1;
+        for _ in 0..4 {
+            d.on_vsync();
+        }
+        assert_ne!(d.get_fmv_word(FMV_ISR) & (FMV_IRQ_EOD | FMV_IRQ_ESI), 0);
+        assert_eq!(d.get_fma_word(FMA_ISR) & FMA_IRQ_EOI, 0);
+        d.set_fma_word(FMA_IER, FMA_IRQ_EOI);
+        assert!(!d.irq_pending());
+
+        // When FMA is armed/playing interleaved audio (!fma_dma_seen), program end still signals EOI.
+        let mut d_av = dvc();
+        d_av.demux.program_ends = 1;
+        d_av.process_stream();
+        assert_ne!(d_av.get_fma_word(FMA_ISR) & FMA_IRQ_EOI, 0);
     }
 }
 
