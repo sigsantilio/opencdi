@@ -9,6 +9,22 @@ L'obiettivo del progetto è preservare e rendere fruibile l'intera libreria soft
 
 ---
 
+## Novità Versione 0.4.1
+
+- **Accuratezza CD-i Ready, CUE Multi-Traccia & CD-DA su CHD**:
+  - Supporto completo ai **dischi ibridi CD-i Ready / Red Book** (es. *Pavarotti*, *Steel Machine*): parsing accurato dei pregap `INDEX 00/01`, `PREGAP` virtuali, Q-subcode Index 00/01 e tabelle TOC complete su Mono-I CDIC e Mono-IV CIAP (risolve #77).
+  - Parsing completo dei metadati **CHD `CHT2`/`CHTR` multi-traccia**, padding a 4 unità e byte-swap automatico delle tracce CD-DA `TYPE:AUDIO` in big-endian (risolve #78).
+  - Scarto dei settori gap/pad non Mode 2 durante `Read Mode 2` (`0x2A`) sul CDIC, risolvendo il loop musicale del Livello 6 in *Tetris* (risolve #76).
+- **Attenuazione Audio Slave MCU & Separazione Stereo**:
+  - Corretto il decoding del comando Slave Channel 2 `0xC0..0xCF` per rispettare i 4 bit di mute codificati da `cdapdriv` nei bit `3..0` del byte di comando, ripristinando la separazione stereo e risolvendo il clipping +6 dB e il mute rotto su titoli Mono-I (tra cui *Steel Machine*).
+- **Accuratezza Interrupt FMA DVC (*Mad Dog McCree*)**:
+  - Impedito il latch spurio di `FMA_IRQ_EOI` al termine di flussi solo video (`0xB9`/`0xB7`) quando l'audio FMA è fermo/non armato, evitando il broadcast `F$Send(0, 0x2001)` di `madriv` che terminava il demone puntatore `cdi_cd_cp` nella modalità Practice di *Mad Dog McCree* (risolve #73).
+- **Interleaving Matte MCD-212, Standalone macOS & Timing Display**:
+  - Esecuzione interleaved ICA/DCA Path 1/0 e matte keying a piena larghezza con `ICM_EV` (*L'albero azzurro*, bersagli *Mad Dog McCree*).
+  - Supporto app standalone nativa macOS e documentazione dei refresh rate esatti PAL/NTSC.
+
+---
+
 ## Novità Versione 0.4.0
 
 - **Perfezionamento Engine MPEG-1 / DVC**:

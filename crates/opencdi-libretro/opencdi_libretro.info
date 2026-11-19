@@ -5,7 +5,7 @@ supported_extensions = "cue|chd|bin|iso"
 corename = "OpenCDI"
 license = "MIT"
 permissions = ""
-display_version = "0.4.0"
+display_version = "0.4.1"
 categories = "Emulator"
 
 # Hardware Information

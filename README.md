@@ -12,6 +12,22 @@ The goal of the project is to accurately preserve and run the complete software 
 
 ---
 
+## What's New in Version 0.4.1
+
+- **CD-i Ready, Multi-Track CUE & CHD CD-DA Accuracy**:
+  - Full support for **CD-i Ready / Red Book hybrid discs** (e.g. *Pavarotti*, *Steel Machine*): accurate `INDEX 00/01` pregap parsing, virtual `PREGAP` silence, Q-subcode Index 00/01 reporting, and complete TOC track tables on both Mono-I CDIC and Mono-IV CIAP (fixes #77).
+  - Full **CHD `CHT2`/`CHTR` multi-track parsing**, 4-unit track padding, and automatic big-endian byte-swapping for Red Book `TYPE:AUDIO` tracks (fixes #78).
+  - Skip non-Mode 2 gap/pad sectors during CDIC `Read Mode 2` (`0x2A`) playback, resolving the Level 6 music loop in *Tetris* (fixes #76).
+- **Slave MCU Audio Attenuation & Stereo Integrity**:
+  - Fixed Slave Channel 2 `0xC0..0xCF` attenuation command decoding to honor the 4 channel mute bits packed by `cdapdriv` in bits `3..0` of the command byte, restoring clean stereo separation and preventing cross-channel +6 dB clipping and broken mute on Mono-I titles (*Steel Machine* and others).
+- **DVC FMA Interrupt Accuracy (*Mad Dog McCree*)**:
+  - Guarded `FMA_IRQ_EOI` latching on video-only `0xB9`/`0xB7` stream end when FMA audio is stopped/unarmed, preventing `madriv` from broadcasting `F$Send(0, 0x2001)` and terminating the `cdi_cd_cp` pointer daemon in *Mad Dog McCree* Practice mode (fixes #73).
+- **MCD-212 Matte Interleaving, macOS Standalone & Display Timing**:
+  - Interleaved Path 1/0 ICA & DCA execution with full-width matte keying under `ICM_EV` (*L'albero azzurro*, *Mad Dog McCree* targets).
+  - Native macOS standalone app support (menu bar, file dialogs, per-user data directory) and documented exact PAL/NTSC vertical refresh rates.
+
+---
+
 ## What's New in Version 0.4.0
 
 - **MPEG-1 / DVC Engine Overhaul**:
