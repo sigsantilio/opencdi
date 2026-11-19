@@ -477,15 +477,23 @@ impl Ciap {
         }
     }
 
-    // Q locator of a delivered sector in the Q-reporting modes: control/ADR, track, index 1, track-relative time, 0, absolute time (LBA plus 150), all BCD; current Q buffer, ISR bit 2.
+    // Q locator of a delivered sector in the Q-reporting modes: control/ADR, track, index (0 pregap / 1 data), track-relative time, 0, absolute time (LBA plus 150), all BCD; current Q buffer, ISR bit 2.
     fn q_locator(&mut self, cd: &CdRom, lba: u32) {
         let bcd = |v: u32| (((v / 10) << 4) | (v % 10)) as u8;
         let msf = |f: u32| [bcd(f / 4500), bcd(f / 75 % 60), bcd(f % 75)];
-        let t = cd.tracks.iter().rev().find(|t| t.start_lba <= lba);
-        let (ctrl, num, start) = t.map_or((0x41, 1, 0), |t| ((t.control & 0xF0) | 0x01, t.number as u32, t.start_lba));
-        let (r, a) = (msf(lba - start), msf(lba + 150));
+        let (ctrl, num, index, rel_frames) = if let Some(t) = cd.track_at_lba(lba) {
+            let (idx, rel) = if lba < t.start_lba {
+                (0x00, t.start_lba - lba)
+            } else {
+                (0x01, lba - t.start_lba)
+            };
+            ((t.control & 0xF0) | 0x01, t.number as u32, idx, rel)
+        } else {
+            (0x41, 1, 0x01, lba)
+        };
+        let (r, a) = (msf(rel_frames), msf(lba + 150));
         let at = if self.reg(REG_BMAN) & 0x10 != 0 { 0x1B24 } else { 0x24E6 };
-        self.ram[at..at + 10].copy_from_slice(&[ctrl, bcd(num), 0x01, r[0], r[1], r[2], 0x00, a[0], a[1], a[2]]);
+        self.ram[at..at + 10].copy_from_slice(&[ctrl, bcd(num), index, r[0], r[1], r[2], 0x00, a[0], a[1], a[2]]);
         self.set(REG_ISR, self.reg(REG_ISR) | 0x0004);
         self.q_reports += 1;
     }

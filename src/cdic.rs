@@ -688,20 +688,56 @@ impl Cdic {
     fn track_q_fields(&self, cd: &CdRom) -> [u8; 12] {
         let real_lba = self.curr_lba + 150;
         let bcd = |v: u32| (((v / 10) << 4) | (v % 10)) as u8;
-        let (cur_track_num, cur_track_ctrl, rel_lba) = if let Some(t) = cd.tracks.iter().find(|t| self.curr_lba >= t.start_lba && self.curr_lba < t.start_lba + t.length_sectors) {
-            (t.number, t.control, self.curr_lba - t.start_lba)
+        let (cur_track_num, cur_track_ctrl, index, rel_lba) = if let Some(t) = cd.track_at_lba(self.curr_lba) {
+            if self.curr_lba < t.start_lba {
+                (t.number, t.control, 0x00, t.start_lba - self.curr_lba)
+            } else {
+                (t.number, t.control, 0x01, self.curr_lba - t.start_lba)
+            }
         } else {
-            (1, 0x41, self.curr_lba)
+            (1, 0x41, 0x01, self.curr_lba)
         };
         [
             cur_track_ctrl, // Control
             bcd(cur_track_num as u32), // Track
-            0x01, // Index
+            index, // Index (0x00 in pregap, 0x01 in track body)
             bcd(rel_lba / (60 * 75)), bcd((rel_lba / 75) % 60), bcd(rel_lba % 75), // Track relative MSF
             0x00,
             bcd(real_lba / (60 * 75)), bcd((real_lba / 75) % 60), bcd(real_lba % 75), // Absolute disc MSF
             0xFF, 0xFF, // CRC (init)
         ]
+    }
+
+    fn build_toc_packets(cd: &CdRom) -> Vec<[u8; 5]> {
+        let bcd = |v: u32| (((v / 10) << 4) | (v % 10)) as u8;
+        let total_abs = cd.total_sectors + 150;
+        let total_mins = total_abs / (60 * 75);
+        let total_secs = (total_abs / 75) % 60;
+        let total_frac = total_abs % 75;
+
+        let first_track = cd.tracks.first().map(|t| t.number).unwrap_or(1);
+        let last_track = cd.tracks.last().map(|t| t.number).unwrap_or(1);
+        let first_ctrl = cd.tracks.first().map(|t| t.control).unwrap_or(0x41);
+        let last_ctrl = cd.tracks.last().map(|t| t.control).unwrap_or(0x41);
+
+        let mut toc_packets: Vec<[u8; 5]> = Vec::with_capacity(3 + cd.tracks.len());
+        // Packet A0: First track, Disc type = 0x10 (CD-i / CD-i Ready), 0x20 (CD-ROM XA / Video CD), or 0x00 (CD-DA)
+        toc_packets.push([first_ctrl, 0xA0, bcd(first_track as u32), cd.disc_type, 0x00]);
+        // Packet A1: Last track
+        toc_packets.push([last_ctrl, 0xA1, bcd(last_track as u32), 0x00, 0x00]);
+        // Packet A2: Lead-out (absolute disc MSF = total_sectors + 150)
+        toc_packets.push([last_ctrl, 0xA2, bcd(total_mins), bcd(total_secs), bcd(total_frac)]);
+
+        // Track start packets (INDEX 01): [Control, Point, PMIN, PSEC, PFRAC]
+        for t in &cd.tracks {
+            let start_abs = t.start_lba + 150;
+            let tm = start_abs / (60 * 75);
+            let ts = (start_abs / 75) % 60;
+            let tf = start_abs % 75;
+            toc_packets.push([t.control, bcd(t.number as u32), bcd(tm), bcd(ts), bcd(tf)]);
+        }
+
+        toc_packets
     }
 
     fn add_q_crc(subcode: &mut [u8; 12]) {
@@ -788,8 +824,12 @@ impl Cdic {
                 }
             }
 
-            // Mode 2 sector filtering
-            if sector_buf[15] == 2 && self.disc_mode == 2 {
+            // Mode 2 sector filtering (Command 0x2A only delivers Mode 2 sectors; skip non-Mode 2 gap/pad sectors)
+            if self.disc_mode == 2 {
+                if sector_buf[15] != 2 {
+                    debug!("CDIC Read Mode 2 skipped non-Mode 2 sector: LBA={}, mode=0x{:02X}", self.curr_lba, sector_buf[15]);
+                    return;
+                }
                 let is_audio_sel = self.is_mode2_audio_selected(&sector_buf);
                 let is_sector_sel = self.is_mode2_sector_selected(&sector_buf);
 
@@ -830,40 +870,7 @@ impl Cdic {
         let frac_bcd = ((frac / 10) << 4) | (frac % 10);
 
         let mut subcode = if is_toc {
-            let total_sectors = cd.total_sectors;
-            let total_mins = (total_sectors / (60 * 75)) as u8;
-            let total_secs = ((total_sectors / 75) % 60) as u8;
-            let total_frac = (total_sectors % 75) as u8;
-            let tot_mins_bcd = ((total_mins / 10) << 4) | (total_mins % 10);
-            let tot_secs_bcd = ((total_secs / 10) << 4) | (total_secs % 10);
-            let tot_frac_bcd = ((total_frac / 10) << 4) | (total_frac % 10);
-
-            let first_track = cd.tracks.first().map(|t| t.number).unwrap_or(1);
-            let last_track = cd.tracks.last().map(|t| t.number).unwrap_or(1);
-            let first_bcd = ((first_track / 10) << 4) | (first_track % 10);
-            let last_bcd = ((last_track / 10) << 4) | (last_track % 10);
-
-            let mut toc_packets: Vec<[u8; 5]> = Vec::with_capacity(3 + cd.tracks.len());
-            // Packet A0: First track = 1, Disc type = 0x10 (CD-i) or 0x20 (CD-ROM XA / Video CD)
-            toc_packets.push([0x41, 0xA0, first_bcd, cd.disc_type, 0x00]);
-            // Packet A1: Last track
-            toc_packets.push([0x41, 0xA1, last_bcd, 0x00, 0x00]);
-            // Packet A2: Lead-out
-            toc_packets.push([0x41, 0xA2, tot_mins_bcd, tot_secs_bcd, tot_frac_bcd]);
-
-            // Track start packets: [Control, Point, PMIN, PSEC, PFRAC]
-            for t in &cd.tracks {
-                let start_abs = t.start_lba + 150;
-                let tm = (start_abs / (60 * 75)) as u8;
-                let ts = ((start_abs / 75) % 60) as u8;
-                let tf = (start_abs % 75) as u8;
-                let tm_bcd = ((tm / 10) << 4) | (tm % 10);
-                let ts_bcd = ((ts / 10) << 4) | (ts % 10);
-                let tf_bcd = ((tf / 10) << 4) | (tf % 10);
-                let num_bcd = ((t.number / 10) << 4) | (t.number % 10);
-                toc_packets.push([t.control, num_bcd, tm_bcd, ts_bcd, tf_bcd]);
-            }
-
+            let toc_packets = Self::build_toc_packets(cd);
             let pkt_idx = ((self.curr_lba as usize) / 3) % toc_packets.len();
             let toc_data = toc_packets[pkt_idx];
 
@@ -1266,5 +1273,128 @@ mod tests {
         c.write_reg(0x3FE, 0x0001);
         assert!(!c.irq_pending);
         assert_eq!(c.read_reg(0x3F6), 0x8000);
+    }
+
+    #[test]
+    fn cdi_ready_subcode_q_reports_pregap_index0_and_toc_idx01() {
+        let dir = std::env::temp_dir().join("opencdi_test_cdi_ready_cdic");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut bin = vec![0u8; 32 * crate::cdrom::CD_SECTOR_RAW_SIZE];
+        let pvd = &mut bin[16 * crate::cdrom::CD_SECTOR_RAW_SIZE..(16 + 1) * crate::cdrom::CD_SECTOR_RAW_SIZE];
+        pvd[0..12].copy_from_slice(&crate::cdrom::CD_SYNC_HEADER);
+        pvd[15] = 2;
+        pvd[24..24 + 7].copy_from_slice(b"\x01CD-I  ");
+        pvd[24 + 8..24 + 15].copy_from_slice(b"CD-RTOS");
+        std::fs::write(dir.join("ready.bin"), &bin).unwrap();
+        std::fs::write(
+            dir.join("ready.cue"),
+            "FILE \"ready.bin\" BINARY\n  TRACK 01 AUDIO\n    INDEX 00 00:00:00\n    INDEX 01 00:00:20\n  TRACK 02 AUDIO\n    INDEX 00 00:00:24\n    INDEX 01 00:00:26\n",
+        )
+        .unwrap();
+
+        let cd = CdRom::open(dir.join("ready.cue")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // TOC packets should list Track 1 at LBA 20 + 150 = 170 (00:02:20) and Track 2 at LBA 26 + 150 = 176 (00:02:26)
+        let toc = Cdic::build_toc_packets(&cd);
+        assert_eq!(toc.len(), 5);
+        assert_eq!(toc[0], [0x01, 0xA0, 0x01, 0x10, 0x00]); // Track 1 audio, CD-i Ready disc_type=0x10
+        assert_eq!(toc[1], [0x01, 0xA1, 0x02, 0x00, 0x00]);
+        assert_eq!(toc[2], [0x01, 0xA2, 0x00, 0x02, 0x32]); // 32 + 150 = 182 frames = 00:02:32
+        assert_eq!(toc[3], [0x01, 0x01, 0x00, 0x02, 0x20]); // Track 1 INDEX 01
+        assert_eq!(toc[4], [0x01, 0x02, 0x00, 0x02, 0x26]); // Track 2 INDEX 01
+
+        let mut c = Cdic::new();
+        // Inside Track 1 pregap (LBA 16): Index 00, countdown = 20 - 16 = 4 frames
+        c.curr_lba = 16;
+        let q_pregap1 = c.track_q_fields(&cd);
+        assert_eq!(q_pregap1[0..6], [0x01, 0x01, 0x00, 0x00, 0x00, 0x04]);
+
+        // Inside Track 2 pregap (LBA 24): Index 00, Track 2, countdown = 2 frames
+        c.curr_lba = 24;
+        let q_pregap2 = c.track_q_fields(&cd);
+        assert_eq!(q_pregap2[0..6], [0x01, 0x02, 0x00, 0x00, 0x00, 0x02]);
+
+        // Track 2 INDEX 01 (LBA 27): Index 01, Track 2, rel = 1 frame
+        c.curr_lba = 27;
+        let q_t2 = c.track_q_fields(&cd);
+        assert_eq!(q_t2[0..6], [0x01, 0x02, 0x01, 0x00, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn read_mode2_skips_non_mode2_gap_sectors() {
+        let dir = std::env::temp_dir().join(format!("opencdi-mode2-skip-nonm2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let make_hdr = |sec: &mut [u8], lba: u32, mode: u8| {
+            let abs = lba + 150;
+            let bcd = |v: u32| (((v / 10) << 4) | (v % 10)) as u8;
+            sec[0..12].copy_from_slice(&crate::cdrom::CD_SYNC_HEADER);
+            sec[12] = bcd(abs / (60 * 75));
+            sec[13] = bcd((abs / 75) % 60);
+            sec[14] = bcd(abs % 75);
+            sec[15] = mode;
+        };
+
+        let mut s0 = [0u8; 2352];
+        make_hdr(&mut s0, 0, 2);
+        for base in [16usize, 20] {
+            s0[base] = 0x01;
+            s0[base + 1] = 0x00;
+            s0[base + 2] = 0x62; // RT + Form 2 + Video
+            s0[base + 3] = 0x04;
+        }
+        s0[24] = 0x11;
+
+        // Sector 1: Mode 1 0x55-filled mastering gap (matches LBA 170713 in Tetris)
+        let mut s1 = [0x55u8; 2352];
+        make_hdr(&mut s1, 1, 1);
+
+        let mut s2 = [0u8; 2352];
+        make_hdr(&mut s2, 2, 2);
+        for base in [16usize, 20] {
+            s2[base] = 0x01;
+            s2[base + 1] = 0x01;
+            s2[base + 2] = 0x64; // RT + Form 2 + Audio
+            s2[base + 3] = 0x05;
+        }
+
+        let mut bin = Vec::with_capacity(2352 * 3);
+        bin.extend_from_slice(&s0);
+        bin.extend_from_slice(&s1);
+        bin.extend_from_slice(&s2);
+        std::fs::write(dir.join("gap.bin"), &bin).unwrap();
+        std::fs::write(dir.join("gap.cue"), "FILE \"gap.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n").unwrap();
+        let mut cd = Some(CdRom::open(dir.join("gap.cue")).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut c = Cdic::new();
+        c.file = 0x0100;
+        c.channel = 0xFFFF_FFFF;
+        c.audio_channel = 1 << 1;
+        c.write_reg(0x00, 0x2A);
+        c.write_reg(0x02, 0x0002); // MSF 00:02:00 -> LBA 0
+        c.write_reg(0x04, 0x0000);
+        c.write_reg(0x3FE, 0xC000); // Execute Read Mode 2 (DBUF IRQ4 enabled)
+
+        // Sector 0 (Mode 2 selected): delivered with XBUF + IRQ4
+        c.step_cycles(CD_SECTOR, CD_SECTOR, &mut cd);
+        assert_ne!(c.read_reg(0x3F6) & 0x8000, 0);
+        assert!(!c.irq_pending);
+
+        // Sector 1 (Mode 1 0x55 gap): must be skipped without delivering into XBUF/IRQ4 or stopping read
+        c.step_cycles(CD_SECTOR, CD_SECTOR, &mut cd);
+        assert_eq!(c.x_buffer & 0x8000, 0);
+        assert!(!c.irq_pending);
+        assert_eq!(c.disc_command, 0x2A);
+
+        // Sector 2 (Mode 2 audio): stream continues cleanly and decodes audio
+        c.step_cycles(CD_SECTOR, CD_SECTOR, &mut cd);
+        assert_ne!(c.x_buffer & 0x8000, 0);
+        assert!(c.irq_pending);
+        assert_eq!(c.audio.total_sectors_decoded, 1);
     }
 }

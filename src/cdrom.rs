@@ -8,6 +8,7 @@ pub const CD_SECTOR_RAW_SIZE: usize = 2352;
 pub const CD_SUBCHANNEL_SIZE: usize = 96;
 pub const CD_FRAME_SIZE: usize = CD_SECTOR_RAW_SIZE + CD_SUBCHANNEL_SIZE; // 2448
 pub const CD_SCRAMBLE_SIZE: usize = 2340;
+pub const CD_TRACK_PADDING: u32 = 4;
 pub const CD_SYNC_HEADER: [u8; 12] = [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00];
 
 static CD_SCRAMBLE_TABLE: std::sync::LazyLock<[u8; CD_SCRAMBLE_SIZE]> = std::sync::LazyLock::new(|| {
@@ -43,12 +44,24 @@ pub fn maybe_descramble_sector(sector: &mut [u8; CD_SECTOR_RAW_SIZE]) {
 #[derive(Clone, Debug)]
 pub struct CdTrack {
     pub number: u8,
-    pub control: u8,      // 0x41 for Data, 0x01 for Audio
-    pub start_lba: u32,
-    pub length_sectors: u32,
+    pub control: u8,            // 0x41 for Data, 0x01 for Audio
+    pub pregap_start_lba: u32,  // Disc LBA where INDEX 00 starts (== start_lba if no pregap)
+    pub start_lba: u32,         // Disc LBA where INDEX 01 starts (reported in TOC)
+    pub length_sectors: u32,    // Sectors from INDEX 01 to end of track
+    pub source_start_lba: u32,  // Disc LBA where stored sectors begin (> pregap_start_lba for virtual zero PREGAP)
+    pub stored_sectors: u32,    // Number of sectors physically present in backing image/CHD
+    pub total_sectors: u32,     // Total disc LBA span covered by this track (pregap + stored + postgap)
     pub sector_size: usize,
     pub file_index: usize,
     pub file_offset: u64,
+    pub chd_unit_start: u32,    // Physical CHD unit index of stored sector 0 (tracks padded to CD_TRACK_PADDING)
+    pub chd_audio_swap: bool,   // CHD TYPE:AUDIO / VAUDIO frames are stored in big-endian 16-bit order
+}
+
+impl CdTrack {
+    pub fn contains_lba(&self, lba: u32) -> bool {
+        lba >= self.pregap_start_lba && lba < self.pregap_start_lba + self.total_sectors
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -207,6 +220,241 @@ fn parse_msf(s: &str) -> Option<u32> {
     Some(m * 60 * 75 + s * 75 + f)
 }
 
+#[derive(Clone, Debug)]
+struct CueTrackDef {
+    num: u8,
+    control: u8,
+    sector_size: usize,
+    file_index: usize,
+    pregap_sectors: u32,
+    postgap_sectors: u32,
+    idx00: Option<u32>,
+    idx01: u32,
+    has_idx01: bool,
+}
+
+fn parse_cue_sheet(content: &str) -> (Vec<String>, Vec<CueTrackDef>) {
+    let mut file_names: Vec<String> = Vec::new();
+    let mut parsed_tracks: Vec<CueTrackDef> = Vec::new();
+    let mut current_file_idx: Option<usize> = None;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("REM") {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        if parts.is_empty() {
+            continue;
+        }
+
+        if parts[0].eq_ignore_ascii_case("FILE") {
+            let fname = if let (Some(start), Some(end)) = (trimmed.find('"'), trimmed.rfind('"')) {
+                if end > start { Some(&trimmed[start + 1..end]) } else { None }
+            } else {
+                parts.get(1).copied()
+            };
+            if let Some(name) = fname {
+                file_names.push(name.to_string());
+                current_file_idx = Some(file_names.len() - 1);
+            }
+        } else if parts[0].eq_ignore_ascii_case("TRACK") {
+            if parts.len() >= 3 {
+                let tnum: u8 = parts[1].parse().unwrap_or(1);
+                let mode = parts[2].to_uppercase();
+                let control = if mode.starts_with("AUDIO") { 0x01 } else { 0x41 };
+                let sector_size = if mode.contains("2048") { 2048 } else { CD_SECTOR_RAW_SIZE };
+                let fidx = current_file_idx.unwrap_or(0);
+                parsed_tracks.push(CueTrackDef {
+                    num: tnum,
+                    control,
+                    sector_size,
+                    file_index: fidx,
+                    pregap_sectors: 0,
+                    postgap_sectors: 0,
+                    idx00: None,
+                    idx01: 0,
+                    has_idx01: false,
+                });
+            }
+        } else if parts[0].eq_ignore_ascii_case("PREGAP") {
+            if let (Some(t), Some(sectors)) = (parsed_tracks.last_mut(), parts.get(1).and_then(|s| parse_msf(s))) {
+                t.pregap_sectors = sectors;
+            }
+        } else if parts[0].eq_ignore_ascii_case("POSTGAP") {
+            if let (Some(t), Some(sectors)) = (parsed_tracks.last_mut(), parts.get(1).and_then(|s| parse_msf(s))) {
+                t.postgap_sectors = sectors;
+            }
+        } else if parts[0].eq_ignore_ascii_case("INDEX") {
+            if parts.len() >= 3 {
+                if let (Some(t), Some(sectors)) = (parsed_tracks.last_mut(), parse_msf(parts[2])) {
+                    if parts[1] == "00" || parts[1] == "0" {
+                        t.idx00 = Some(sectors);
+                    } else if parts[1] == "01" || parts[1] == "1" {
+                        t.idx01 = sectors;
+                        t.has_idx01 = true;
+                    }
+                }
+            }
+        }
+    }
+
+    for t in &mut parsed_tracks {
+        if !t.has_idx01 {
+            if let Some(i00) = t.idx00 {
+                t.idx01 = i00;
+            }
+        }
+    }
+
+    (file_names, parsed_tracks)
+}
+
+fn build_cue_tracks(parsed_tracks: &[CueTrackDef], file_sizes: &[u64]) -> (Vec<CdTrack>, u32) {
+    let mut tracks: Vec<CdTrack> = Vec::with_capacity(parsed_tracks.len());
+    let mut current_disc_lba = 0u32;
+    let mut current_file_idx: Option<usize> = None;
+    let mut file_base_disc_lba = 0u32;
+    let mut file_synth_gap = 0u32;
+
+    for (i, pt) in parsed_tracks.iter().enumerate() {
+        let fsize = file_sizes.get(pt.file_index).copied().unwrap_or(0);
+        let file_sectors = (fsize / pt.sector_size as u64) as u32;
+        let start_in_file = pt.idx00.unwrap_or(pt.idx01).min(file_sectors);
+
+        if current_file_idx != Some(pt.file_index) {
+            current_file_idx = Some(pt.file_index);
+            file_base_disc_lba = current_disc_lba;
+            file_synth_gap = 0;
+        }
+
+        let end_in_file = if i + 1 < parsed_tracks.len() && parsed_tracks[i + 1].file_index == pt.file_index {
+            let next = &parsed_tracks[i + 1];
+            next.idx00.unwrap_or(next.idx01).min(file_sectors)
+        } else {
+            file_sectors
+        };
+
+        let stored_sectors = end_in_file.saturating_sub(start_in_file);
+        let pregap_start_lba = current_disc_lba;
+        file_synth_gap += pt.pregap_sectors;
+        let source_start_lba = pregap_start_lba + pt.pregap_sectors;
+        let start_lba = file_base_disc_lba + file_synth_gap + pt.idx01;
+        let track_end_lba = source_start_lba + stored_sectors + pt.postgap_sectors;
+        let total_sectors = track_end_lba.saturating_sub(pregap_start_lba);
+        let length_sectors = track_end_lba.saturating_sub(start_lba);
+
+        tracks.push(CdTrack {
+            number: pt.num,
+            control: pt.control,
+            pregap_start_lba,
+            start_lba,
+            length_sectors,
+            source_start_lba,
+            stored_sectors,
+            total_sectors,
+            sector_size: pt.sector_size,
+            file_index: pt.file_index,
+            file_offset: (start_in_file as u64) * (pt.sector_size as u64),
+            chd_unit_start: 0,
+            chd_audio_swap: false,
+        });
+
+        file_synth_gap += pt.postgap_sectors;
+        current_disc_lba = track_end_lba;
+    }
+
+    (tracks, current_disc_lba)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChdTrackMeta {
+    num: u8,
+    track_type: String,
+    frames: u32,
+    pregap: u32,
+    pregap_in_source: bool,
+    postgap: u32,
+}
+
+fn parse_chd_track_entry(s: &str) -> Option<ChdTrackMeta> {
+    let clean = s.trim_matches(|c: char| c == '\0' || c.is_whitespace() || c == '.');
+    let mut num: Option<u8> = None;
+    let mut track_type = String::new();
+    let mut frames: u32 = 0;
+    let mut pregap: u32 = 0;
+    let mut pgtype = String::new();
+    let mut postgap: u32 = 0;
+
+    for token in clean.split_whitespace() {
+        if let Some((key, val)) = token.split_once(':') {
+            match key {
+                "TRACK" => num = val.parse().ok(),
+                "TYPE" => track_type = val.to_uppercase(),
+                "FRAMES" => frames = val.parse().unwrap_or(0),
+                "PREGAP" => pregap = val.parse().unwrap_or(0),
+                "PGTYPE" => pgtype = val.to_uppercase(),
+                "POSTGAP" => postgap = val.parse().unwrap_or(0),
+                _ => {}
+            }
+        }
+    }
+
+    let num = num?;
+    Some(ChdTrackMeta {
+        num,
+        track_type,
+        frames,
+        pregap,
+        pregap_in_source: pgtype.starts_with('V'),
+        postgap,
+    })
+}
+
+fn build_chd_tracks(entries: &[ChdTrackMeta]) -> (Vec<CdTrack>, u32) {
+    let mut tracks = Vec::with_capacity(entries.len());
+    let mut current_disc_lba = 0u32;
+    let mut current_chd_unit = 0u32;
+
+    for m in entries {
+        let is_audio = m.track_type == "AUDIO";
+        let control = if is_audio { 0x01 } else { 0x41 };
+        let pregap_start_lba = current_disc_lba;
+        let source_start_lba = if m.pregap_in_source {
+            current_disc_lba
+        } else {
+            current_disc_lba + m.pregap
+        };
+        let start_lba = current_disc_lba + m.pregap;
+        let stored_sectors = m.frames;
+        let track_end_lba = source_start_lba + stored_sectors + m.postgap;
+        let total_sectors = track_end_lba.saturating_sub(pregap_start_lba);
+        let length_sectors = track_end_lba.saturating_sub(start_lba);
+
+        tracks.push(CdTrack {
+            number: m.num,
+            control,
+            pregap_start_lba,
+            start_lba,
+            length_sectors,
+            source_start_lba,
+            stored_sectors,
+            total_sectors,
+            sector_size: CD_SECTOR_RAW_SIZE,
+            file_index: 0,
+            file_offset: 0,
+            chd_unit_start: current_chd_unit,
+            chd_audio_swap: is_audio,
+        });
+
+        current_disc_lba = track_end_lba;
+        let padded_frames = (m.frames + (CD_TRACK_PADDING - 1)) & !(CD_TRACK_PADDING - 1);
+        current_chd_unit += padded_frames;
+    }
+
+    (tracks, current_disc_lba)
+}
+
 impl CdRom {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let path_ref = path.as_ref();
@@ -226,130 +474,41 @@ impl CdRom {
 
         if ext == "cue" {
             let content = std::fs::read_to_string(path_ref)?;
-            let mut files: Vec<File> = Vec::new();
-            let mut file_sizes: Vec<u64> = Vec::new();
+            let (file_names, parsed_tracks) = parse_cue_sheet(&content);
 
-            struct ParsedTrack {
-                num: u8,
-                control: u8,
-                sector_size: usize,
-                file_index: usize,
-                idx01: u32,
-            }
-            let mut parsed_tracks: Vec<ParsedTrack> = Vec::new();
-            let mut current_file_idx: Option<usize> = None;
-
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed.starts_with('#') {
-                    continue;
-                }
-                let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                if parts.is_empty() {
-                    continue;
-                }
-
-                if parts[0].eq_ignore_ascii_case("FILE") {
-                    if let Some(start) = trimmed.find('"') {
-                        if let Some(end) = trimmed.rfind('"') {
-                            if end > start {
-                                let fname = &trimmed[start + 1..end];
-                                let fpath = path_ref.parent().map(|p| p.join(fname)).unwrap_or_else(|| PathBuf::from(fname));
-                                let file = File::open(&fpath)?;
-                                let fsize = file.metadata()?.len();
-                                files.push(file);
-                                file_sizes.push(fsize);
-                                current_file_idx = Some(files.len() - 1);
-                            }
-                        }
-                    }
-                } else if parts[0].eq_ignore_ascii_case("TRACK") {
-                    if parts.len() >= 3 {
-                        let tnum: u8 = parts[1].parse().unwrap_or(1);
-                        let mode = parts[2].to_uppercase();
-                        let control = if mode.starts_with("AUDIO") { 0x01 } else { 0x41 };
-                        let sector_size = if mode.contains("2048") { 2048 } else { CD_SECTOR_RAW_SIZE };
-                        let fidx = current_file_idx.unwrap_or(0);
-                        parsed_tracks.push(ParsedTrack {
-                            num: tnum,
-                            control,
-                            sector_size,
-                            file_index: fidx,
-                            idx01: 0,
-                        });
-                    }
-                } else if parts[0].eq_ignore_ascii_case("INDEX") {
-                    if parts.len() >= 3 && (parts[1] == "01" || parts[1] == "1") {
-                        if let Some(t) = parsed_tracks.last_mut() {
-                            if let Some(sectors) = parse_msf(parts[2]) {
-                                t.idx01 = sectors;
-                            }
-                        }
-                    }
-                }
+            let mut files: Vec<File> = Vec::with_capacity(file_names.len());
+            let mut file_sizes: Vec<u64> = Vec::with_capacity(file_names.len());
+            for fname in &file_names {
+                let fpath = path_ref.parent().map(|p| p.join(fname)).unwrap_or_else(|| PathBuf::from(fname));
+                let file = File::open(&fpath)?;
+                let fsize = file.metadata()?.len();
+                files.push(file);
+                file_sizes.push(fsize);
             }
 
             if files.is_empty() {
                 return Err(format!("No files found in CUE sheet {:?}", path_ref).into());
             }
 
-            let mut tracks: Vec<CdTrack> = Vec::new();
-            let total_sectors: u32;
-
-            if files.len() == 1 {
-                let fsize = file_sizes[0];
-                let sec_size = parsed_tracks.first().map(|t| t.sector_size).unwrap_or(CD_SECTOR_RAW_SIZE);
-                let file_sectors = (fsize / sec_size as u64) as u32;
-
-                for i in 0..parsed_tracks.len() {
-                    let pt = &parsed_tracks[i];
-                    let start_lba = pt.idx01;
-                    let file_offset = (start_lba as u64) * (pt.sector_size as u64);
-                    let length_sectors = if i + 1 < parsed_tracks.len() {
-                        parsed_tracks[i + 1].idx01.saturating_sub(start_lba)
-                    } else {
-                        file_sectors.saturating_sub(start_lba)
-                    };
-
-                    tracks.push(CdTrack {
-                        number: pt.num,
-                        control: pt.control,
-                        start_lba,
-                        length_sectors,
-                        sector_size: pt.sector_size,
-                        file_index: 0,
-                        file_offset,
-                    });
-                }
-                total_sectors = file_sectors;
-            } else {
-                let mut current_disc_lba = 0u32;
-                for pt in parsed_tracks {
-                    let fsize = file_sizes.get(pt.file_index).copied().unwrap_or(0);
-                    let length_sectors = (fsize / pt.sector_size as u64) as u32;
-                    tracks.push(CdTrack {
-                        number: pt.num,
-                        control: pt.control,
-                        start_lba: current_disc_lba,
-                        length_sectors,
-                        sector_size: pt.sector_size,
-                        file_index: pt.file_index,
-                        file_offset: 0,
-                    });
-                    current_disc_lba += length_sectors;
-                }
-                total_sectors = current_disc_lba;
-            }
+            let (mut tracks, mut total_sectors) = build_cue_tracks(&parsed_tracks, &file_sizes);
 
             if tracks.is_empty() {
+                let sec_size = CD_SECTOR_RAW_SIZE;
+                total_sectors = (file_sizes[0] / sec_size as u64) as u32;
                 tracks.push(CdTrack {
                     number: 1,
                     control: 0x41,
+                    pregap_start_lba: 0,
                     start_lba: 0,
                     length_sectors: total_sectors,
-                    sector_size: CD_SECTOR_RAW_SIZE,
+                    source_start_lba: 0,
+                    stored_sectors: total_sectors,
+                    total_sectors,
+                    sector_size: sec_size,
                     file_index: 0,
                     file_offset: 0,
+                    chd_unit_start: 0,
+                    chd_audio_swap: false,
                 });
             }
 
@@ -361,7 +520,16 @@ impl CdRom {
                 total_sectors
             );
             for t in &tracks {
-                info!("  Track {:02}: LBA {}..{} ({} sectors) ctrl=0x{:02X} file_idx={}", t.number, t.start_lba, t.start_lba + t.length_sectors.saturating_sub(1), t.length_sectors, t.control, t.file_index);
+                info!(
+                    "  Track {:02}: span {}..{} (idx01={}, len={}) ctrl=0x{:02X} file_idx={}",
+                    t.number,
+                    t.pregap_start_lba,
+                    t.pregap_start_lba + t.total_sectors.saturating_sub(1),
+                    t.start_lba,
+                    t.length_sectors,
+                    t.control,
+                    t.file_index
+                );
             }
 
             let mut cdrom = Self {
@@ -379,7 +547,7 @@ impl CdRom {
 
         if ext == "chd" {
             let file = File::open(path_ref)?;
-            let chd = Chd::open(file, None)?;
+            let mut chd = Chd::open(file, None)?;
             let header = chd.header();
 
             let hunk_size = header.hunk_size() as usize;
@@ -391,23 +559,64 @@ impl CdRom {
                 8
             };
 
-            let total_sectors = header.hunk_count() * sectors_per_hunk;
+            let raw_total_units = header.hunk_count() * sectors_per_hunk;
             let hunk_buf = chd.get_hunksized_buffer();
 
-            info!(
-                "Opened CHD: {:?}, hunk_size={}, sectors_per_hunk={}, total_sectors={}",
-                path_ref, hunk_size, sectors_per_hunk, total_sectors
-            );
+            let mut chd_metas: Vec<ChdTrackMeta> = Vec::new();
+            if let Ok(metadatas) = Vec::<chd::metadata::Metadata>::try_from(chd.metadata_refs()) {
+                for meta in metadatas {
+                    let tag = meta.metatag;
+                    if tag == chd::metadata::KnownMetadata::CdRomTrack2 as u32
+                        || tag == chd::metadata::KnownMetadata::CdRomTrack as u32
+                        || tag == chd::metadata::KnownMetadata::GdRomTrack as u32
+                    {
+                        if let Ok(s) = std::str::from_utf8(&meta.value) {
+                            if let Some(parsed) = parse_chd_track_entry(s) {
+                                chd_metas.push(parsed);
+                            }
+                        }
+                    }
+                }
+            }
 
-            let tracks = vec![CdTrack {
-                number: 1,
-                control: 0x41,
-                start_lba: 0,
-                length_sectors: total_sectors,
-                sector_size: CD_SECTOR_RAW_SIZE,
-                file_index: 0,
-                file_offset: 0,
-            }];
+            let (tracks, total_sectors) = if !chd_metas.is_empty() {
+                build_chd_tracks(&chd_metas)
+            } else {
+                let tracks = vec![CdTrack {
+                    number: 1,
+                    control: 0x41,
+                    pregap_start_lba: 0,
+                    start_lba: 0,
+                    length_sectors: raw_total_units,
+                    source_start_lba: 0,
+                    stored_sectors: raw_total_units,
+                    total_sectors: raw_total_units,
+                    sector_size: CD_SECTOR_RAW_SIZE,
+                    file_index: 0,
+                    file_offset: 0,
+                    chd_unit_start: 0,
+                    chd_audio_swap: false,
+                }];
+                (tracks, raw_total_units)
+            };
+
+            info!(
+                "Opened CHD: {:?}, hunk_size={}, sectors_per_hunk={}, tracks={}, total_sectors={}",
+                path_ref, hunk_size, sectors_per_hunk, tracks.len(), total_sectors
+            );
+            for t in &tracks {
+                info!(
+                    "  CHD Track {:02}: span {}..{} (idx01={}, len={}) unit_start={} ctrl=0x{:02X} swap={}",
+                    t.number,
+                    t.pregap_start_lba,
+                    t.pregap_start_lba + t.total_sectors.saturating_sub(1),
+                    t.start_lba,
+                    t.length_sectors,
+                    t.chd_unit_start,
+                    t.control,
+                    t.chd_audio_swap
+                );
+            }
 
             let mut cdrom = Self {
                 source: CdSource::Chd {
@@ -441,11 +650,17 @@ impl CdRom {
             let tracks = vec![CdTrack {
                 number: 1,
                 control: 0x41,
+                pregap_start_lba: 0,
                 start_lba: 0,
                 length_sectors: total_sectors,
+                source_start_lba: 0,
+                stored_sectors: total_sectors,
+                total_sectors,
                 sector_size,
                 file_index: 0,
                 file_offset: 0,
+                chd_unit_start: 0,
+                chd_audio_swap: false,
             }];
 
             let mut cdrom = Self {
@@ -568,15 +783,23 @@ impl CdRom {
 
                 let is_data = (td.control_adr & 0x04) != 0 || (td.control_adr & 0x40) != 0;
                 let control = if is_data { 0x41 } else { 0x01 };
+                let pregap_start_lba = if i == 0 { 0 } else { start_lba };
+                let track_total = (start_lba + length_sectors).saturating_sub(pregap_start_lba);
 
                 tracks.push(CdTrack {
                     number: td.track_number,
                     control,
+                    pregap_start_lba,
                     start_lba,
                     length_sectors,
+                    source_start_lba: pregap_start_lba,
+                    stored_sectors: track_total,
+                    total_sectors: track_total,
                     sector_size: CD_SECTOR_RAW_SIZE,
                     file_index: 0,
                     file_offset: 0,
+                    chd_unit_start: 0,
+                    chd_audio_swap: false,
                 });
 
                 info!(
@@ -612,9 +835,19 @@ impl CdRom {
         }
     }
 
+    pub fn track_at_lba(&self, lba: u32) -> Option<&CdTrack> {
+        self.tracks.iter().find(|t| t.contains_lba(lba))
+    }
+
     fn detect_disc_type(&mut self) {
         let mut s16 = [0u8; CD_SECTOR_RAW_SIZE];
         if self.read_sector(16, &mut s16) {
+            if s16[0] == 0xFF && s16[1] == 0x00 && s16[2] == 0xFF && s16[10] == 0x00 && s16[11] == 0xFF {
+                for pair in s16.chunks_exact_mut(2) {
+                    pair.swap(0, 1);
+                }
+                maybe_descramble_sector(&mut s16);
+            }
             let sys_id = &s16[24 + 8..24 + 40];
             self.volume_id = String::from_utf8_lossy(&s16[24 + 40..24 + 72]).trim().to_string();
             self.volume_set = String::from_utf8_lossy(&s16[24 + 318..24 + 446]).trim().to_string();
@@ -662,10 +895,27 @@ impl CdRom {
             return false;
         }
 
+        let matched_track = self.tracks.iter().find(|t| t.contains_lba(lba)).cloned();
+
         let success = match &mut self.source {
             CdSource::Chd { chd, hunk_buf, comp_buf, current_hunk, hunk_size, sectors_per_hunk } => {
-                let hunk_idx = lba / *sectors_per_hunk;
-                let sector_in_hunk = (lba % *sectors_per_hunk) as usize;
+                let (chd_unit, is_virtual_silence, is_chd_audio) = if let Some(ref tr) = matched_track {
+                    if lba < tr.source_start_lba || lba >= tr.source_start_lba + tr.stored_sectors {
+                        (0, true, false)
+                    } else {
+                        (tr.chd_unit_start + (lba - tr.source_start_lba), false, tr.chd_audio_swap)
+                    }
+                } else {
+                    (lba, false, false)
+                };
+
+                if is_virtual_silence {
+                    out_sector.fill(0);
+                    return true;
+                }
+
+                let hunk_idx = chd_unit / *sectors_per_hunk;
+                let sector_in_hunk = (chd_unit % *sectors_per_hunk) as usize;
 
                 if *current_hunk != Some(hunk_idx) {
                     match chd.hunk(hunk_idx) {
@@ -692,6 +942,13 @@ impl CdRom {
                 let start = sector_in_hunk * frame_stride;
                 if start + CD_SECTOR_RAW_SIZE <= hunk_buf.len() {
                     out_sector.copy_from_slice(&hunk_buf[start..start + CD_SECTOR_RAW_SIZE]);
+                    // MAME CHD stores CD audio tracks in big-endian 16-bit order (and CdFlacCodec always outputs BE).
+                    // Skip swapping only if a data sector inside an audio pregap was already stored raw unswapped.
+                    if is_chd_audio && out_sector[0..12] != CD_SYNC_HEADER {
+                        for pair in out_sector.chunks_exact_mut(2) {
+                            pair.swap(0, 1);
+                        }
+                    }
                     true
                 } else {
                     error!("CD-ROM: Sector offset out of hunk bounds");
@@ -699,12 +956,16 @@ impl CdRom {
                 }
             }
             CdSource::RawFiles { files } => {
-                if let Some(track) = self.tracks.iter().find(|t| lba >= t.start_lba && lba < t.start_lba + t.length_sectors) {
+                if let Some(ref track) = matched_track {
+                    if lba < track.source_start_lba || lba >= track.source_start_lba + track.stored_sectors {
+                        out_sector.fill(0);
+                        return true;
+                    }
                     if track.file_index >= files.len() {
                         return false;
                     }
                     let file = &mut files[track.file_index];
-                    let rel_lba = lba - track.start_lba;
+                    let rel_lba = lba - track.source_start_lba;
                     let offset = track.file_offset + (rel_lba as u64) * (track.sector_size as u64);
 
                     if file.seek(SeekFrom::Start(offset)).is_err() {
@@ -728,8 +989,7 @@ impl CdRom {
             }
             #[cfg(target_os = "windows")]
             CdSource::PhysicalDrive { handle, drive_letter: _ } => {
-                let track = self.tracks.iter().find(|t| lba >= t.start_lba && lba < t.start_lba + t.length_sectors);
-                let is_audio = track.map_or(false, |t| (t.control & 0x40) == 0);
+                let is_audio = matched_track.as_ref().map_or(false, |t| (t.control & 0x40) == 0);
 
                 // 1. Try IOCTL_CDROM_RAW_READ
                 let modes_to_try: &[u32] = if is_audio {
@@ -831,5 +1091,163 @@ mod tests {
         assert_eq!(parse_drive_letter(r"\\.\e:"), Some('E'));
         assert_eq!(parse_drive_letter("game.chd"), None);
         assert_eq!(parse_drive_letter("C:\\games\\mario.iso"), None);
+    }
+
+    #[test]
+    fn test_cue_single_file_cdi_ready_pregap() {
+        let cue = "\
+FILE \"pav.bin\" BINARY
+  TRACK 01 AUDIO
+    INDEX 00 00:00:00
+    INDEX 01 28:34:00
+  TRACK 02 AUDIO
+    INDEX 00 31:53:67
+    INDEX 01 31:55:67
+";
+        let (files, parsed) = parse_cue_sheet(cue);
+        assert_eq!(files, vec!["pav.bin"]);
+        let total_bin_sectors: u64 = 143_542 + 14_188;
+        let (tracks, total_sectors) = build_cue_tracks(&parsed, &[total_bin_sectors * CD_SECTOR_RAW_SIZE as u64]);
+
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(total_sectors, total_bin_sectors as u32);
+
+        // Track 1: pregap 0..128550 contains CD-i data, INDEX 01 is at 128550
+        assert_eq!(tracks[0].number, 1);
+        assert_eq!(tracks[0].control, 0x01);
+        assert_eq!(tracks[0].pregap_start_lba, 0);
+        assert_eq!(tracks[0].source_start_lba, 0);
+        assert_eq!(tracks[0].start_lba, 128_550);
+        assert_eq!(tracks[0].length_sectors, 14_992);
+        assert_eq!(tracks[0].file_offset, 0);
+        assert!(tracks[0].contains_lba(16));
+
+        // Track 2: starts with INDEX 00 pause at 143542, INDEX 01 at 143692
+        assert_eq!(tracks[1].number, 2);
+        assert_eq!(tracks[1].pregap_start_lba, 143_542);
+        assert_eq!(tracks[1].source_start_lba, 143_542);
+        assert_eq!(tracks[1].start_lba, 143_692);
+        assert_eq!(tracks[1].length_sectors, 14_038);
+        assert_eq!(tracks[1].file_offset, 143_542 * CD_SECTOR_RAW_SIZE as u64);
+        assert!(tracks[1].contains_lba(143_600));
+        assert!(tracks[1].contains_lba(143_692));
+    }
+
+    #[test]
+    fn test_cue_multi_file_and_virtual_pregap_read_sector() {
+        let dir = std::env::temp_dir().join("opencdi_test_cdi_ready_cue");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let t1_pregap = 20u32;
+        let t1_audio = 4u32;
+        let mut t1_bin = vec![0u8; ((t1_pregap + t1_audio) as usize) * CD_SECTOR_RAW_SIZE];
+        // Populate LBA 16 as unscrambled Mode 2 CD-RTOS PVD
+        let pvd = &mut t1_bin[16 * CD_SECTOR_RAW_SIZE..(16 + 1) * CD_SECTOR_RAW_SIZE];
+        pvd[0..12].copy_from_slice(&CD_SYNC_HEADER);
+        pvd[15] = 2;
+        pvd[24..24 + 14].copy_from_slice(b"\x01CD-I  CD-RTOS");
+        // Marker in Track 1 INDEX 01 audio
+        t1_bin[(t1_pregap as usize) * CD_SECTOR_RAW_SIZE] = 0xAA;
+
+        let t2_pregap = 2u32;
+        let t2_audio = 3u32;
+        let mut t2_bin = vec![0u8; ((t2_pregap + t2_audio) as usize) * CD_SECTOR_RAW_SIZE];
+        t2_bin[(t2_pregap as usize) * CD_SECTOR_RAW_SIZE] = 0xBB;
+
+        let t3_audio = 2u32;
+        let t3_bin = vec![0xCCu8; (t3_audio as usize) * CD_SECTOR_RAW_SIZE];
+
+        std::fs::write(dir.join("t1.bin"), &t1_bin).unwrap();
+        std::fs::write(dir.join("t2.bin"), &t2_bin).unwrap();
+        std::fs::write(dir.join("t3.bin"), &t3_bin).unwrap();
+        std::fs::write(
+            dir.join("disc.cue"),
+            "\
+FILE \"t1.bin\" BINARY
+  TRACK 01 AUDIO
+    INDEX 00 00:00:00
+    INDEX 01 00:00:20
+FILE \"t2.bin\" BINARY
+  TRACK 02 AUDIO
+    INDEX 00 00:00:00
+    INDEX 01 00:00:02
+FILE \"t3.bin\" BINARY
+  TRACK 03 AUDIO
+    PREGAP 00:00:02
+    INDEX 01 00:00:00
+",
+        )
+        .unwrap();
+
+        let mut cd = CdRom::open(dir.join("disc.cue")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(cd.tracks.len(), 3);
+        assert_eq!(cd.tracks[0].start_lba, 20);
+        assert_eq!(cd.tracks[1].pregap_start_lba, 24);
+        assert_eq!(cd.tracks[1].start_lba, 26);
+        assert_eq!(cd.tracks[2].pregap_start_lba, 29);
+        assert_eq!(cd.tracks[2].source_start_lba, 31);
+        assert_eq!(cd.tracks[2].start_lba, 31);
+        assert_eq!(cd.total_sectors, 33);
+
+        let mut sec = [0u8; CD_SECTOR_RAW_SIZE];
+        assert!(cd.read_sector(16, &mut sec));
+        assert_eq!(&sec[24..24 + 14], b"\x01CD-I  CD-RTOS");
+        assert!(cd.read_sector(20, &mut sec));
+        assert_eq!(sec[0], 0xAA);
+        assert!(cd.read_sector(26, &mut sec));
+        assert_eq!(sec[0], 0xBB);
+        // Track 3 virtual PREGAP at LBA 29..31 returns synthesized silence
+        assert!(cd.read_sector(29, &mut sec));
+        assert!(sec.iter().all(|&b| b == 0));
+        // Track 3 stored data starts at LBA 31
+        assert!(cd.read_sector(31, &mut sec));
+        assert_eq!(sec[0], 0xCC);
+    }
+
+    #[test]
+    fn test_chd_metadata_tracks_and_4_unit_padding() {
+        let raw_entries = [
+            "TRACK:1 TYPE:AUDIO SUBTYPE:NONE FRAMES:143542 PREGAP:128550 PGTYPE:VAUDIO PGSUB:NONE POSTGAP:0\0",
+            "TRACK:2 TYPE:AUDIO SUBTYPE:NONE FRAMES:14188 PREGAP:150 PGTYPE:VAUDIO PGSUB:NONE POSTGAP:0\0",
+            "TRACK:3 TYPE:AUDIO SUBTYPE:NONE FRAMES:501 PREGAP:150 PGTYPE:AUDIO PGSUB:NONE POSTGAP:75\0",
+            "TRACK:4 TYPE:MODE2_RAW SUBTYPE:NONE FRAMES:200\0",
+        ];
+        let parsed: Vec<ChdTrackMeta> = raw_entries
+            .iter()
+            .filter_map(|s| parse_chd_track_entry(s))
+            .collect();
+        assert_eq!(parsed.len(), 4);
+
+        let (tracks, total_sectors) = build_chd_tracks(&parsed);
+        assert_eq!(tracks.len(), 4);
+
+        // Track 1: 143542 frames, VAUDIO pregap inside stream; padded unit end = 143544 (CD_TRACK_PADDING=4)
+        assert_eq!(tracks[0].pregap_start_lba, 0);
+        assert_eq!(tracks[0].start_lba, 128_550);
+        assert_eq!(tracks[0].length_sectors, 14_992);
+        assert_eq!(tracks[0].chd_unit_start, 0);
+        assert!(tracks[0].chd_audio_swap);
+
+        // Track 2: disc LBA starts at 143542, CHD physical unit starts at padded 143544
+        assert_eq!(tracks[1].pregap_start_lba, 143_542);
+        assert_eq!(tracks[1].source_start_lba, 143_542);
+        assert_eq!(tracks[1].start_lba, 143_692);
+        assert_eq!(tracks[1].chd_unit_start, 143_544);
+
+        // Track 3: non-V PGTYPE:AUDIO -> 150 virtual pregap before source_start_lba, plus 75 postgap
+        assert_eq!(tracks[2].pregap_start_lba, 157_730);
+        assert_eq!(tracks[2].source_start_lba, 157_880);
+        assert_eq!(tracks[2].start_lba, 157_880);
+        assert_eq!(tracks[2].chd_unit_start, 143_544 + 14_188);
+        assert_eq!(tracks[2].total_sectors, 150 + 501 + 75);
+
+        // Track 4 (CHTR format without PREGAP fields): Track 3 frames=501 pads to 504 units
+        assert_eq!(tracks[3].control, 0x41);
+        assert!(!tracks[3].chd_audio_swap);
+        assert_eq!(tracks[3].chd_unit_start, 143_544 + 14_188 + 504);
+        assert_eq!(total_sectors, 143_542 + 14_188 + 150 + 501 + 75 + 200);
     }
 }
