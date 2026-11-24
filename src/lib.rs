@@ -6,6 +6,7 @@ pub mod bios;
 pub mod bus;
 pub mod cdic;
 pub mod cdrom;
+pub mod deinterlace;
 pub mod dma;
 pub mod dvc;
 #[cfg(feature = "host")]

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use log::info;
 
-use crate::frontend::{push_action, GuiAction, InputDeviceMode, InputProfile};
+use crate::frontend::{push_action, GamepadAction, GamepadButton, GuiAction, InputDeviceMode, InputProfile, KeyBindings};
 
 pub const ID_FILE_INSERT: usize = 1000;
 pub const ID_FILE_OPEN: usize = 1001;
@@ -30,15 +30,29 @@ pub const ID_MOUSE_SENS_50: usize = 1091;
 pub const ID_MOUSE_SENS_75: usize = 1092;
 pub const ID_MOUSE_SENS_100: usize = 1093;
 pub const ID_MOUSE_SENS_150: usize = 1094;
+pub const ID_PAD_SPEED_LOW: usize = 1095;
+pub const ID_PAD_SPEED_MEDIUM: usize = 1096;
+pub const ID_PAD_SPEED_HIGH: usize = 1097;
 
 pub const ID_AUDIO_MUTE: usize = 1020;
 pub const ID_AUDIO_VOL_UP: usize = 1021;
 pub const ID_AUDIO_VOL_DOWN: usize = 1022;
+pub const ID_AUDIO_LATENCY_LOW: usize = 1023;
+pub const ID_AUDIO_LATENCY_NORMAL: usize = 1024;
+pub const ID_AUDIO_LATENCY_HIGH: usize = 1025;
+pub const ID_AUDIO_LATENCY_SAFE: usize = 1026;
+
+pub const ID_GAMEPAD_BTN1_BASE: usize = 1400;  // 1400..1412
+pub const ID_GAMEPAD_BTN2_BASE: usize = 1420;  // 1420..1432
+pub const ID_GAMEPAD_BTN12_BASE: usize = 1440; // 1440..1452
+pub const ID_GAMEPAD_SPEED_BASE: usize = 1460; // 1460..1472
 
 pub const ID_VIDEO_FULLSCREEN: usize = 1030;
 pub const ID_VIDEO_SCREENSHOT: usize = 1031;
 pub const ID_VIDEO_PAL: usize = 1032;
 pub const ID_VIDEO_NTSC: usize = 1033;
+pub const ID_VIDEO_EXCLUSIVE_FULLSCREEN: usize = 1034;
+pub const ID_VIDEO_DEINTERLACE: usize = 1035;
 pub const ID_EMU_WAITSTATES: usize = 1050;
 pub const ID_EMU_DVC: usize = 1051;
 
@@ -485,6 +499,103 @@ pub fn update_dvc_menu(fitted: bool) {
     }
 }
 
+pub fn update_pad_speed_menu(speed: crate::input_script::PadSpeed) {
+    unsafe {
+        if !MENU_HANDLE.is_null() {
+            for (id, target) in [
+                (ID_PAD_SPEED_LOW, crate::input_script::PadSpeed::Low),
+                (ID_PAD_SPEED_MEDIUM, crate::input_script::PadSpeed::Medium),
+                (ID_PAD_SPEED_HIGH, crate::input_script::PadSpeed::High),
+            ] {
+                CheckMenuItem(
+                    MENU_HANDLE,
+                    id as u32,
+                    MF_BYCOMMAND | if speed == target { MF_CHECKED } else { MF_UNCHECKED },
+                );
+            }
+            if !OWNER_HWND.is_null() {
+                DrawMenuBar(OWNER_HWND);
+            }
+        }
+    }
+}
+
+pub fn update_audio_latency_menu(latency: crate::audio::AudioLatency) {
+    unsafe {
+        if !MENU_HANDLE.is_null() {
+            for (id, target) in [
+                (ID_AUDIO_LATENCY_LOW, crate::audio::AudioLatency::Low),
+                (ID_AUDIO_LATENCY_NORMAL, crate::audio::AudioLatency::Normal),
+                (ID_AUDIO_LATENCY_HIGH, crate::audio::AudioLatency::High),
+                (ID_AUDIO_LATENCY_SAFE, crate::audio::AudioLatency::Safe),
+            ] {
+                CheckMenuItem(
+                    MENU_HANDLE,
+                    id as u32,
+                    MF_BYCOMMAND | if latency == target { MF_CHECKED } else { MF_UNCHECKED },
+                );
+            }
+            if !OWNER_HWND.is_null() {
+                DrawMenuBar(OWNER_HWND);
+            }
+        }
+    }
+}
+
+pub fn update_gamepad_mapping_menu(bindings: &KeyBindings) {
+    unsafe {
+        if !MENU_HANDLE.is_null() {
+            for (base, active) in [
+                (ID_GAMEPAD_BTN1_BASE, bindings.pad_btn1),
+                (ID_GAMEPAD_BTN2_BASE, bindings.pad_btn2),
+                (ID_GAMEPAD_BTN12_BASE, bindings.pad_btn12),
+                (ID_GAMEPAD_SPEED_BASE, bindings.pad_speed_btn),
+            ] {
+                for (i, &btn) in GamepadButton::ALL.iter().enumerate() {
+                    CheckMenuItem(
+                        MENU_HANDLE,
+                        (base + i) as u32,
+                        MF_BYCOMMAND | if btn == active { MF_CHECKED } else { MF_UNCHECKED },
+                    );
+                }
+            }
+            if !OWNER_HWND.is_null() {
+                DrawMenuBar(OWNER_HWND);
+            }
+        }
+    }
+}
+
+pub fn update_exclusive_fullscreen_menu(enabled: bool) {
+    unsafe {
+        if !MENU_HANDLE.is_null() {
+            CheckMenuItem(
+                MENU_HANDLE,
+                ID_VIDEO_EXCLUSIVE_FULLSCREEN as u32,
+                MF_BYCOMMAND | if enabled { MF_CHECKED } else { MF_UNCHECKED },
+            );
+            if !OWNER_HWND.is_null() {
+                DrawMenuBar(OWNER_HWND);
+            }
+        }
+    }
+}
+
+pub fn update_deinterlace_menu(enabled: bool) {
+    unsafe {
+        if !MENU_HANDLE.is_null() {
+            CheckMenuItem(
+                MENU_HANDLE,
+                ID_VIDEO_DEINTERLACE as u32,
+                MF_BYCOMMAND | if enabled { MF_CHECKED } else { MF_UNCHECKED },
+            );
+            if !OWNER_HWND.is_null() {
+                DrawMenuBar(OWNER_HWND);
+            }
+        }
+    }
+}
+
 unsafe extern "system" fn custom_wndproc(
     hwnd: *mut std::ffi::c_void,
     msg: u32,
@@ -647,6 +758,18 @@ unsafe extern "system" fn custom_wndproc(
                 push_action(GuiAction::SetMouseSensitivity(1.50));
                 return 0;
             }
+            ID_PAD_SPEED_LOW => {
+                push_action(GuiAction::SetPadSpeed(crate::input_script::PadSpeed::Low));
+                return 0;
+            }
+            ID_PAD_SPEED_MEDIUM => {
+                push_action(GuiAction::SetPadSpeed(crate::input_script::PadSpeed::Medium));
+                return 0;
+            }
+            ID_PAD_SPEED_HIGH => {
+                push_action(GuiAction::SetPadSpeed(crate::input_script::PadSpeed::High));
+                return 0;
+            }
             ID_CONTROLS_EDIT_INI => {
                 let _ = std::process::Command::new("notepad.exe").arg("opencdi_controls.ini").spawn();
                 push_action(GuiAction::SetProfile(InputProfile::Custom));
@@ -676,8 +799,48 @@ unsafe extern "system" fn custom_wndproc(
                 push_action(GuiAction::VolumeDown);
                 return 0;
             }
+            ID_AUDIO_LATENCY_LOW => {
+                push_action(GuiAction::SetAudioLatency(crate::audio::AudioLatency::Low));
+                return 0;
+            }
+            ID_AUDIO_LATENCY_NORMAL => {
+                push_action(GuiAction::SetAudioLatency(crate::audio::AudioLatency::Normal));
+                return 0;
+            }
+            ID_AUDIO_LATENCY_HIGH => {
+                push_action(GuiAction::SetAudioLatency(crate::audio::AudioLatency::High));
+                return 0;
+            }
+            ID_AUDIO_LATENCY_SAFE => {
+                push_action(GuiAction::SetAudioLatency(crate::audio::AudioLatency::Safe));
+                return 0;
+            }
+            id if (ID_GAMEPAD_BTN1_BASE..ID_GAMEPAD_BTN1_BASE + GamepadButton::ALL.len()).contains(&id) => {
+                push_action(GuiAction::SetGamepadButton(GamepadAction::Btn1, GamepadButton::ALL[id - ID_GAMEPAD_BTN1_BASE]));
+                return 0;
+            }
+            id if (ID_GAMEPAD_BTN2_BASE..ID_GAMEPAD_BTN2_BASE + GamepadButton::ALL.len()).contains(&id) => {
+                push_action(GuiAction::SetGamepadButton(GamepadAction::Btn2, GamepadButton::ALL[id - ID_GAMEPAD_BTN2_BASE]));
+                return 0;
+            }
+            id if (ID_GAMEPAD_BTN12_BASE..ID_GAMEPAD_BTN12_BASE + GamepadButton::ALL.len()).contains(&id) => {
+                push_action(GuiAction::SetGamepadButton(GamepadAction::Btn12, GamepadButton::ALL[id - ID_GAMEPAD_BTN12_BASE]));
+                return 0;
+            }
+            id if (ID_GAMEPAD_SPEED_BASE..ID_GAMEPAD_SPEED_BASE + GamepadButton::ALL.len()).contains(&id) => {
+                push_action(GuiAction::SetGamepadButton(GamepadAction::SpeedSwitch, GamepadButton::ALL[id - ID_GAMEPAD_SPEED_BASE]));
+                return 0;
+            }
             ID_VIDEO_FULLSCREEN => {
                 push_action(GuiAction::ToggleFullscreen);
+                return 0;
+            }
+            ID_VIDEO_EXCLUSIVE_FULLSCREEN => {
+                push_action(GuiAction::ToggleExclusiveFullscreen);
+                return 0;
+            }
+            ID_VIDEO_DEINTERLACE => {
+                push_action(GuiAction::ToggleDeinterlace);
                 return 0;
             }
             ID_VIDEO_SCREENSHOT => {
@@ -836,24 +999,15 @@ pub fn attach_gui_menu(
         }
 
         AppendMenuW(file_menu, MF_SEPARATOR, 0, std::ptr::null());
-        AppendMenuW(file_menu, MF_STRING, ID_STATE_QUICK_SAVE, to_wide("Quick Save State (Slot 1)\tF6").as_ptr());
-        AppendMenuW(file_menu, MF_STRING, ID_STATE_QUICK_LOAD, to_wide("Quick Load State (Slot 1)\tF7").as_ptr());
+        AppendMenuW(file_menu, MF_STRING, ID_STATE_QUICK_SAVE, to_wide("Quick Save State (Current Slot)\tF2").as_ptr());
+        AppendMenuW(file_menu, MF_STRING, ID_STATE_QUICK_LOAD, to_wide("Quick Load State (Current Slot)\tF4").as_ptr());
 
         let save_state_menu = CreatePopupMenu();
         let load_state_menu = CreatePopupMenu();
         for slot in 1..=5 {
-            let save_label = if slot == 1 {
-                format!("Slot &{} (Quick Save)\tF6", slot)
-            } else {
-                format!("Slot &{}", slot)
-            };
-            let load_label = if slot == 1 {
-                format!("Slot &{} (Quick Load)\tF7", slot)
-            } else {
-                format!("Slot &{}", slot)
-            };
-            AppendMenuW(save_state_menu, MF_STRING, ID_STATE_SAVE_BASE + (slot - 1), to_wide(&save_label).as_ptr());
-            AppendMenuW(load_state_menu, MF_STRING, ID_STATE_LOAD_BASE + (slot - 1), to_wide(&load_label).as_ptr());
+            let label = format!("Slot &{}", slot);
+            AppendMenuW(save_state_menu, MF_STRING, ID_STATE_SAVE_BASE + (slot - 1), to_wide(&label).as_ptr());
+            AppendMenuW(load_state_menu, MF_STRING, ID_STATE_LOAD_BASE + (slot - 1), to_wide(&label).as_ptr());
         }
         AppendMenuW(file_menu, MF_POPUP, save_state_menu as usize, to_wide("Save State to Slot").as_ptr());
         AppendMenuW(file_menu, MF_POPUP, load_state_menu as usize, to_wide("Load State from Slot").as_ptr());
@@ -880,6 +1034,27 @@ pub fn attach_gui_menu(
         AppendMenuW(sens_menu, MF_STRING, ID_MOUSE_SENS_100, to_wide("Normal (100% Raw)").as_ptr());
         AppendMenuW(sens_menu, MF_STRING, ID_MOUSE_SENS_150, to_wide("High (150%)").as_ptr());
         AppendMenuW(controls_menu, MF_POPUP, sens_menu as usize, to_wide("Mouse Sensitivity").as_ptr());
+
+        let pad_speed_menu = CreatePopupMenu();
+        AppendMenuW(pad_speed_menu, MF_STRING, ID_PAD_SPEED_LOW, to_wide("Speed 1/3 — Slow (Precise)\tTab / L1").as_ptr());
+        AppendMenuW(pad_speed_menu, MF_STRING | MF_CHECKED, ID_PAD_SPEED_MEDIUM, to_wide("Speed 2/3 — Medium (Default)\tTab / L1").as_ptr());
+        AppendMenuW(pad_speed_menu, MF_STRING, ID_PAD_SPEED_HIGH, to_wide("Speed 3/3 — Fast\tTab / L1").as_ptr());
+        AppendMenuW(controls_menu, MF_POPUP, pad_speed_menu as usize, to_wide("CD-i Gamepad Speed (22ER9021)").as_ptr());
+
+        let pad_map_menu = CreatePopupMenu();
+        for (title, base) in [
+            ("CD-i Button 1", ID_GAMEPAD_BTN1_BASE),
+            ("CD-i Button 2", ID_GAMEPAD_BTN2_BASE),
+            ("CD-i Button 1+2 (Combined)", ID_GAMEPAD_BTN12_BASE),
+            ("CD-i Pad Speed Switch (1/2/3)", ID_GAMEPAD_SPEED_BASE),
+        ] {
+            let sub = CreatePopupMenu();
+            for (i, &btn) in GamepadButton::ALL.iter().enumerate() {
+                AppendMenuW(sub, MF_STRING, base + i, to_wide(btn.label()).as_ptr());
+            }
+            AppendMenuW(pad_map_menu, MF_POPUP, sub as usize, to_wide(title).as_ptr());
+        }
+        AppendMenuW(controls_menu, MF_POPUP, pad_map_menu as usize, to_wide("Gamepad Button Mapping").as_ptr());
         AppendMenuW(controls_menu, MF_SEPARATOR, 0, std::ptr::null());
 
         AppendMenuW(controls_menu, MF_STRING, ID_PROFILE_STANDARD, to_wide("Key Profile: Standard (Arrow Keys + Z / X)").as_ptr());
@@ -899,11 +1074,20 @@ pub fn attach_gui_menu(
         AppendMenuW(audio_menu, MF_STRING, ID_AUDIO_MUTE, to_wide("Mute / Unmute Audio\tM").as_ptr());
         AppendMenuW(audio_menu, MF_STRING, ID_AUDIO_VOL_UP, to_wide("Volume Up (+)\t+").as_ptr());
         AppendMenuW(audio_menu, MF_STRING, ID_AUDIO_VOL_DOWN, to_wide("Volume Down (-)\t-").as_ptr());
+        AppendMenuW(audio_menu, MF_SEPARATOR, 0, std::ptr::null());
+        let latency_menu = CreatePopupMenu();
+        AppendMenuW(latency_menu, MF_STRING, ID_AUDIO_LATENCY_LOW, to_wide("Low (~32 ms — Tightest SFX)").as_ptr());
+        AppendMenuW(latency_menu, MF_STRING | MF_CHECKED, ID_AUDIO_LATENCY_NORMAL, to_wide("Normal (~46 ms — Default)").as_ptr());
+        AppendMenuW(latency_menu, MF_STRING, ID_AUDIO_LATENCY_HIGH, to_wide("High (~93 ms)").as_ptr());
+        AppendMenuW(latency_menu, MF_STRING, ID_AUDIO_LATENCY_SAFE, to_wide("Safe (~186 ms — Maximum Buffer)").as_ptr());
+        AppendMenuW(audio_menu, MF_POPUP, latency_menu as usize, to_wide("Audio Latency (Buffer)").as_ptr());
         AppendMenuW(main_menu, MF_POPUP, audio_menu as usize, to_wide("Audio").as_ptr());
 
         // 4. Video Menu
         let video_menu = CreatePopupMenu();
         AppendMenuW(video_menu, MF_STRING, ID_VIDEO_FULLSCREEN, to_wide("Fullscreen\tF11 / Alt+Enter").as_ptr());
+        AppendMenuW(video_menu, MF_STRING, ID_VIDEO_EXCLUSIVE_FULLSCREEN, to_wide("Exclusive Fullscreen (Lower Latency)").as_ptr());
+        AppendMenuW(video_menu, MF_STRING, ID_VIDEO_DEINTERLACE, to_wide("De-interlacing (Motion-Adaptive FMV)").as_ptr());
         AppendMenuW(video_menu, MF_STRING, ID_VIDEO_SCREENSHOT, to_wide("Save Screenshot (PNG)\tF12").as_ptr());
         AppendMenuW(video_menu, MF_SEPARATOR, 0, std::ptr::null());
         AppendMenuW(video_menu, MF_STRING, ID_VIDEO_PAL, to_wide("PAL (50 Hz) [CD-i 220 Standard]").as_ptr());
@@ -1003,34 +1187,37 @@ pub fn show_controls_dialog(owner: *mut std::ffi::c_void) {
         1. STANDARD PROFILE (Default):\n\
            • Directional Movement / D-Pad: Arrow Keys\n\
            • Button 1 (Action / Confirm): [Z]\n\
-           • Button 2 (Jump / Action 2): [X]\n\n\
+           • Button 2 (Jump / Action 2): [X]\n\
+           • Button 1+2 (Combined / Button 3): [C]\n\n\
         2. WASD PROFILE (PC Style):\n\
            • Movement: [W] [A] [S] [D]\n\
-           • Button 1: [J]  |  Button 2: [K]\n\n\
+           • Button 1: [J]  |  Button 2: [K]  |  Button 1+2: [U]\n\n\
         3. NUMPAD PROFILE:\n\
            • Movement: [8] [4] [6] [2]\n\
-           • Button 1: [1]  |  Button 2: [0]\n\n\
+           • Button 1: [1]  |  Button 2: [0]  |  Button 1+2: [3]\n\n\
         4. CUSTOM PROFILE:\n\
            • Configurable via 'Controls -> Edit Controls in Notepad...'\n\
-           • Map any key (e.g. Space, Enter, Shift, etc.) in opencdi_controls.ini\n\n\
+           • Map any key (up/down/left/right/btn1/btn2/btn12) or gamepad button in opencdi_controls.ini\n\n\
         MOUSE & TOUCH:\n\
            • Move host mouse to move the on-screen pointer or cursor.\n\
            • Left Click = Button 1 (also locks / captures mouse if released).\n\
            • Right Click = Button 2\n\
            • Middle Click: Lock / release host mouse cursor to/from the window.\n\
            • Controls -> Mouse Sensitivity: adjust speed multiplier (25% - 150%).\n\n\
-        USB GAMEPAD / XBOX / PLAYSTATION:\n\
+        USB GAMEPAD / XBOX / PLAYSTATION (Remappable via Controls -> Gamepad Button Mapping):\n\
            • D-Pad or Left Analog Stick = Movement\n\
-           • Button A / Cross = Button 1\n\
-           • Button B / Circle / X = Button 2\n\
-           • Start Button = Action / Pause\n\n\
+           • Default Button 1 = A / Cross (South)\n\
+           • Default Button 2 = B / Circle (East)\n\
+           • Default Button 1+2 (Combined) = X / Square (West)\n\
+           • Default Pad Speed Switch = L1 / LB (cycles 3-level CD-i Gamepad speed)\n\n\
         KEYBOARD SHORTCUTS:\n\
-           • F11 or Alt+Enter: Fullscreen\n\
+           • F11 or Alt+Enter: Fullscreen (Borderless default, Exclusive optional in Video menu)\n\
+           • Tab: Cycle 3-Level CD-i Gamepad Speed (1 Slow / 2 Medium / 3 Fast)\n\
            • F5 or H: Restart console (Reset)\n\
-           • F6: Quick Save State (Slot 1)  |  F7: Quick Load State (Slot 1)\n\
+           • F2 / F4: Quick Save / Quick Load state (current slot)\n\
+           • F6 / F7: Previous / Next save state slot (0 - 999)\n\
            • F9: Switch Active Input Device (Gamepad <-> Mouse)\n\
            • P: Pause  |  Space (hold): Fast-forward\n\
-           • F2 / F4: Save / Load state  |  F6: Quick Save  |  F7: Quick Load\n\
            • F8: Screenshot (BMP)  |  F12: Screenshot (PNG)\n\
            • Ctrl+I: Insert disc  |  Ctrl+O: Open disc image and restart\n\
            • M: Mute / Unmute audio  |  + / - : Adjust volume\n\
@@ -1055,12 +1242,12 @@ pub fn show_disc_error(owner: *mut std::ffi::c_void, text: &str) {
 pub fn show_about_dialog(owner: *mut std::ffi::c_void) {
     let text = to_wide(
         "OpenCDi - Philips CD-i Emulator\n\
-        Version: 0.4.1 (High Performance Edition)\n\
+        Version: 0.4.2 (High Performance Edition)\n\
         GitHub: https://github.com/sigsantilio/opencdi\n\n\
         Project Lead & Maintainer:\n\
         • Gianluca \"sigsantilio\"\n\n\
         Core Contributors:\n\
-        • ArnoldDeRuiter (Libretro core, Mono-IV, Savestates)\n\
+        • ArnoldDeRuiter (Libretro core, Mono-IV, Savestates, macOS standalone)\n\
         • OpenCDi Community\n\n\
         Built with Rust, winit & softbuffer\n\n\
         Key Emulation Features:\n\
@@ -1072,6 +1259,7 @@ pub fn show_about_dialog(owner: *mut std::ffi::c_void) {
         • Win32 GUI menu with disc hot-swapping and configurable controls\n\
         • Direct USB gamepad (XInput / DirectInput) and precise mouse capture\n\n\
         Special Thanks & Acknowledgements:\n\
+        • whatever-industries (E-Di emulator: MIT motion-adaptive de-interlacer & CD-i hardware research)\n\
         • The MAME Team (BSD-3-Clause CD-i drivers: cdi, mcd212, cdicdic, scc68070)\n\
         • The CDi_MiSTer project (ash2020) for FPGA hardware research\n\
         • The CD-i preservation community"

@@ -18,6 +18,123 @@ pub enum InputDeviceMode {
     Mouse,   // Mouse Philips CD-i (Cursore Fisico Host)
 }
 
+/// Physical USB gamepad button that can be assigned to any CD-i action (Button 1, Button 2, Button 1+2, or Pad Speed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GamepadButton {
+    South,
+    East,
+    West,
+    North,
+    LeftTrigger,
+    RightTrigger,
+    LeftTrigger2,
+    RightTrigger2,
+    Start,
+    Select,
+    LeftThumb,
+    RightThumb,
+    None,
+}
+
+impl GamepadButton {
+    pub const ALL: [GamepadButton; 13] = [
+        GamepadButton::South,
+        GamepadButton::East,
+        GamepadButton::West,
+        GamepadButton::North,
+        GamepadButton::LeftTrigger,
+        GamepadButton::RightTrigger,
+        GamepadButton::LeftTrigger2,
+        GamepadButton::RightTrigger2,
+        GamepadButton::Start,
+        GamepadButton::Select,
+        GamepadButton::LeftThumb,
+        GamepadButton::RightThumb,
+        GamepadButton::None,
+    ];
+
+    pub const fn as_ini_str(self) -> &'static str {
+        match self {
+            GamepadButton::South => "South",
+            GamepadButton::East => "East",
+            GamepadButton::West => "West",
+            GamepadButton::North => "North",
+            GamepadButton::LeftTrigger => "L1",
+            GamepadButton::RightTrigger => "R1",
+            GamepadButton::LeftTrigger2 => "L2",
+            GamepadButton::RightTrigger2 => "R2",
+            GamepadButton::Start => "Start",
+            GamepadButton::Select => "Select",
+            GamepadButton::LeftThumb => "L3",
+            GamepadButton::RightThumb => "R3",
+            GamepadButton::None => "None",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            GamepadButton::South => "A / Cross (South)",
+            GamepadButton::East => "B / Circle (East)",
+            GamepadButton::West => "X / Square (West)",
+            GamepadButton::North => "Y / Triangle (North)",
+            GamepadButton::LeftTrigger => "L1 / LB",
+            GamepadButton::RightTrigger => "R1 / RB",
+            GamepadButton::LeftTrigger2 => "L2 / LT",
+            GamepadButton::RightTrigger2 => "R2 / RT",
+            GamepadButton::Start => "Start / Options",
+            GamepadButton::Select => "Select / Back / Share",
+            GamepadButton::LeftThumb => "L3 (Left Stick Press)",
+            GamepadButton::RightThumb => "R3 (Right Stick Press)",
+            GamepadButton::None => "Disabled",
+        }
+    }
+
+    pub fn from_ini_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "SOUTH" | "A" | "CROSS" => Some(GamepadButton::South),
+            "EAST" | "B" | "CIRCLE" => Some(GamepadButton::East),
+            "WEST" | "X" | "SQUARE" => Some(GamepadButton::West),
+            "NORTH" | "Y" | "TRIANGLE" => Some(GamepadButton::North),
+            "L1" | "LB" | "LEFTTRIGGER" | "LEFTBUMPER" => Some(GamepadButton::LeftTrigger),
+            "R1" | "RB" | "RIGHTTRIGGER" | "RIGHTBUMPER" => Some(GamepadButton::RightTrigger),
+            "L2" | "LT" | "LEFTTRIGGER2" => Some(GamepadButton::LeftTrigger2),
+            "R2" | "RT" | "RIGHTTRIGGER2" => Some(GamepadButton::RightTrigger2),
+            "START" | "OPTIONS" | "MENU" => Some(GamepadButton::Start),
+            "SELECT" | "BACK" | "SHARE" | "VIEW" => Some(GamepadButton::Select),
+            "L3" | "LEFTTHUMB" => Some(GamepadButton::LeftThumb),
+            "R3" | "RIGHTTHUMB" => Some(GamepadButton::RightThumb),
+            "NONE" | "OFF" | "DISABLED" => Some(GamepadButton::None),
+            _ => None,
+        }
+    }
+
+    pub const fn to_gilrs(self) -> Option<gilrs::Button> {
+        match self {
+            GamepadButton::South => Some(gilrs::Button::South),
+            GamepadButton::East => Some(gilrs::Button::East),
+            GamepadButton::West => Some(gilrs::Button::West),
+            GamepadButton::North => Some(gilrs::Button::North),
+            GamepadButton::LeftTrigger => Some(gilrs::Button::LeftTrigger),
+            GamepadButton::RightTrigger => Some(gilrs::Button::RightTrigger),
+            GamepadButton::LeftTrigger2 => Some(gilrs::Button::LeftTrigger2),
+            GamepadButton::RightTrigger2 => Some(gilrs::Button::RightTrigger2),
+            GamepadButton::Start => Some(gilrs::Button::Start),
+            GamepadButton::Select => Some(gilrs::Button::Select),
+            GamepadButton::LeftThumb => Some(gilrs::Button::LeftThumb),
+            GamepadButton::RightThumb => Some(gilrs::Button::RightThumb),
+            GamepadButton::None => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GamepadAction {
+    Btn1,
+    Btn2,
+    Btn12,
+    SpeedSwitch,
+}
+
 pub fn key_to_string(key: Key) -> &'static str {
     match key {
         Key::ArrowUp => "Up",
@@ -148,12 +265,18 @@ pub struct KeyBindings {
     pub profile: InputProfile,
     pub input_device: InputDeviceMode,
     pub mouse_sensitivity: f32,
+    pub pad_speed: crate::input_script::PadSpeed,
     pub up: Key,
     pub down: Key,
     pub left: Key,
     pub right: Key,
     pub btn1: Key,
     pub btn2: Key,
+    pub btn12: Key,
+    pub pad_btn1: GamepadButton,
+    pub pad_btn2: GamepadButton,
+    pub pad_btn12: GamepadButton,
+    pub pad_speed_btn: GamepadButton,
 }
 
 impl KeyBindings {
@@ -162,15 +285,39 @@ impl KeyBindings {
             profile: InputProfile::Standard,
             input_device: InputDeviceMode::Gamepad,
             mouse_sensitivity: 1.00,
+            pad_speed: crate::input_script::PadSpeed::Medium,
             up: Key::ArrowUp,
             down: Key::ArrowDown,
             left: Key::ArrowLeft,
             right: Key::ArrowRight,
             btn1: Key::KeyZ,
             btn2: Key::KeyX,
+            btn12: Key::KeyC,
+            pad_btn1: GamepadButton::South,
+            pad_btn2: GamepadButton::East,
+            pad_btn12: GamepadButton::West,
+            pad_speed_btn: GamepadButton::LeftTrigger,
         };
         bindings.load_from_ini();
         bindings
+    }
+
+    pub fn gamepad_button(&self, action: GamepadAction) -> GamepadButton {
+        match action {
+            GamepadAction::Btn1 => self.pad_btn1,
+            GamepadAction::Btn2 => self.pad_btn2,
+            GamepadAction::Btn12 => self.pad_btn12,
+            GamepadAction::SpeedSwitch => self.pad_speed_btn,
+        }
+    }
+
+    pub fn set_gamepad_button(&mut self, action: GamepadAction, btn: GamepadButton) {
+        match action {
+            GamepadAction::Btn1 => self.pad_btn1 = btn,
+            GamepadAction::Btn2 => self.pad_btn2 = btn,
+            GamepadAction::Btn12 => self.pad_btn12 = btn,
+            GamepadAction::SpeedSwitch => self.pad_speed_btn = btn,
+        }
     }
 
     // User choice: apply and write the ini
@@ -189,6 +336,7 @@ impl KeyBindings {
                 self.right = Key::ArrowRight;
                 self.btn1 = Key::KeyZ;
                 self.btn2 = Key::KeyX;
+                self.btn12 = Key::KeyC;
             }
             InputProfile::Wasd => {
                 self.up = Key::KeyW;
@@ -197,6 +345,7 @@ impl KeyBindings {
                 self.right = Key::KeyD;
                 self.btn1 = Key::KeyJ;
                 self.btn2 = Key::KeyK;
+                self.btn12 = Key::KeyU;
             }
             InputProfile::Numpad => {
                 self.up = Key::Numpad8;
@@ -205,6 +354,7 @@ impl KeyBindings {
                 self.right = Key::Numpad6;
                 self.btn1 = Key::Numpad1;
                 self.btn2 = Key::Numpad0;
+                self.btn12 = Key::Numpad3;
             }
             InputProfile::Custom => {
                 // Keep custom key configuration intact
@@ -229,17 +379,26 @@ impl KeyBindings {
              input_device={}\n\
              # Mouse sensitivity multiplier (0.50 = 50% recommended for modern high-DPI mice)\n\
              mouse_sensitivity={:.2}\n\
+             # Philips CD-i Gamepad (22ER9021) 3-level cursor speed: 1 (Slow) | 2 (Medium) | 3 (Fast)\n\
+             pad_speed={}\n\
              # Profile: Standard | WASD | Numpad | Custom\n\
              profile={}\n\n\
-             # Custom key bindings (active with profile=Custom or as overrides):\n\
+             # Custom keyboard bindings (active with profile=Custom or as overrides):\n\
              up={}\n\
              down={}\n\
              left={}\n\
              right={}\n\
              btn1={}\n\
-             btn2={}\n",
+             btn2={}\n\
+             btn12={}\n\n\
+             # USB Gamepad button mapping (South, East, West, North, L1, R1, L2, R2, Start, Select, L3, R3, None):\n\
+             gamepad_btn1={}\n\
+             gamepad_btn2={}\n\
+             gamepad_btn12={}\n\
+             gamepad_speed_btn={}\n",
             dev_str,
             self.mouse_sensitivity,
+            self.pad_speed.level(),
             prof_str,
             key_to_string(self.up),
             key_to_string(self.down),
@@ -247,6 +406,11 @@ impl KeyBindings {
             key_to_string(self.right),
             key_to_string(self.btn1),
             key_to_string(self.btn2),
+            key_to_string(self.btn12),
+            self.pad_btn1.as_ini_str(),
+            self.pad_btn2.as_ini_str(),
+            self.pad_btn12.as_ini_str(),
+            self.pad_speed_btn.as_ini_str(),
         );
         let _ = std::fs::write("opencdi_controls.ini", content);
     }
@@ -273,6 +437,17 @@ impl KeyBindings {
                                 self.mouse_sensitivity = factor.clamp(0.05, 10.0);
                             }
                         },
+                        "pad_speed" => {
+                            if let Ok(lvl) = parts[1].parse::<u8>() {
+                                self.pad_speed = crate::input_script::PadSpeed::from_level(lvl);
+                            } else {
+                                self.pad_speed = match parts[1].to_lowercase().as_str() {
+                                    "low" | "slow" => crate::input_script::PadSpeed::Low,
+                                    "high" | "fast" => crate::input_script::PadSpeed::High,
+                                    _ => crate::input_script::PadSpeed::Medium,
+                                };
+                            }
+                        },
                         "profile" => match parts[1].to_lowercase().as_str() {
                             "wasd" => self.apply_profile(InputProfile::Wasd),
                             "numpad" => self.apply_profile(InputProfile::Numpad),
@@ -288,6 +463,11 @@ impl KeyBindings {
                         "right" => if let Some(k) = string_to_key(parts[1]) { self.right = k; detected_custom = true; }
                         "btn1" => if let Some(k) = string_to_key(parts[1]) { self.btn1 = k; detected_custom = true; }
                         "btn2" => if let Some(k) = string_to_key(parts[1]) { self.btn2 = k; detected_custom = true; }
+                        "btn12" | "btn3" => if let Some(k) = string_to_key(parts[1]) { self.btn12 = k; detected_custom = true; }
+                        "gamepad_btn1" => if let Some(b) = GamepadButton::from_ini_str(parts[1]) { self.pad_btn1 = b; }
+                        "gamepad_btn2" => if let Some(b) = GamepadButton::from_ini_str(parts[1]) { self.pad_btn2 = b; }
+                        "gamepad_btn12" | "gamepad_btn3" => if let Some(b) = GamepadButton::from_ini_str(parts[1]) { self.pad_btn12 = b; }
+                        "gamepad_speed_btn" => if let Some(b) = GamepadButton::from_ini_str(parts[1]) { self.pad_speed_btn = b; }
                         _ => {}
                     }
                 }
@@ -311,12 +491,18 @@ pub enum GuiAction {
     SetProfile(InputProfile),
     SetInputDevice(InputDeviceMode),
     SetMouseSensitivity(f32),
+    SetPadSpeed(crate::input_script::PadSpeed),
+    CyclePadSpeed,
+    SetGamepadButton(GamepadAction, GamepadButton),
     ReloadControls,
     ToggleReleaseMouse,
     ToggleMute,
     VolumeUp,
     VolumeDown,
+    SetAudioLatency(crate::audio::AudioLatency),
     ToggleFullscreen,
+    ToggleExclusiveFullscreen,
+    ToggleDeinterlace,
     TakeScreenshot,
     SetVideoMode(crate::mcd212::VideoMode),
     ToggleWaitStates,
@@ -493,4 +679,75 @@ pub fn save_dvc_preference(board: crate::bus::BoardKind, path: &std::path::Path)
         lines.push(format!("{}={}", key, path.display()));
     }
     let _ = std::fs::write(CONFIG_FILE, lines.join("\n") + "\n");
+}
+
+pub fn load_string_preference(key: &str) -> Option<String> {
+    let content = std::fs::read_to_string(CONFIG_FILE).ok()?;
+    for line in content.lines().map(str::trim) {
+        if line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim().eq_ignore_ascii_case(key) {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+pub fn save_string_preference(key: &str, val: &str) {
+    let mut lines = Vec::new();
+    let mut found = false;
+    if let Ok(content) = std::fs::read_to_string(CONFIG_FILE) {
+        for line in content.lines() {
+            if let Some((k, _)) = line.trim().split_once('=') {
+                if k.trim().eq_ignore_ascii_case(key) {
+                    lines.push(format!("{}={}", key, val));
+                    found = true;
+                    continue;
+                }
+            }
+            lines.push(line.to_string());
+        }
+    }
+    if !found {
+        if lines.is_empty() {
+            lines.push("# OpenCDi Emulator Configuration".to_string());
+        }
+        lines.push(format!("{}={}", key, val));
+    }
+    let _ = std::fs::write(CONFIG_FILE, lines.join("\n") + "\n");
+}
+
+pub fn load_bool_preference(key: &str, default: bool) -> bool {
+    match load_string_preference(key) {
+        Some(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"),
+        None => default,
+    }
+}
+
+pub fn save_bool_preference(key: &str, value: bool) {
+    save_string_preference(key, if value { "on" } else { "off" });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gamepad_button_ini_round_trip_and_aliases() {
+        for btn in GamepadButton::ALL {
+            assert_eq!(GamepadButton::from_ini_str(btn.as_ini_str()), Some(btn));
+            assert_eq!(btn.to_gilrs().is_none(), btn == GamepadButton::None);
+        }
+        assert_eq!(GamepadButton::from_ini_str("Cross"), Some(GamepadButton::South));
+        assert_eq!(GamepadButton::from_ini_str("Circle"), Some(GamepadButton::East));
+        assert_eq!(GamepadButton::from_ini_str("Square"), Some(GamepadButton::West));
+        assert_eq!(GamepadButton::from_ini_str("Triangle"), Some(GamepadButton::North));
+        assert_eq!(GamepadButton::from_ini_str("LB"), Some(GamepadButton::LeftTrigger));
+        assert_eq!(GamepadButton::from_ini_str("RT"), Some(GamepadButton::RightTrigger2));
+        assert_eq!(GamepadButton::from_ini_str("Disabled"), Some(GamepadButton::None));
+        assert_eq!(GamepadButton::from_ini_str("invalid"), None);
+    }
 }

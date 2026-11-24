@@ -5,6 +5,7 @@ use input::{Input, Table};
 use libretro::*;
 use opencdi::audio;
 use opencdi::bios;
+use opencdi::deinterlace::Deinterlacer;
 use opencdi::machine::Machine;
 use opencdi::mcd212::{VideoMode, SCREEN_HEIGHT, SCREEN_WIDTH};
 use opencdi::savestate::{Reader, State};
@@ -47,7 +48,47 @@ struct LoadSpec {
 const OPT_DVC: &CStr = c"opencdi_dvc";
 const OPT_MONO4: &CStr = c"opencdi_mono4";
 const OPT_LEVELS: &CStr = c"opencdi_video_levels";
+const OPT_DEINTERLACE: &CStr = c"opencdi_deinterlace";
+const OPT_DPAD_SPEED_X: &CStr = c"opencdi_dpad_speed_x";
+const OPT_DPAD_SPEED_Y: &CStr = c"opencdi_dpad_speed_y";
+const OPT_ANALOG_SPEED_X: &CStr = c"opencdi_analog_speed_x";
+const OPT_ANALOG_SPEED_Y: &CStr = c"opencdi_analog_speed_y";
+const OPT_CURSOR_BOOST: &CStr = c"opencdi_cursor_boost";
 const NO_VALUE: retro_core_option_value = retro_core_option_value { value: std::ptr::null(), label: std::ptr::null() };
+
+const DPAD_SPEED_VALUES: [(&CStr, &CStr); 12] = [
+    (c"1", c"1 px/frame (Slowest)"),
+    (c"2", c"2 px/frame"),
+    (c"3", c"3 px/frame (Default)"),
+    (c"4", c"4 px/frame"),
+    (c"5", c"5 px/frame"),
+    (c"6", c"6 px/frame"),
+    (c"7", c"7 px/frame"),
+    (c"8", c"8 px/frame"),
+    (c"9", c"9 px/frame"),
+    (c"10", c"10 px/frame"),
+    (c"11", c"11 px/frame"),
+    (c"12", c"12 px/frame (Fastest)"),
+];
+
+const ANALOG_SPEED_VALUES: [(&CStr, &CStr); 16] = [
+    (c"1", c"1 px/frame (Slowest)"),
+    (c"2", c"2 px/frame"),
+    (c"3", c"3 px/frame"),
+    (c"4", c"4 px/frame"),
+    (c"5", c"5 px/frame"),
+    (c"6", c"6 px/frame (Default)"),
+    (c"7", c"7 px/frame"),
+    (c"8", c"8 px/frame"),
+    (c"9", c"9 px/frame"),
+    (c"10", c"10 px/frame"),
+    (c"11", c"11 px/frame"),
+    (c"12", c"12 px/frame"),
+    (c"13", c"13 px/frame"),
+    (c"14", c"14 px/frame"),
+    (c"15", c"15 px/frame"),
+    (c"16", c"16 px/frame (Fastest)"),
+];
 
 const fn option_values(list: &[(&CStr, &CStr)]) -> [retro_core_option_value; RETRO_NUM_CORE_OPTION_VALUES_MAX] {
     let mut out = [NO_VALUE; RETRO_NUM_CORE_OPTION_VALUES_MAX];
@@ -60,7 +101,7 @@ const fn option_values(list: &[(&CStr, &CStr)]) -> [retro_core_option_value; RET
 }
 
 // Core options v1, terminated by an empty entry; frontends without v1 get VARIABLES below.
-static OPTIONS: Table<[retro_core_option_definition; 4]> = Table([
+static OPTIONS: Table<[retro_core_option_definition; 10]> = Table([
     retro_core_option_definition {
         key: OPT_DVC.as_ptr(),
         desc: c"DVC cartridge (restart)".as_ptr(),
@@ -82,12 +123,60 @@ static OPTIONS: Table<[retro_core_option_definition; 4]> = Table([
         values: option_values(&[(c"studio", c"studio (black 16)"), (c"full", c"full (black 0)")]),
         default_value: c"studio".as_ptr(),
     },
+    retro_core_option_definition {
+        key: OPT_DEINTERLACE.as_ptr(),
+        desc: c"De-interlacing (FMV / Interlaced)".as_ptr(),
+        info: c"Motion-adaptive presentation de-interlacer: keeps full weave resolution on static areas and reconstructs moving interlaced regions (such as FMV camera pans) without vertical jitter. Takes effect at once.".as_ptr(),
+        values: option_values(&[(c"off", c"off"), (c"on", c"on (motion-adaptive)")]),
+        default_value: c"off".as_ptr(),
+    },
+    retro_core_option_definition {
+        key: OPT_DPAD_SPEED_X.as_ptr(),
+        desc: c"Cursor D-Pad speed (horizontal)".as_ptr(),
+        info: c"Horizontal CD-i pointer speed (pixels per frame at Medium pad speed) when controlled with the D-Pad. Combines with the 3-level L button pad speed switch and R boost. Takes effect at once.".as_ptr(),
+        values: option_values(&DPAD_SPEED_VALUES),
+        default_value: c"3".as_ptr(),
+    },
+    retro_core_option_definition {
+        key: OPT_DPAD_SPEED_Y.as_ptr(),
+        desc: c"Cursor D-Pad speed (vertical)".as_ptr(),
+        info: c"Vertical CD-i pointer speed (pixels per frame at Medium pad speed) when controlled with the D-Pad. Useful because CD-i native output is 768x560. Takes effect at once.".as_ptr(),
+        values: option_values(&DPAD_SPEED_VALUES),
+        default_value: c"3".as_ptr(),
+    },
+    retro_core_option_definition {
+        key: OPT_ANALOG_SPEED_X.as_ptr(),
+        desc: c"Cursor analog stick speed (horizontal)".as_ptr(),
+        info: c"Maximum horizontal CD-i pointer speed (pixels per frame at full deflection) for the left analog stick. Movement scales proportionally beyond the inner deadzone. Takes effect at once.".as_ptr(),
+        values: option_values(&ANALOG_SPEED_VALUES),
+        default_value: c"6".as_ptr(),
+    },
+    retro_core_option_definition {
+        key: OPT_ANALOG_SPEED_Y.as_ptr(),
+        desc: c"Cursor analog stick speed (vertical)".as_ptr(),
+        info: c"Maximum vertical CD-i pointer speed (pixels per frame at full deflection) for the left analog stick. Movement scales proportionally beyond the inner deadzone. Takes effect at once.".as_ptr(),
+        values: option_values(&ANALOG_SPEED_VALUES),
+        default_value: c"6".as_ptr(),
+    },
+    retro_core_option_definition {
+        key: OPT_CURSOR_BOOST.as_ptr(),
+        desc: c"Cursor speed boost (hold R)".as_ptr(),
+        info: c"Speed multiplier applied while holding the R (or mapped boost) button on D-Pad or left analog cursor movement. Takes effect at once.".as_ptr(),
+        values: option_values(&[(c"1.0", c"Off (1.0x)"), (c"1.5", c"1.5x"), (c"2.0", c"2.0x (Default)"), (c"2.5", c"2.5x"), (c"3.0", c"3.0x")]),
+        default_value: c"2.0".as_ptr(),
+    },
     retro_core_option_definition { key: std::ptr::null(), desc: std::ptr::null(), info: std::ptr::null(), values: [NO_VALUE; RETRO_NUM_CORE_OPTION_VALUES_MAX], default_value: std::ptr::null() },
 ]);
-static VARIABLES: Table<[retro_variable; 4]> = Table([
+static VARIABLES: Table<[retro_variable; 10]> = Table([
     retro_variable { key: OPT_DVC.as_ptr(), value: c"DVC cartridge (restart); auto|off".as_ptr() },
     retro_variable { key: OPT_MONO4.as_ptr(), value: c"CD-i 490 BIOS, experimental (restart); off|on".as_ptr() },
     retro_variable { key: OPT_LEVELS.as_ptr(), value: c"Video levels; studio|full".as_ptr() },
+    retro_variable { key: OPT_DEINTERLACE.as_ptr(), value: c"De-interlacing (FMV / Interlaced); off|on".as_ptr() },
+    retro_variable { key: OPT_DPAD_SPEED_X.as_ptr(), value: c"Cursor D-Pad speed (horizontal); 3|1|2|4|5|6|7|8|9|10|11|12".as_ptr() },
+    retro_variable { key: OPT_DPAD_SPEED_Y.as_ptr(), value: c"Cursor D-Pad speed (vertical); 3|1|2|4|5|6|7|8|9|10|11|12".as_ptr() },
+    retro_variable { key: OPT_ANALOG_SPEED_X.as_ptr(), value: c"Cursor analog stick speed (horizontal); 6|1|2|3|4|5|7|8|9|10|11|12|13|14|15|16".as_ptr() },
+    retro_variable { key: OPT_ANALOG_SPEED_Y.as_ptr(), value: c"Cursor analog stick speed (vertical); 6|1|2|3|4|5|7|8|9|10|11|12|13|14|15|16".as_ptr() },
+    retro_variable { key: OPT_CURSOR_BOOST.as_ptr(), value: c"Cursor speed boost (hold R); 2.0|1.0|1.5|2.5|3.0".as_ptr() },
     retro_variable { key: std::ptr::null(), value: std::ptr::null() },
 ]);
 
@@ -102,6 +191,8 @@ struct Core {
     uart_line: Vec<u8>,
     state_buf: Vec<u8>,
     state_size: usize,
+    deinterlace: bool,
+    deinterlacer: Deinterlacer,
 }
 
 static CALLBACKS: Mutex<Callbacks> = Mutex::new(Callbacks {
@@ -123,6 +214,8 @@ static CORE: Mutex<Core> = Mutex::new(Core {
     input: Input::new(),
     state_buf: Vec::new(),
     state_size: 0,
+    deinterlace: false,
+    deinterlacer: Deinterlacer::new(),
 });
 static LOG: Mutex<retro_log_printf_t> = Mutex::new(None);
 static POISONED: AtomicBool = AtomicBool::new(false);
@@ -268,6 +361,32 @@ fn options_updated() -> bool {
     // SAFETY: GET_VARIABLE_UPDATE writes one bool.
     let ok = unsafe { env_call(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &mut changed as *mut bool as *mut c_void) };
     ok && changed
+}
+
+fn parse_cursor_speed(raw: Option<&str>, default: i32, min: i32, max: i32) -> i32 {
+    raw.and_then(|s| s.trim().parse::<i32>().ok())
+        .map_or(default, |v| v.clamp(min, max))
+}
+
+fn parse_boost_x10(raw: Option<&str>) -> i32 {
+    match raw.map(str::trim) {
+        Some("1.0") => 10,
+        Some("1.5") => 15,
+        Some("2.0") => 20,
+        Some("2.5") => 25,
+        Some("3.0") => 30,
+        _ => input::DEFAULT_BOOST_X10,
+    }
+}
+
+fn read_cursor_config() -> input::CursorConfig {
+    input::CursorConfig {
+        dpad_speed_x: parse_cursor_speed(option_value(OPT_DPAD_SPEED_X).as_deref(), input::DEFAULT_DPAD_SPEED, 1, 12),
+        dpad_speed_y: parse_cursor_speed(option_value(OPT_DPAD_SPEED_Y).as_deref(), input::DEFAULT_DPAD_SPEED, 1, 12),
+        analog_speed_x: parse_cursor_speed(option_value(OPT_ANALOG_SPEED_X).as_deref(), input::DEFAULT_ANALOG_SPEED, 1, 16),
+        analog_speed_y: parse_cursor_speed(option_value(OPT_ANALOG_SPEED_Y).as_deref(), input::DEFAULT_ANALOG_SPEED, 1, 16),
+        boost_multiplier_x10: parse_boost_x10(option_value(OPT_CURSOR_BOOST).as_deref()),
+    }
 }
 
 // The IMPEG cartridge for the 490 board; only the known dump is fitted.
@@ -530,6 +649,7 @@ pub extern "C" fn retro_reset() {
                 }
                 core.machine = Some(m);
                 core.input.reset();
+                core.deinterlacer.reset();
                 core.frames_out = 0;
             }
             Err(e) => log(RETRO_LOG_ERROR, &format!("reset failed: {}", e)),
@@ -571,22 +691,33 @@ pub extern "C" fn retro_run() {
             unsafe { poll() };
         }
         let mut core = lock(&CORE);
-        let Core { machine, input, uart_line, .. } = &mut *core;
+        let Core { machine, input, uart_line, deinterlace, deinterlacer, .. } = &mut *core;
         let Some(m) = machine.as_mut() else { return };
         if options_updated() {
             opencdi::mcd212::set_studio_levels(option_value(OPT_LEVELS).as_deref() != Some("full"));
+            let new_deint = option_value(OPT_DEINTERLACE).as_deref() == Some("on");
+            if new_deint != *deinterlace {
+                *deinterlace = new_deint;
+                deinterlacer.reset();
+            }
+            input.config = read_cursor_config();
         }
-        input.apply(cb.input_state, &mut m.bus);
+        let speed_changed = input.apply(cb.input_state, &mut m.bus);
         m.run_frame();
         if let Some(buf) = m.bus.uart_capture.as_mut() {
             drain_uart(buf, uart_line);
         }
         if let Some(video) = cb.video {
-            let fb = m.framebuffer();
+            let (interlaced, odd_field, y_offset) = m.bus.mcd212.display_interlace_info();
+            let fb = deinterlacer.process(m.framebuffer(), interlaced, odd_field, y_offset, *deinterlace);
             // SAFETY: `fb` is SCREEN_WIDTH * SCREEN_HEIGHT XRGB8888 pixels, valid for the duration of the call.
             unsafe { video(fb.as_ptr() as *const c_void, SCREEN_WIDTH as c_uint, SCREEN_HEIGHT as c_uint, SCREEN_WIDTH * 4) };
         }
         send_audio(&mut core, cb.audio_batch);
+        drop(core);
+        if let Some(speed) = speed_changed {
+            show_message(&format!("CD-i Pad Speed: {}", speed.label()));
+        }
     })
 }
 
@@ -730,11 +861,16 @@ fn load(game: *const retro_game_info) -> Result<(), String> {
         spec.disc.as_ref().map_or("none".into(), |d| d.display().to_string()),
         spec.mode
     ));
+    let deinterlace = option_value(OPT_DEINTERLACE).as_deref() == Some("on");
+    let cursor_config = read_cursor_config();
     let mut core = lock(&CORE);
     core.machine = Some(m);
     core.spec = Some(spec);
     core.temp_disc = temp;
     core.input.reset();
+    core.input.config = cursor_config;
+    core.deinterlace = deinterlace;
+    core.deinterlacer.reset();
     core.frames_out = 0;
     core.state_size = 0;
     Ok(())
@@ -754,6 +890,7 @@ fn unload() {
     core.spec = None;
     core.state_size = 0;
     core.state_buf = Vec::new();
+    core.deinterlacer.reset();
     if let Some(p) = core.temp_disc.take() {
         let _ = std::fs::remove_file(p);
     }
@@ -879,6 +1016,26 @@ mod tests {
         assert_eq!(retro_get_memory_size(RETRO_MEMORY_SYSTEM_RAM), 0);
         retro_deinit();
         assert!(!POISONED.load(Ordering::SeqCst), "retro_deinit clears the poison");
+    }
+
+    #[test]
+    fn static_ffi_tables_are_null_terminated() {
+        assert!(OPTIONS.0.last().unwrap().key.is_null(), "OPTIONS must end with null terminator");
+        assert!(VARIABLES.0.last().unwrap().key.is_null(), "VARIABLES must end with null terminator");
+        assert!(input::DESCRIPTORS.0.last().unwrap().description.is_null(), "DESCRIPTORS must end with null terminator");
+        assert!(input::CONTROLLER_INFO.0.last().unwrap().types.is_null(), "CONTROLLER_INFO must end with null terminator");
+    }
+
+    #[test]
+    fn cursor_speed_and_boost_options_parse_and_clamp() {
+        assert_eq!(parse_cursor_speed(None, 3, 1, 12), 3);
+        assert_eq!(parse_cursor_speed(Some("0"), 3, 1, 12), 1);
+        assert_eq!(parse_cursor_speed(Some("99"), 6, 1, 16), 16);
+        assert_eq!(parse_cursor_speed(Some(" 8 "), 6, 1, 16), 8);
+        assert_eq!(parse_boost_x10(Some("1.0")), 10);
+        assert_eq!(parse_boost_x10(Some("1.5")), 15);
+        assert_eq!(parse_boost_x10(Some("3.0")), 30);
+        assert_eq!(parse_boost_x10(None), 20);
     }
 
     #[cfg(unix)]

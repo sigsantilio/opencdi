@@ -1300,7 +1300,7 @@ mod tests {
         // TOC packets should list Track 1 at LBA 20 + 150 = 170 (00:02:20) and Track 2 at LBA 26 + 150 = 176 (00:02:26)
         let toc = Cdic::build_toc_packets(&cd);
         assert_eq!(toc.len(), 5);
-        assert_eq!(toc[0], [0x01, 0xA0, 0x01, 0x10, 0x00]); // Track 1 audio, CD-i Ready disc_type=0x10
+        assert_eq!(toc[0], [0x01, 0xA0, 0x01, 0x00, 0x00]); // Track 1 audio, CD-i Ready disc_type=0x00 (Green Book Ch. VIII)
         assert_eq!(toc[1], [0x01, 0xA1, 0x02, 0x00, 0x00]);
         assert_eq!(toc[2], [0x01, 0xA2, 0x00, 0x02, 0x32]); // 32 + 150 = 182 frames = 00:02:32
         assert_eq!(toc[3], [0x01, 0x01, 0x00, 0x02, 0x20]); // Track 1 INDEX 01
@@ -1321,6 +1321,27 @@ mod tests {
         c.curr_lba = 27;
         let q_t2 = c.track_q_fields(&cd);
         assert_eq!(q_t2[0..6], [0x01, 0x02, 0x01, 0x00, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn chd_cdi_ready_apprentice_toc_reports_audio_type_and_track1_idx01() {
+        let entries = [
+            crate::cdrom::parse_chd_track_entry(
+                "TRACK:1 TYPE:AUDIO SUBTYPE:NONE FRAMES:81650 PREGAP:69150 PGTYPE:VAUDIO PGSUB:NONE POSTGAP:0\0",
+            )
+            .unwrap(),
+            crate::cdrom::parse_chd_track_entry(
+                "TRACK:2 TYPE:AUDIO SUBTYPE:NONE FRAMES:12000 PREGAP:150 PGTYPE:VAUDIO PGSUB:NONE POSTGAP:0\0",
+            )
+            .unwrap(),
+        ];
+        let (tracks, total_sectors) = crate::cdrom::build_chd_tracks(&entries);
+        assert!(CdRom::is_cdi_ready_layout(&tracks));
+        // Once LBA 16 decodes CD-RTOS on a CD-i Ready CHD, detect_disc_type sets disc_type = 0x00.
+        let cd = CdRom::from_tracks_for_test(tracks, total_sectors, 0x00);
+        let toc = Cdic::build_toc_packets(&cd);
+        assert_eq!(toc[0], [0x01, 0xA0, 0x01, 0x00, 0x00]); // Track 1 audio, A0 PSEC = 0x00 (CD-i Ready)
+        assert_eq!(toc[3], [0x01, 0x01, 0x15, 0x24, 0x00]); // Track 1 INDEX 01 = 69150 + 150 = 69300 = 15:24:00
     }
 
     #[test]

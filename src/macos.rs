@@ -170,15 +170,16 @@ pub fn ask_bios_copied(folder: &Path) -> bool {
 
 pub const CONTROLS_TEXT: &str = "\
 Keyboard (Standard profile)
-  Arrow keys: move  ·  Z: button 1  ·  X: button 2
+  Arrow keys: move  ·  Z: button 1  ·  X: button 2  ·  C: button 1+2 (combined)
   The WASD, Numpad and Custom profiles are set in opencdi_controls.ini.
 
 Mouse
   Left click: button 1 (captures the mouse)  ·  Right click: button 2
   Middle click: capture / release the mouse  ·  F9: switch gamepad ↔ mouse
 
-USB gamepad
+USB gamepad (remappable in opencdi_controls.ini)
   D-pad or left stick: move  ·  A / Cross: button 1  ·  B / Circle: button 2
+  X / Square: button 1+2 (combined)  ·  L1 / LB (or Tab): cycle 3-level CD-i pad speed
 
 Shortcuts
   ⌘O: open disc and restart  ·  ⌘I: insert disc  ·  ⌘E: eject
@@ -197,6 +198,7 @@ pub fn show_about(parent: Parent, data_dir: Option<&Path>) {
     let mut text = format!(
         "OpenCDi {} - Philips CD-i emulator\nhttps://github.com/sigsantilio/opencdi\n\n\
          Gianluca \"sigsantilio\", ArnoldDeRuiter and OpenCDi contributors.\n\
+         Special thanks to whatever-industries (E-Di) for motion-adaptive de-interlacing (MIT) and CD-i hardware research.\n\
          CD-i drivers ported with reference to MAME (BSD-3-Clause).",
         env!("CARGO_PKG_VERSION")
     );

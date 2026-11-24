@@ -8,6 +8,62 @@ pub const START_Y: i32 = 280;
 // Pointer speed of the d-pad, pixels per frame per axis.
 pub const PAD_SPEED: i32 = 3;
 
+/// Authentic Philips CD-i gamepad (22ER9021 / 22ER9017) 3-level cursor speed switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PadSpeed {
+    Low = 1,
+    Medium = 2,
+    High = 3,
+}
+
+impl PadSpeed {
+    pub const fn next(self) -> Self {
+        match self {
+            PadSpeed::Low => PadSpeed::Medium,
+            PadSpeed::Medium => PadSpeed::High,
+            PadSpeed::High => PadSpeed::Low,
+        }
+    }
+
+    pub const fn from_level(level: u8) -> Self {
+        match level {
+            1 => PadSpeed::Low,
+            3 => PadSpeed::High,
+            _ => PadSpeed::Medium,
+        }
+    }
+
+    pub const fn level(self) -> u8 {
+        self as u8
+    }
+
+    /// Pixels per frame per axis for Libretro / integer D-pad stepping (default Medium = PAD_SPEED).
+    pub const fn pixels_per_frame(self) -> i32 {
+        match self {
+            PadSpeed::Low => 2,
+            PadSpeed::Medium => PAD_SPEED,
+            PadSpeed::High => 6,
+        }
+    }
+
+    /// Pixels per frame per axis for standalone host D-pad / keyboard stepping (default Medium = 5.0).
+    pub const fn standalone_speed(self) -> f32 {
+        match self {
+            PadSpeed::Low => 2.5,
+            PadSpeed::Medium => 5.0,
+            PadSpeed::High => 8.0,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            PadSpeed::Low => "1/3 (Slow)",
+            PadSpeed::Medium => "2/3 (Medium)",
+            PadSpeed::High => "3/3 (Fast)",
+        }
+    }
+}
+
 // Button mask as passed to `Slave::update_mouse`: button 1, button 2, third button (presses both on Mono-I).
 pub const BTN_1: u8 = 1;
 pub const BTN_2: u8 = 2;
@@ -70,17 +126,27 @@ impl Pad {
         m
     }
 
-    // Unclamped move of the held directions, PAD_SPEED per axis.
-    pub fn delta(self) -> (i32, i32) {
+    // Unclamped move of the held directions, `speed` pixels per axis.
+    pub fn delta_with_speed(self, speed: i32) -> (i32, i32) {
         let dx = self.held(PadButton::Right) as i32 - self.held(PadButton::Left) as i32;
         let dy = self.held(PadButton::Down) as i32 - self.held(PadButton::Up) as i32;
-        (dx * PAD_SPEED, dy * PAD_SPEED)
+        (dx * speed, dy * speed)
+    }
+
+    // Unclamped move of the held directions, PAD_SPEED per axis.
+    pub fn delta(self) -> (i32, i32) {
+        self.delta_with_speed(PAD_SPEED)
+    }
+
+    // Moves (x, y) by `speed` per held direction, clamped to the slave's range.
+    pub fn step_with_speed(self, x: i32, y: i32, speed: i32) -> (i32, i32) {
+        let (dx, dy) = self.delta_with_speed(speed);
+        ((x + dx).clamp(0, MAX_X), (y + dy).clamp(0, MAX_Y))
     }
 
     // Moves (x, y) by PAD_SPEED per held direction, clamped to the slave's range.
     pub fn step(self, x: i32, y: i32) -> (i32, i32) {
-        let (dx, dy) = self.delta();
-        ((x + dx).clamp(0, MAX_X), (y + dy).clamp(0, MAX_Y))
+        self.step_with_speed(x, y, PAD_SPEED)
     }
 }
 

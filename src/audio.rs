@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 #[cfg(feature = "host")]
-use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
+use std::sync::{Arc, atomic::{AtomicU32, AtomicUsize, Ordering}};
 #[cfg(feature = "host")]
 use log::{info, warn, error};
 use crate::mcd212::VideoMode;
@@ -536,29 +536,115 @@ impl CdiAudio {
     }
 }
 
-#[cfg(feature = "host")]
-pub struct HostAudioOutput {
-    _stream: cpal::Stream,
+/// Configurable standalone host audio ring buffer latency preset.
+///
+/// The emulated CD-i audio path itself has only one CD sector period (13.3 ms) of
+/// ADPCM decode latency; previously the standalone host ring targeted 8192 frames
+/// (~186 ms), making sound effects feel noticeably delayed behind gameplay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AudioLatency {
+    /// ~32 ms (1408 frames at 44.1 kHz) — tightest response for crisp SFX
+    Low,
+    /// ~46 ms (2048 frames at 44.1 kHz) — balanced low-latency default (>2 PAL frames of jitter margin)
+    #[default]
+    Normal,
+    /// ~93 ms (4096 frames at 44.1 kHz) — extra headroom for busy systems
+    High,
+    /// ~186 ms (8192 frames at 44.1 kHz) — legacy maximum safety buffer
+    Safe,
 }
 
-// Most frames the sound-card ring holds (about 1.7 s); the oldest are dropped beyond it.
-pub const RING_CAP: usize = 65536;
+impl AudioLatency {
+    pub const fn target_frames(self) -> usize {
+        match self {
+            AudioLatency::Low => 1408,
+            AudioLatency::Normal => 2048,
+            AudioLatency::High => 4096,
+            AudioLatency::Safe => 8192,
+        }
+    }
 
-// Appends output frames to the sound-card ring, dropping the oldest beyond RING_CAP.
-pub fn feed_ring(ring: &Mutex<VecDeque<Frame>>, frames: &[Frame]) {
-    if let Ok(mut q) = ring.lock() {
-        q.extend(frames.iter().copied());
-        if q.len() > RING_CAP {
-            let n = q.len() - RING_CAP;
-            q.drain(..n);
+    pub const fn prebuffer_frames(self) -> usize {
+        match self {
+            AudioLatency::Low => 704,
+            AudioLatency::Normal => 1024,
+            AudioLatency::High => 1536,
+            AudioLatency::Safe => 2048,
+        }
+    }
+
+    pub const fn max_ring_frames(self) -> usize {
+        match self {
+            AudioLatency::Low => 5632,
+            AudioLatency::Normal => 8192,
+            AudioLatency::High => 16384,
+            AudioLatency::Safe => 32768,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            AudioLatency::Low => "low",
+            AudioLatency::Normal => "normal",
+            AudioLatency::High => "high",
+            AudioLatency::Safe => "safe",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            AudioLatency::Low => "Low (~32 ms)",
+            AudioLatency::Normal => "Normal (~46 ms)",
+            AudioLatency::High => "High (~93 ms)",
+            AudioLatency::Safe => "Safe (~186 ms)",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "low" | "32" | "32ms" => Some(AudioLatency::Low),
+            "normal" | "medium" | "default" | "46" | "46ms" => Some(AudioLatency::Normal),
+            "high" | "93" | "93ms" => Some(AudioLatency::High),
+            "safe" | "legacy" | "186" | "186ms" => Some(AudioLatency::Safe),
+            _ => None,
         }
     }
 }
 
 #[cfg(feature = "host")]
+pub struct HostAudioOutput {
+    _stream: cpal::Stream,
+}
+
+// Most frames the sound-card ring holds; feed_ring_capped trims tighter based on the active AudioLatency preset.
+pub const RING_CAP: usize = 65536;
+
+// Appends output frames to the sound-card ring, dropping the oldest beyond `max_cap`.
+pub fn feed_ring_capped(ring: &Mutex<VecDeque<Frame>>, frames: &[Frame], max_cap: usize) {
+    let cap = max_cap.clamp(1024, RING_CAP);
+    if let Ok(mut q) = ring.lock() {
+        q.extend(frames.iter().copied());
+        if q.len() > cap {
+            let n = q.len() - cap;
+            q.drain(..n);
+        }
+    }
+}
+
+// Appends output frames to the sound-card ring, dropping the oldest beyond RING_CAP.
+pub fn feed_ring(ring: &Mutex<VecDeque<Frame>>, frames: &[Frame]) {
+    feed_ring_capped(ring, frames, RING_CAP);
+}
+
+#[cfg(feature = "host")]
 impl HostAudioOutput {
-    // Plays the ring (OUT_RATE frames) on the default device; `gain` holds the volume as f32 bits (0 is mute).
-    pub fn try_start(ring: Arc<Mutex<VecDeque<Frame>>>, gain: Arc<AtomicU32>) -> Option<Self> {
+    // Plays the ring (OUT_RATE frames) on the default device; `gain` holds the volume as f32 bits (0 is mute)
+    // and `target_frames` holds the live ring-buffer latency target (see `AudioLatency`).
+    pub fn try_start(
+        ring: Arc<Mutex<VecDeque<Frame>>>,
+        gain: Arc<AtomicU32>,
+        target_frames: Arc<AtomicUsize>,
+    ) -> Option<Self> {
         let host = cpal::default_host();
         let device = match host.default_output_device() {
             Some(d) => d,
@@ -608,10 +694,11 @@ impl HostAudioOutput {
                     }
                 };
                 let q_len = q.len();
+                let target = target_frames.load(Ordering::Relaxed).clamp(1024, 8192);
+                let prebuffer = (target / 2).clamp(512, 2048);
 
-                // Start playing once about 40 ms are queued.
-                const PREBUFFER: usize = 1536;
-                if prebuffering && q_len >= PREBUFFER {
+                // Start playing once half the target buffer is queued.
+                if prebuffering && q_len >= prebuffer {
                     prebuffering = false;
                     curr = q.pop_front().unwrap_or((0.0, 0.0));
                     next = q.pop_front().unwrap_or(curr);
@@ -623,10 +710,10 @@ impl HostAudioOutput {
                     return;
                 }
 
-                // Proportional rate control towards about 8192 queued frames absorbs the drift between emulated and wall-clock time.
-                const TARGET: f64 = 8192.0;
-                let diff = (q_len as f64 - TARGET) / TARGET;
-                let drc = (1.0 + diff * 0.008).clamp(0.990, 1.010);
+                // Proportional rate control towards `target` queued frames absorbs drift between emulated and wall-clock time.
+                let target_f = target as f64;
+                let diff = (q_len as f64 - target_f) / target_f;
+                let drc = (1.0 + diff * 0.015).clamp(0.985, 1.015);
                 let step = (OUT_RATE as f64 / host_sample_rate) * drc;
 
                 #[inline]
@@ -887,6 +974,25 @@ mod tests {
         let mut out = Vec::new();
         a.drain(&mut out);
         assert_eq!((out[0], out[1]), ((0.0, 0.0), (0.0, 0.0)));
+    }
+
+    #[test]
+    fn audio_latency_presets_and_capped_ring() {
+        assert_eq!(AudioLatency::default(), AudioLatency::Normal);
+        assert!(AudioLatency::Low.target_frames() < AudioLatency::Normal.target_frames());
+        assert!(AudioLatency::Normal.target_frames() < AudioLatency::High.target_frames());
+        assert!(AudioLatency::High.target_frames() < AudioLatency::Safe.target_frames());
+        // Default target must stay well below 60 ms so SFX remain tightly synced to gameplay.
+        assert!(AudioLatency::Normal.target_frames() * 1000 / OUT_RATE as usize <= 50);
+        for p in [AudioLatency::Low, AudioLatency::Normal, AudioLatency::High, AudioLatency::Safe] {
+            assert_eq!(AudioLatency::parse(p.as_str()), Some(p));
+            assert!(p.prebuffer_frames() < p.target_frames());
+            assert!(p.max_ring_frames() >= p.target_frames() * 4);
+        }
+        let ring = Mutex::new(VecDeque::new());
+        let batch = vec![(0.25, -0.25); 10_000];
+        feed_ring_capped(&ring, &batch, AudioLatency::Low.max_ring_frames());
+        assert_eq!(ring.lock().unwrap().len(), AudioLatency::Low.max_ring_frames());
     }
 
     #[test]

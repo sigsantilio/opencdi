@@ -12,6 +12,29 @@ The goal of the project is to accurately preserve and run the complete software 
 
 ---
 
+## What's New in Version 0.4.2
+
+- **MCD-212 External Video (`0xC0` `ICM_EV`) Accuracy**:
+  - Restricted External Video enable strictly to Register `0xC0` bit 18 (`ICM_EV`) per the official Motorola MCD212 datasheet, ignoring reserved bits 4 & 12 so stale FMV frames no longer bleed through subsequent screens (fixes *Lucky Luke* boot screen overlap, #89).
+- **DVC CL450 Display PRPA Offset**:
+  - Preserved decoded picture presentation pointer `PRPA` at DRAM byte `0x56` while keeping Frame Rate Ratio (`1800`) at byte `0xAC`, fixing *BrainDead 13* stopping after the Philips intro (fixes #94) and unskipped FMV end-signal detection (*Lucky Luke*).
+- **CD-i Ready & CHD Track Mapping**:
+  - Fixed CD-i Ready TOC `disc_type = 0x00` and CHD track alignment so track 1 is no longer skipped in *Steel Machine* (fixes #84) and *The Apprentice* (fixes #88, #92).
+- **Optional Motion-Adaptive FMV De-Interlacing**:
+  - Added presentation-only motion-adaptive FMV de-interlacing configurable in both standalone and Libretro Core Options (fixes #81).
+- **Exclusive Fullscreen & Configurable Audio Latency**:
+  - Added Exclusive Fullscreen mode for lower display latency (fixes #80) and Low / Medium / High audio latency presets (fixes #85).
+- **Gamepad Remapping, Authentic 3-Speed CD-i Pad & Libretro Cursor Controls**:
+  - Configurable gamepad button mapping for CD-i Button 1, Button 2, and Button 1+2 (fixes #86).
+  - Authentic Philips `22ER9021` 3-level pad cursor speed switch (`L` in Libretro / configurable button in standalone).
+  - Libretro Core Options for independent D-Pad and Left Analog X/Y cursor speeds, proportional analog deflection with deadzone, and hold-`R` speed boost (fixes #91).
+- **Hotkeys, Pointer IRQ2 & Documentation**:
+  - Fixed standalone Quicksave/Quickload hotkeys and menu/dialog alignment (`F2`/`F4`, slots `F6`/`F7`) (fixes #87).
+  - Improved Slave CH0 IRQ2 preservation across synchronous `0xF6` polls and standalone `PT_Pos` warp preservation (progress on #83).
+  - Added ES-DE (`EmulationStation Desktop Edition`) `es_systems.xml` configuration guide (fixes #54).
+
+---
+
 ## What's New in Version 0.4.1
 
 - **CD-i Ready, Multi-Track CUE & CHD CD-DA Accuracy**:
@@ -86,8 +109,8 @@ The goal of the project is to accurately preserve and run the complete software 
   - Video decoder with YUV-to-RGB planar compositing onto the MCD-212 external video plane.
 - **Input System & Controls:**
   - `F9` toggle: instantly switch between CD-i Gamepad (USB Controller / Keyboard) and Philips CD-i Mouse / Lightgun.
-  - Native USB gamepad support (Xbox, PlayStation, generic XInput / DirectInput controllers via `gilrs`).
-  - Adjustable mouse sensitivity (25% - 150%) via Controls menu.
+  - Native USB gamepad support (Xbox, PlayStation, generic XInput / DirectInput controllers via `gilrs`) with full button remapping for CD-i **Button 1** (`A / Cross`), **Button 2** (`B / Circle`), **Button 1+2 combined** (`X / Square`), and **3-level CD-i Gamepad speed** (`L1 / LB` or `Tab`) via `Controls -> Gamepad Button Mapping`, `opencdi_controls.ini`, or RetroArch's Port 1 Controls.
+  - Adjustable mouse sensitivity (25% - 150%) via Controls menu and configurable low-latency host audio buffer (`Audio -> Audio Latency`, default ~46 ms).
 
 ---
 
@@ -102,7 +125,8 @@ The goal of the project is to accurately preserve and run the complete software 
 | **F5 / H** | Reset Console |
 | **F8 / F12** | Take Screenshot (High-Definition PNG) |
 | **F9** | Switch Input Device (Gamepad <-> Mouse) |
-| **F11 / Alt+Enter** | Toggle Borderless Fullscreen |
+| **Tab / Gamepad L1 (LB)** | Cycle 3-Level CD-i Gamepad Cursor Speed (1 Slow / 2 Medium / 3 Fast) |
+| **F11 / Alt+Enter** | Toggle Fullscreen (Borderless default, Exclusive optional in Video menu) |
 | **P** | Pause / Resume Emulation |
 | **Space (hold)** | Fast-Forward |
 | **L** | Toggle Video Levels (Studio Range / Full Range) |
@@ -153,6 +177,26 @@ cargo build --release -p opencdi-libretro
 ```
 The dynamic library `opencdi_libretro.dll` (or `.so` on Linux) will be generated in `target/release/`.
 
+Core Options include DVC auto-detection, experimental CD-i 490 (Mono-IV) BIOS selection, video levels (`studio`/`full`), motion-adaptive FMV de-interlacing (`opencdi_deinterlace`), and independent cursor speed settings for D-Pad (`opencdi_dpad_speed_x/y`), proportional left analog stick (`opencdi_analog_speed_x/y`), and hold `R` cursor speed boost (`opencdi_cursor_boost`) alongside the `L` 3-level CD-i speed switch.
+
+### ES-DE (EmulationStation Desktop Edition) Integration
+To launch Philips CD-i titles with OpenCDi in ES-DE (`~/.emulationstation/custom_systems/es_systems.xml` on Linux/SteamOS, or `%USERPROFILE%\ES-DE\custom_systems\es_systems.xml` on Windows), add:
+```xml
+<systemList>
+  <system>
+    <name>cdimono1</name>
+    <fullname>Philips CD-i</fullname>
+    <path>%ROMPATH%/cdimono1</path>
+    <extension>.chd .cue .bin .iso .CHD .CUE .BIN .ISO</extension>
+    <command label="OpenCDi (RetroArch)">%EMULATOR_RETROARCH% -L %CORE_RETROARCH%/opencdi_libretro.so %ROM%</command>
+    <command label="OpenCDi (Standalone)">%EMULATOR_OPENCDI% %ROM%</command>
+    <platform>cdi</platform>
+    <theme>cdimono1</theme>
+  </system>
+</systemList>
+```
+On Windows/macOS replace `.so` with `.dll`/`.dylib`, or place `opencdi` / `opencdi.exe` on `PATH` (or define `%EMULATOR_OPENCDI%` in `es_find_rules.xml`).
+
 ---
 
 ## Video Timing & Exact Refresh Rates
@@ -179,6 +223,7 @@ OpenCDi derives scanline and field timing from the Philips CD-i MCD-212 clocks (
 
 Heartfelt thanks to everyone who contributed to the development and preservation goals of OpenCDi:
 - **ArnoldDeRuiter**: for the outstanding and extensive engineering work, Libretro core implementation, in-memory deterministic savestates, Mono-IV chip models (CIAP, IKAT), regression harness, and countless timing and audio refinements.
+- **whatever-industries** ([`edi_emulator`](https://github.com/whatever-industries/edi_emulator)): for the MIT-licensed motion-adaptive de-interlacing algorithm adapted for OpenCDi's optional FMV de-interlacing, CD-i hardware research, and community collaboration.
 - **The MAME / MESS Team**: for their invaluable documentation and foundational work on Philips and Motorola custom chips (SCC68070, MCD212, CDIC, Slave 68HC05).
 - **The World of CD-i** and the broader CD-i preservation community for their dedication, technical insights, and continuous support.
 - All testers, players, and contributors who helped test games and provided feedback.

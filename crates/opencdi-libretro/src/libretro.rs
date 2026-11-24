@@ -18,6 +18,8 @@ pub const RETRO_DEVICE_ID_JOYPAD_DOWN: c_uint = 5;
 pub const RETRO_DEVICE_ID_JOYPAD_LEFT: c_uint = 6;
 pub const RETRO_DEVICE_ID_JOYPAD_RIGHT: c_uint = 7;
 pub const RETRO_DEVICE_ID_JOYPAD_A: c_uint = 8;
+pub const RETRO_DEVICE_ID_JOYPAD_L: c_uint = 10;
+pub const RETRO_DEVICE_ID_JOYPAD_R: c_uint = 11;
 
 pub const RETRO_DEVICE_INDEX_ANALOG_LEFT: c_uint = 0;
 pub const RETRO_DEVICE_ID_ANALOG_X: c_uint = 0;

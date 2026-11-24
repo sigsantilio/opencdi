@@ -1137,7 +1137,7 @@ impl Mcd212 {
     }
 
     fn get_backdrop_plane(&self) -> u32 {
-        if (self.image_coding_method & ((1 << 4) | (1 << 12) | (1 << 18))) != 0 {
+        if (self.image_coding_method & ICM_EV) != 0 {
             fixed_color_out(0xFF00_0000) // External Video Background
         } else {
             fixed_color_out(S_4BPP_DISPLAY_COLOR[(self.backdrop_color & 0x0F) as usize])
@@ -1183,7 +1183,7 @@ impl Mcd212 {
         for x in 0..width {
             let dest_x = border_width + x;
             if transparent_a[x] && transparent_b[x] {
-                out[dest_x] = if (self.image_coding_method & ((1 << 4) | (1 << 12) | (1 << 18))) != 0 {
+                out[dest_x] = if (self.image_coding_method & ICM_EV) != 0 {
                     self.external_video_line[dest_x]
                 } else {
                     self.get_backdrop_plane()
@@ -1336,6 +1336,17 @@ impl Mcd212 {
             let start = (y_offset + active_lines * 2) * SCREEN_WIDTH;
             self.framebuffer[start..].fill(0xFF00_0000);
         }
+    }
+
+    /// Returns `(is_interlaced, rendered_odd_field, y_offset)` describing the frame just
+    /// completed in `self.framebuffer`, for presentation-only de-interlacing.
+    pub fn display_interlace_info(&self) -> (bool, bool, usize) {
+        let interlaced = (self.dcr[0] & DCR_SM_BIT) != 0;
+        // CSR1R_PA toggles at the end of the final scanline, so the just-rendered field
+        // had the opposite parity.
+        let rendered_odd_field = (self.csrr[0] & CSR1R_PA) != 0;
+        let y_offset = (SCREEN_HEIGHT.saturating_sub(self.effective_active_scanlines() * 2)) / 2;
+        (interlaced, rendered_odd_field, y_offset)
     }
 }
 
@@ -1571,6 +1582,43 @@ mod matte_and_dc_tests {
         assert_eq!(row[10], 0xFF00_0000);
         assert_eq!(row[384], 0xFF12_3456);
         assert_eq!(row[750], 0xFF00_0000);
+    }
+
+    #[test]
+    fn icm_reserved_bits_4_and_12_do_not_enable_external_video() {
+        let mut m = Mcd212::new();
+        m.dcr[0] = DCR_DE_BIT | DCR_CF_BIT;
+        m.dcr[1] = DCR_DE_BIT | DCR_CF_BIT;
+        m.csrr[0] = CSR1R_DA;
+        m.set_register::<0>(0xC1, 0x0080_0000); // Both planes always transparent (TCR_ALWAYS)
+        m.set_register::<0>(0xD8, 0x09); // Bright blue backdrop color
+        m.set_vsr::<0>(0x1000);
+        m.set_vsr::<1>(0x1000);
+        m.external_video_line.fill(0xFF12_3456);
+
+        let y_off = (SCREEN_HEIGHT.saturating_sub(m.effective_active_scanlines() * 2)) / 2;
+        let row_start = y_off * SCREEN_WIDTH;
+        let expected_backdrop = fixed_color_out(S_4BPP_DISPLAY_COLOR[0x09]);
+        assert_ne!(expected_backdrop, 0xFF12_3456);
+
+        // MCD212 0xC0 value 0x001313 (e.g. Lucky Luke / Vision Factory) sets reserved bits 4 & 12
+        // with EV bit 18 clear: external video must stay disabled and backdrop must show cleanly.
+        m.set_register::<0>(0xC0, 0x0000_1313);
+        m.render_scanline(0);
+        let row = &m.framebuffer[row_start..row_start + 768];
+        assert_eq!(row[10], expected_backdrop);
+        assert_eq!(row[384], expected_backdrop);
+        assert_eq!(row[750], expected_backdrop);
+
+        // Setting bit 18 (ICM_EV) must route external_video_line through transparent planes.
+        m.set_vsr::<0>(0x1000);
+        m.set_vsr::<1>(0x1000);
+        m.set_register::<0>(0xC0, ICM_EV | 0x0000_1313);
+        m.render_scanline(0);
+        let row = &m.framebuffer[row_start..row_start + 768];
+        assert_eq!(row[10], 0xFF12_3456);
+        assert_eq!(row[384], 0xFF12_3456);
+        assert_eq!(row[750], 0xFF12_3456);
     }
 }
 

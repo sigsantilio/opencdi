@@ -162,14 +162,17 @@ impl SlaveHle {
         }
     }
 
+    #[inline]
+    fn channel_has_pending_irq(ch: &SlaveChannel) -> bool {
+        ch.out_count > 0 && ch.out_index == 0 && ch.out_cmd != 0xF6
+    }
+
     pub fn read(&mut self, offset: u32) -> u16 {
         let ch_idx = ((offset >> 1) & 3) as usize;
         if self.channels[ch_idx].out_count > 0 {
             let val = self.channels[ch_idx].out_buf[self.channels[ch_idx].out_index];
-
-            if self.channels[ch_idx].out_index == 0 {
-                self.irq_pending = false;
-            }
+            let was_first_byte = self.channels[ch_idx].out_index == 0;
+            let was_irq_channel = self.channels[ch_idx].out_cmd != 0xF6;
 
             let ch = &mut self.channels[ch_idx];
             ch.out_index += 1;
@@ -179,6 +182,13 @@ impl SlaveHle {
                 println!("[SLAVE R CH0] val=0x{:02X} (left={})", val, ch.out_count);
             }
 
+            if was_first_byte && was_irq_channel {
+                // Only drop IRQ2 when no other channel still holds an unread IRQ-bearing reply.
+                // Synchronous polled reads (e.g. 0xF6 NTSC/PAL on Ch2) must never clear another channel's IRQ.
+                self.irq_pending = self.channels.iter().any(Self::channel_has_pending_irq);
+            }
+
+            let ch = &mut self.channels[ch_idx];
             if ch.out_count == 0 {
                 ch.out_index = 0;
                 ch.out_cmd = 0;
@@ -419,6 +429,9 @@ impl SlaveHle {
                     ch.pending_buf[2] = data[2];
                     ch.pending_buf[3] = data[3];
                 }
+                if !in_flight_read && assert_irq {
+                    self.irq_pending = true;
+                }
                 return;
             }
         }
@@ -555,5 +568,32 @@ mod tests {
         // Unmuted cross-mix -> cmd=0xC0, payload=[0, 6, 0, 6]
         send(&mut s, [0xC0, 0x00, 0x06, 0x00, 0x06]);
         assert_eq!(s.attenuation, [0xFF, 0x80, 0xFF, 0x80]);
+    }
+
+    #[test]
+    fn synchronous_ch2_poll_and_ch3_read_preserve_pending_ch0_pointer_irq() {
+        let mut s = SlaveHle::new();
+        // Queue a CH0 button press packet (raises IRQ2).
+        s.update_mouse(320, 240, 1);
+        assert!(s.irq_pending);
+
+        // Synchronous polled 0xF6 (NTSC/PAL status) on CH3 -> reply on CH2 without IRQ.
+        // Reading CH2 must NOT clear the pending CH0 IRQ2!
+        s.write(6, 0xF6);
+        assert_eq!((s.read(4) & 0xFF) as u8, 0xF6);
+        assert_eq!((s.read(4) & 0xFF) as u8, 0x02);
+        assert!(s.irq_pending, "synchronous Ch2 0xF6 read must preserve unread Ch0 pointer IRQ");
+
+        // Even if a CH3 status reply is also pending and read first, CH0 IRQ2 must stay asserted.
+        s.prepare_readback(3, &[0xB0, 0x00, 0x02, 0x15], 0xB0, true);
+        assert_eq!((s.read(6) & 0xFF) as u8, 0xB0);
+        assert!(s.irq_pending, "reading Ch3 while Ch0 still has an unread packet must keep IRQ2 asserted");
+
+        // Now reading CH0 drains the click and promotes any staged release packet cleanly.
+        s.update_mouse(350, 240, 0);
+        for _ in 0..4 {
+            let _ = s.read(0);
+        }
+        assert!(s.irq_pending, "staged release packet promoted after Ch0 click drained");
     }
 }

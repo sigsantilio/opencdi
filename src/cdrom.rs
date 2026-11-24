@@ -368,7 +368,7 @@ fn build_cue_tracks(parsed_tracks: &[CueTrackDef], file_sizes: &[u64]) -> (Vec<C
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ChdTrackMeta {
+pub(crate) struct ChdTrackMeta {
     num: u8,
     track_type: String,
     frames: u32,
@@ -377,7 +377,7 @@ struct ChdTrackMeta {
     postgap: u32,
 }
 
-fn parse_chd_track_entry(s: &str) -> Option<ChdTrackMeta> {
+pub(crate) fn parse_chd_track_entry(s: &str) -> Option<ChdTrackMeta> {
     let clean = s.trim_matches(|c: char| c == '\0' || c.is_whitespace() || c == '.');
     let mut num: Option<u8> = None;
     let mut track_type = String::new();
@@ -411,7 +411,7 @@ fn parse_chd_track_entry(s: &str) -> Option<ChdTrackMeta> {
     })
 }
 
-fn build_chd_tracks(entries: &[ChdTrackMeta]) -> (Vec<CdTrack>, u32) {
+pub(crate) fn build_chd_tracks(entries: &[ChdTrackMeta]) -> (Vec<CdTrack>, u32) {
     let mut tracks = Vec::with_capacity(entries.len());
     let mut current_disc_lba = 0u32;
     let mut current_chd_unit = 0u32;
@@ -839,7 +839,28 @@ impl CdRom {
         self.tracks.iter().find(|t| t.contains_lba(lba))
     }
 
+    pub fn is_cdi_ready_layout(tracks: &[CdTrack]) -> bool {
+        tracks
+            .first()
+            .is_some_and(|t| (t.control & 0x40) == 0 && t.start_lba > t.pregap_start_lba)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_tracks_for_test(tracks: Vec<CdTrack>, total_sectors: u32, disc_type: u8) -> Self {
+        Self {
+            source: CdSource::RawFiles { files: Vec::new() },
+            total_sectors,
+            tracks,
+            disc_type,
+            volume_id: String::new(),
+            volume_set: String::new(),
+            publisher: String::new(),
+        }
+    }
+
     fn detect_disc_type(&mut self) {
+        let is_cdi_ready = Self::is_cdi_ready_layout(&self.tracks);
+
         let mut s16 = [0u8; CD_SECTOR_RAW_SIZE];
         if self.read_sector(16, &mut s16) {
             if s16[0] == 0xFF && s16[1] == 0x00 && s16[2] == 0xFF && s16[10] == 0x00 && s16[11] == 0xFF {
@@ -855,6 +876,11 @@ impl CdRom {
             if sys_id.starts_with(b"CD-RTOS CD-BRIDGE") {
                 info!("CD-ROM: Riconosciuto disco CD-RTOS CD-BRIDGE (Video CD / White Book), disc_type = 0x20");
                 self.disc_type = 0x20;
+            } else if is_cdi_ready {
+                // Green Book Ch. VIII (CD-i Ready): Track 1 is Red Book Audio with CD-i data in INDEX 00 pregap,
+                // so TOC packet A0 PSEC must be 0x00 (CD-DA) rather than 0x10.
+                info!("CD-ROM: Riconosciuto disco CD-i Ready (Red Book + pregap CD-RTOS), disc_type = 0x00, volume = {:?}", self.volume_id);
+                self.disc_type = 0x00;
             } else if sys_id.starts_with(b"CD-RTOS") || sys_id.starts_with(b"CD-I") {
                 info!("CD-ROM: Riconosciuto disco CD-i standard, disc_type = 0x10, volume = {:?}", self.volume_id);
                 self.disc_type = 0x10;
@@ -1184,6 +1210,10 @@ FILE \"t3.bin\" BINARY
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(cd.tracks.len(), 3);
+        assert_eq!(
+            cd.disc_type, 0x00,
+            "CD-i Ready disc (Track 1 AUDIO with CD-RTOS pregap) must report TOC A0 PSEC = 0x00"
+        );
         assert_eq!(cd.tracks[0].start_lba, 20);
         assert_eq!(cd.tracks[1].pregap_start_lba, 24);
         assert_eq!(cd.tracks[1].start_lba, 26);
@@ -1249,5 +1279,23 @@ FILE \"t3.bin\" BINARY
         assert!(!tracks[3].chd_audio_swap);
         assert_eq!(tracks[3].chd_unit_start, 143_544 + 14_188 + 504);
         assert_eq!(total_sectors, 143_542 + 14_188 + 150 + 501 + 75 + 200);
+    }
+
+    #[test]
+    fn test_chd_cdi_ready_apprentice_layout() {
+        let entries = [
+            parse_chd_track_entry("TRACK:1 TYPE:AUDIO SUBTYPE:NONE FRAMES:81650 PREGAP:69150 PGTYPE:VAUDIO PGSUB:NONE POSTGAP:0\0").unwrap(),
+            parse_chd_track_entry("TRACK:2 TYPE:AUDIO SUBTYPE:NONE FRAMES:12000 PREGAP:150 PGTYPE:VAUDIO PGSUB:NONE POSTGAP:0\0").unwrap(),
+        ];
+        let (tracks, total_sectors) = build_chd_tracks(&entries);
+        assert_eq!(total_sectors, 81_650 + 12_000);
+        assert_eq!(tracks[0].control, 0x01);
+        assert_eq!(tracks[0].pregap_start_lba, 0);
+        assert_eq!(tracks[0].source_start_lba, 0);
+        assert_eq!(tracks[0].start_lba, 69_150);
+        assert!(tracks[0].chd_audio_swap);
+        assert!(tracks[0].contains_lba(16));
+        assert!(tracks[0].contains_lba(69_150));
+        assert!(CdRom::is_cdi_ready_layout(&tracks));
     }
 }

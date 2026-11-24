@@ -57,7 +57,7 @@ fn test_pavarotti_cdi_ready_boot() {
     // Verify disc type and volume ID
     {
         let cd = machine.bus.cdrom.as_ref().expect("Disc should be loaded");
-        assert_eq!(cd.disc_type, 0x10, "CD-i Ready disc must be recognized as CD-i (0x10)");
+        assert_eq!(cd.disc_type, 0x00, "CD-i Ready disc must report TOC A0 PSEC = 0x00 (CD-DA per Green Book Ch. VIII)");
         assert_eq!(cd.volume_id, "Pav1", "Volume ID must match Pav1");
     }
 

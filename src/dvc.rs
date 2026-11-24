@@ -887,7 +887,7 @@ impl Dvc {
         self.set_fmv_word(0x52, 352); // Width
         self.set_fmv_word(0x54, 240); // Height
         self.set_fmv_word(0x06, 0x23); // PRPA (4:3 PAL)
-        self.set_fmv_word(0x56, 0x0708);
+        self.set_fmv_word(0x56, 0x23); // PRPA (Display, matches decoder PRPA at 0x06)
 
         self.sync_mirrors();
     }
@@ -1836,7 +1836,7 @@ impl Dvc {
         self.set_fmv_word(0x52, decoded_w as u16);
         self.set_fmv_word(0x54, decoded_h as u16);
         self.set_fmv_word(0x06, decoded_prpa); // PRPA (Decoder)
-        self.set_fmv_word(0x56, 1800); // Frame rate ratio
+        self.set_fmv_word(0x56, decoded_prpa); // PRPA (Display)
 
         // Synchronize with embedded MPEG-1 GOP timecode if present, otherwise advance by 1 frame
         if let Some(tc) = gop_tc {
@@ -2571,6 +2571,35 @@ mod timing_tests {
         d_av.demux.program_ends = 1;
         d_av.process_stream();
         assert_ne!(d_av.get_fma_word(FMA_ISR) & FMA_IRQ_EOI, 0);
+    }
+
+    #[test]
+    fn display_prpa_matches_decoder_prpa_not_frame_rate_ratio() {
+        // CL450 byte offset 0x56 (word 0x2B) is Display PRPA (matching Decoder PRPA at 0x06),
+        // while Frame Rate Ratio (1800 = 0x0708) lives at word 0x56 (byte offset 0xAC).
+        // Leaving 0x0708 in byte 0x56 makes vmpega.rom see a permanent picture-rate mismatch
+        // (0x08 != 0x03) and emit spurious 0x0200 video-start bits on stream end (BrainDead 13).
+        let mut d = Dvc::new();
+        assert_eq!(d.get_fmv_word(0x06), 0x0023);
+        assert_eq!(d.get_fmv_word(0x56), 0x0023);
+        assert_eq!(d.get_fmv_word(0xAC), 1800);
+
+        let mut es = vec![0, 0, 1, 0xB3, 0x01, 0x00, 0x10, 0x83, 0xFF, 0xFF, 0xE0, 0x00];
+        es.extend(std::iter::repeat(0).take(32));
+        es.extend([0, 0, 1, 0x00, 0x00, 0x08, 0xFF, 0xF8, 0x90, 0x00]);
+        es.extend([0, 0, 1, 0x01, 0x08, 0x00, 0x00, 0x00]);
+        d.video_decoder = Some(Video::new(es));
+        d.cache_sequence_params();
+        d.decoder_enabled = true;
+        d.video_playing = false;
+        for _ in 0..3 {
+            d.on_vsync();
+        }
+
+        assert_eq!(d.frames_presented_count, 1);
+        assert_eq!(d.get_fmv_word(0x06), 0x0083);
+        assert_eq!(d.get_fmv_word(0x56), 0x0083);
+        assert_eq!(d.get_fmv_word(0xAC), 1800);
     }
 }
 

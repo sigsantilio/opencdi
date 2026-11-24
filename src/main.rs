@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use log::{info, error, warn};
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -14,8 +14,9 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode as Key, ModifiersState, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
-use opencdi::audio::{self, Frame, HostAudioOutput};
-use opencdi::frontend::{pop_action, push_action, GuiAction, InputDeviceMode, KeyBindings};
+use opencdi::audio::{self, AudioLatency, Frame, HostAudioOutput};
+use opencdi::deinterlace::Deinterlacer;
+use opencdi::frontend::{load_bool_preference, load_string_preference, pop_action, push_action, save_bool_preference, save_string_preference, GuiAction, InputDeviceMode, KeyBindings};
 #[cfg(target_os = "windows")]
 use opencdi::gui;
 use opencdi::bios;
@@ -100,7 +101,10 @@ Usage: opencdi [options] [disc image (cue, chd, iso, bin)]
   --no-dvc, --nodvc        Boot without the Digital Video Cartridge
   --slave-debug            Log slave (mouse channel) bytes
   --nvram <path>           Console NVRAM save file (default: bios/nvram_mk48t08.bin or nvram_mk48t08.bin; 490: nvram_cdi490a.bin)
-  --fullscreen, -f         Start directly in borderless fullscreen
+  --fullscreen, -f         Start directly in fullscreen (borderless by default)
+  --exclusive-fullscreen   Use exclusive fullscreen mode for lower latency (fallback: borderless)
+  --deinterlace            Enable optional motion-adaptive de-interlacing for interlaced FMV
+  --audio-latency <preset> Host audio buffer latency: low (~32ms), normal (~46ms, default), high (~93ms), safe (~186ms)
   --no-menu, --nomenu      Start without the top menu bar (useful for frontends)
   --monitor <n>            Monitor index to display on in fullscreen
   --screenshot-dir <path>  Folder for F8/F12 PNG screenshots (default: screenshots/ next to the program)
@@ -557,6 +561,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--screenshot-dir",
     "--monitor",
     "--video-levels",
+    "--audio-latency",
 ];
 
 // Disc = first positional argument, skipping flag values; --recent takes a value only when it is a number
@@ -804,9 +809,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // 6. Initialize Host Audio Playback
-    let audio_ring: Arc<Mutex<VecDeque<Frame>>> = Arc::new(Mutex::new(VecDeque::with_capacity(audio::RING_CAP)));
+    let audio_latency = flag_value("--audio-latency")
+        .and_then(|s| AudioLatency::parse(&s))
+        .or_else(|| load_string_preference("audio_latency").and_then(|s| AudioLatency::parse(&s)))
+        .unwrap_or_default();
+    let audio_ring: Arc<Mutex<VecDeque<Frame>>> = Arc::new(Mutex::new(VecDeque::with_capacity(audio_latency.max_ring_frames())));
     let audio_gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
-    let host_audio = HostAudioOutput::try_start(audio_ring.clone(), audio_gain.clone());
+    let audio_target = Arc::new(AtomicUsize::new(audio_latency.target_frames()));
+    info!("Host audio latency target: {} ({} frames)", audio_latency.label(), audio_latency.target_frames());
+    let host_audio = HostAudioOutput::try_start(audio_ring.clone(), audio_gain.clone(), audio_target.clone());
 
     // 7. Initialize USB Gamepad subsystem (Gilrs / XInput / DirectInput)
     let gilrs = gilrs::Gilrs::new().ok();
@@ -816,6 +827,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     m.bus.emulate_wait_states = true; // Authentic hardware wait-states (15 MHz)
     let start_fullscreen = has_flag("--fullscreen") || has_flag("-f");
+    let exclusive_fullscreen = has_flag("--exclusive-fullscreen") || load_bool_preference("exclusive_fullscreen", false);
+    let deinterlace = has_flag("--deinterlace") || load_bool_preference("deinterlace", false);
     let no_menu = has_flag("--no-menu") || has_flag("--nomenu");
     let monitor_index: Option<usize> = flag_value("--monitor").and_then(|s| {
         let n = s.parse().ok();
@@ -844,6 +857,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         bios_report,
         dvc_path: resolved_dvc_path,
         start_fullscreen,
+        exclusive_fullscreen,
+        deinterlace,
+        deinterlacer: Deinterlacer::new(),
         no_menu,
         monitor_index,
         screenshot_dir,
@@ -860,6 +876,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _host_audio: host_audio,
         audio_ring,
         audio_gain,
+        audio_target,
+        audio_latency,
         audio_buf: Vec::new(),
         volume: 1.0,
         muted: false,
@@ -896,6 +914,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pad_x_f: pad_x as f32,
         pad_y_f: pad_y as f32,
         prev_key_btn: 0,
+        prev_pad_speed_btn: false,
         run_at: now,
         next_frame_time: now + frame_duration,
         fps_timer: now,
@@ -911,7 +930,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         measured_cd_rate: 0.0,
     };
 
-    info!("Emulation loop started. Shortcuts: [F11]/[Alt+Enter] Fullscreen, [F5]/[H] Reset, [P] Pause, [Space] hold Fast-forward, [F8]/[F12] Screenshot (PNG), [F2]/[F4] Save/Load state, [F6]/[F7] State slot, [M] Mute, [+]/[-] Volume, [L] Video levels studio/full, [Ctrl+I] Insert Disc, [Ctrl+O] Open & Reset, [Ctrl+B] Select BIOS, [Middle Click] Capture/Release Mouse, [Esc] Quit");
+    info!("Emulation loop started. Shortcuts: [F11]/[Alt+Enter] Fullscreen, [F5]/[H] Reset, [P] Pause, [Space] hold Fast-forward, [Tab]/[L1] Pad Speed (1/2/3), [F8]/[F12] Screenshot (PNG), [F2]/[F4] Save/Load state, [F6]/[F7] State slot, [M] Mute, [+]/[-] Volume, [L] Video levels studio/full, [Ctrl+I] Insert Disc, [Ctrl+O] Open & Reset, [Ctrl+B] Select BIOS, [Middle Click] Capture/Release Mouse, [Esc] Quit");
 
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut app)?;
@@ -1007,6 +1026,9 @@ struct App {
     bios_report: Option<bios::Report>,
     dvc_path: Option<PathBuf>,
     start_fullscreen: bool,
+    exclusive_fullscreen: bool,
+    deinterlace: bool,
+    deinterlacer: Deinterlacer,
     no_menu: bool,
     monitor_index: Option<usize>,
     screenshot_dir: PathBuf,
@@ -1022,6 +1044,8 @@ struct App {
     _host_audio: Option<HostAudioOutput>,
     audio_ring: Arc<Mutex<VecDeque<Frame>>>,
     audio_gain: Arc<AtomicU32>,
+    audio_target: Arc<AtomicUsize>,
+    audio_latency: AudioLatency,
     audio_buf: Vec<Frame>,
     volume: f32,
     muted: bool,
@@ -1060,6 +1084,7 @@ struct App {
     pad_x_f: f32,
     pad_y_f: f32,
     prev_key_btn: u8,
+    prev_pad_speed_btn: bool,
     run_at: Instant,
     next_frame_time: Instant,
     fps_timer: Instant,
@@ -1073,6 +1098,21 @@ struct App {
     measured_render_fps: f64,
     measured_mips: f64,
     measured_cd_rate: f64,
+}
+
+fn step_state_slot(current: u32, delta: i32) -> u32 {
+    if delta < 0 {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        current.saturating_add(delta as u32).min(999)
+    }
+}
+
+fn resolve_state_action_slot(current: u32, action: &GuiAction) -> u32 {
+    match action {
+        GuiAction::SaveState(slot) | GuiAction::LoadState(slot) => (*slot as u32).min(999),
+        _ => current,
+    }
 }
 
 impl App {
@@ -1124,7 +1164,43 @@ impl App {
                         None
                     }
                 });
-                window.set_fullscreen(Some(Fullscreen::Borderless(target_monitor)));
+                let fs_mode = if self.exclusive_fullscreen {
+                    let monitor = target_monitor
+                        .clone()
+                        .or_else(|| window.current_monitor())
+                        .or_else(|| window.primary_monitor());
+                    let best_mode = monitor.and_then(|m| {
+                        let target_size = m.size();
+                        m.video_modes()
+                            .filter(|vm| vm.size() == target_size)
+                            .max_by_key(|vm| (vm.refresh_rate_millihertz(), vm.bit_depth()))
+                            .or_else(|| {
+                                m.video_modes().max_by_key(|vm| {
+                                    (
+                                        (vm.size().width as u64) * (vm.size().height as u64),
+                                        vm.refresh_rate_millihertz(),
+                                        vm.bit_depth(),
+                                    )
+                                })
+                            })
+                    });
+                    if let Some(mode) = best_mode {
+                        info!(
+                            "Exclusive fullscreen mode selected: {}x{} @ {:.2} Hz ({} bpp)",
+                            mode.size().width,
+                            mode.size().height,
+                            mode.refresh_rate_millihertz() as f64 / 1000.0,
+                            mode.bit_depth()
+                        );
+                        Fullscreen::Exclusive(mode)
+                    } else {
+                        warn!("Exclusive fullscreen requested, but no video modes were reported; falling back to borderless fullscreen");
+                        Fullscreen::Borderless(target_monitor)
+                    }
+                } else {
+                    Fullscreen::Borderless(target_monitor)
+                };
+                window.set_fullscreen(Some(fs_mode));
                 #[cfg(target_os = "windows")]
                 gui::set_menu_visible(self.hwnd(), false);
             } else {
@@ -1140,7 +1216,14 @@ impl App {
                     self.restore_check = Some(Instant::now() + Duration::from_millis(300));
                 }
             }
-            info!("Schermo intero: {}", if full { "SCHERMO INTERO" } else { "FINESTRA" });
+            let fs_label = if !full {
+                "FINESTRA"
+            } else if self.exclusive_fullscreen {
+                "SCHERMO INTERO (EXCLUSIVE)"
+            } else {
+                "SCHERMO INTERO (BORDERLESS)"
+            };
+            info!("Schermo intero: {}", fs_label);
         }
     }
 
@@ -1232,6 +1315,11 @@ impl App {
         {
             gui::update_bios_menu(self.hwnd(), &self.active_bios_path, &self.available_bioses);
             gui::update_dvc_menu(self.m.bus.dvc.is_fitted());
+            gui::update_pad_speed_menu(self.bindings.pad_speed);
+            gui::update_gamepad_mapping_menu(&self.bindings);
+            gui::update_audio_latency_menu(self.audio_latency);
+            gui::update_exclusive_fullscreen_menu(self.exclusive_fullscreen);
+            gui::update_deinterlace_menu(self.deinterlace);
             self.refresh_title();
         }
         true
@@ -1245,6 +1333,7 @@ impl App {
         self.pad_y = if self.m.bus.cdrom.is_some() { 335 } else { 280 };
         self.pad_x_f = self.pad_x as f32;
         self.pad_y_f = self.pad_y as f32;
+        self.deinterlacer.reset();
     }
 
     // Hide and confine the host cursor while captured and focused (Win32 ShowCursor/ClipCursor before)
@@ -1297,7 +1386,7 @@ impl App {
     // A key bound to a CD-i control in opencdi_controls.ini is not a shortcut
     fn bound(&self, k: Key) -> bool {
         let b = &self.bindings;
-        [b.up, b.down, b.left, b.right, b.btn1, b.btn2].contains(&k)
+        [b.up, b.down, b.left, b.right, b.btn1, b.btn2, b.btn12].contains(&k)
     }
 
     // Host-side input and autoplay state saved alongside the machine so a load does not re-run autoplay clicks
@@ -1342,6 +1431,7 @@ impl App {
                 if let Err(e) = self.set_frontend_state(&fe) {
                     error!("State slot {}: frontend section unreadable ({}); autoplay state kept", self.state_slot, e);
                 }
+                self.deinterlacer.reset();
                 self.reset_telemetry();
                 info!("State slot {} loaded from {:?}", self.state_slot, path);
             }
@@ -1438,7 +1528,7 @@ impl App {
             Key::F2 => self.save_state(),
             Key::F4 => self.load_state(),
             Key::F6 | Key::F7 => {
-                self.state_slot = if code == Key::F6 { self.state_slot.saturating_sub(1) } else { (self.state_slot + 1).min(999) };
+                self.state_slot = step_state_slot(self.state_slot, if code == Key::F6 { -1 } else { 1 });
                 info!("State slot: {} ({:?})", self.state_slot, self.state_file());
                 self.refresh_title();
             }
@@ -1448,6 +1538,7 @@ impl App {
                 info!("Video levels: {}", if studio { "studio (black 16)" } else { "full (black 0)" });
             }
             Key::KeyM if !self.bound(code) => self.toggle_mute(),
+            Key::Tab if !ctrl && !alt && !self.bound(code) => push_action(GuiAction::CyclePadSpeed),
             _ => {}
         }
     }
@@ -1589,6 +1680,30 @@ impl App {
                     gui::update_mouse_sensitivity_menu(sens);
                     info!("Sensibilità mouse impostata su: {:.0}% ({:.2})", sens * 100.0, sens);
                 }
+                GuiAction::SetPadSpeed(speed) => {
+                    self.bindings.pad_speed = speed;
+                    self.bindings.save_to_ini();
+                    #[cfg(target_os = "windows")]
+                    gui::update_pad_speed_menu(speed);
+                    info!("CD-i Gamepad speed set to: {}", speed.label());
+                    self.refresh_title();
+                }
+                GuiAction::CyclePadSpeed => {
+                    let next = self.bindings.pad_speed.next();
+                    self.bindings.pad_speed = next;
+                    self.bindings.save_to_ini();
+                    #[cfg(target_os = "windows")]
+                    gui::update_pad_speed_menu(next);
+                    info!("CD-i Gamepad speed cycled to: {}", next.label());
+                    self.refresh_title();
+                }
+                GuiAction::SetGamepadButton(action, btn) => {
+                    self.bindings.set_gamepad_button(action, btn);
+                    self.bindings.save_to_ini();
+                    #[cfg(target_os = "windows")]
+                    gui::update_gamepad_mapping_menu(&self.bindings);
+                    info!("Gamepad mapping updated: {:?} -> {}", action, btn.label());
+                }
                 GuiAction::ReloadControls => {
                     self.bindings.load_from_ini();
                     #[cfg(target_os = "windows")]
@@ -1597,8 +1712,22 @@ impl App {
                     gui::update_input_device_menu(self.bindings.input_device);
                     #[cfg(target_os = "windows")]
                     gui::update_mouse_sensitivity_menu(self.bindings.mouse_sensitivity);
+                    #[cfg(target_os = "windows")]
+                    gui::update_pad_speed_menu(self.bindings.pad_speed);
+                    #[cfg(target_os = "windows")]
+                    gui::update_gamepad_mapping_menu(&self.bindings);
                     self.input_device_mode = self.bindings.input_device;
-                    info!("Controls reloaded from INI file. Profile: {:?}, Device: {:?}, Sensitivity: {:.2}", self.bindings.profile, self.bindings.input_device, self.bindings.mouse_sensitivity);
+                    info!(
+                        "Controls reloaded from INI file. Profile: {:?}, Device: {:?}, Sensitivity: {:.2}, Pad Speed: {}, Gamepad: B1={}, B2={}, B1+2={}, Speed={}",
+                        self.bindings.profile,
+                        self.bindings.input_device,
+                        self.bindings.mouse_sensitivity,
+                        self.bindings.pad_speed.label(),
+                        self.bindings.pad_btn1.as_ini_str(),
+                        self.bindings.pad_btn2.as_ini_str(),
+                        self.bindings.pad_btn12.as_ini_str(),
+                        self.bindings.pad_speed_btn.as_ini_str()
+                    );
                 }
                 GuiAction::ToggleReleaseMouse => {
                     self.mouse_captured = !self.mouse_captured;
@@ -1618,8 +1747,44 @@ impl App {
                     self.volume = (self.volume - 0.05).max(0.0);
                     self.publish_gain();
                 }
+                GuiAction::SetAudioLatency(latency) => {
+                    self.audio_latency = latency;
+                    self.audio_target.store(latency.target_frames(), Ordering::Relaxed);
+                    if let Ok(mut q) = self.audio_ring.lock() {
+                        let cap = latency.max_ring_frames();
+                        if q.len() > cap {
+                            let drop_n = q.len() - cap;
+                            q.drain(..drop_n);
+                        }
+                    }
+                    save_string_preference("audio_latency", latency.as_str());
+                    #[cfg(target_os = "windows")]
+                    gui::update_audio_latency_menu(latency);
+                    info!("Host audio latency updated to: {} ({} frames)", latency.label(), latency.target_frames());
+                }
                 GuiAction::ToggleFullscreen => {
                     self.toggle_fullscreen();
+                }
+                GuiAction::ToggleExclusiveFullscreen => {
+                    self.exclusive_fullscreen = !self.exclusive_fullscreen;
+                    save_bool_preference("exclusive_fullscreen", self.exclusive_fullscreen);
+                    #[cfg(target_os = "windows")]
+                    gui::update_exclusive_fullscreen_menu(self.exclusive_fullscreen);
+                    info!(
+                        "Fullscreen mode preference: {}",
+                        if self.exclusive_fullscreen { "Exclusive (Lower Latency)" } else { "Borderless" }
+                    );
+                    if self.window.as_ref().is_some_and(|w| w.fullscreen().is_some()) {
+                        self.set_fullscreen(true);
+                    }
+                }
+                GuiAction::ToggleDeinterlace => {
+                    self.deinterlace = !self.deinterlace;
+                    self.deinterlacer.reset();
+                    save_bool_preference("deinterlace", self.deinterlace);
+                    #[cfg(target_os = "windows")]
+                    gui::update_deinterlace_menu(self.deinterlace);
+                    info!("De-interlacing (motion-adaptive FMV): {}", if self.deinterlace { "ENABLED" } else { "DISABLED" });
                 }
                 GuiAction::TakeScreenshot => {
                     self.take_screenshot();
@@ -1671,10 +1836,7 @@ impl App {
                     macos::show_about(self.window.as_deref(), self.mac_data_dir.as_deref());
                 }
                 GuiAction::QuickSaveState | GuiAction::SaveState(_) | GuiAction::QuickLoadState | GuiAction::LoadState(_) => {
-                    self.state_slot = match action {
-                        GuiAction::SaveState(slot) | GuiAction::LoadState(slot) => slot as u32,
-                        _ => 1,
-                    };
+                    self.state_slot = resolve_state_action_slot(self.state_slot, &action);
                     if matches!(action, GuiAction::QuickSaveState | GuiAction::SaveState(_)) {
                         self.save_state();
                     } else {
@@ -1865,9 +2027,13 @@ impl App {
             {
                 key_btn |= 2;
             }
+            if self.key(b.btn12) {
+                key_btn |= 4;
+            }
         }
 
         // Gamepad handling via Gilrs (Xbox / PlayStation / USB)
+        let mut speed_btn_down = false;
         if let Some(ref mut g) = self.gilrs {
             while let Some(_) = g.next_event() {} // Drain events to refresh state
             for (_id, gamepad) in g.gamepads().filter(|_| self.host_input) {
@@ -1909,19 +2075,39 @@ impl App {
                     dir_x += pad_dir_x;
                     dir_y += pad_dir_y;
 
-                    // Button 1: South (A / Cross)
-                    if gamepad.is_pressed(gilrs::Button::South) {
+                    // Configurable CD-i Button 1, Button 2, Button 1+2 (combined), and Pad Speed Switch
+                    if self.bindings.pad_btn1.to_gilrs().is_some_and(|btn| gamepad.is_pressed(btn)) {
                         key_btn |= 1;
                     }
-                    // Button 2: East (B / Circle) or West (X / Square) -> Jump
-                    if gamepad.is_pressed(gilrs::Button::East) || gamepad.is_pressed(gilrs::Button::West) {
+                    if self.bindings.pad_btn2.to_gilrs().is_some_and(|btn| gamepad.is_pressed(btn)) {
                         key_btn |= 2;
                     }
-                    // Start Button -> Confirm / Action
-                    if gamepad.is_pressed(gilrs::Button::Start) {
-                        key_btn |= 1;
+                    if self.bindings.pad_btn12.to_gilrs().is_some_and(|btn| gamepad.is_pressed(btn)) {
+                        key_btn |= 4;
+                    }
+                    if self.bindings.pad_speed_btn.to_gilrs().is_some_and(|btn| gamepad.is_pressed(btn)) {
+                        speed_btn_down = true;
                     }
                 }
+            }
+        }
+        if speed_btn_down && !self.prev_pad_speed_btn {
+            push_action(GuiAction::CyclePadSpeed);
+        }
+        self.prev_pad_speed_btn = speed_btn_down;
+
+        // Adopt any game-initiated pointer warp (Slave CH0 0xC0..0xFF / PT_Pos) BEFORE sampling mouse/gamepad
+        // so InputDeviceMode::Mouse never overwrites the game's warp with stale pre-warp host coordinates.
+        if self.m.bus.slave.device_mouse_updated {
+            self.pad_x = self.m.bus.slave.device_mouse_x;
+            self.pad_y = self.m.bus.slave.device_mouse_y;
+            self.pad_x_f = self.pad_x as f32;
+            self.pad_y_f = self.pad_y as f32;
+            self.m.bus.slave.device_mouse_updated = false;
+            self.m.bus.slave.input_mouse_x = self.pad_x;
+            self.m.bus.slave.input_mouse_y = self.pad_y;
+            if self.rel_pointer.is_some() {
+                self.rel_pointer = Some((self.pad_x as f64, self.pad_y as f64));
             }
         }
 
@@ -1947,34 +2133,24 @@ impl App {
         }
 
         let m = &mut self.m;
-        if m.bus.slave.device_mouse_updated {
-            self.pad_x = m.bus.slave.device_mouse_x;
-            self.pad_y = m.bus.slave.device_mouse_y;
-            self.pad_x_f = self.pad_x as f32;
-            self.pad_y_f = self.pad_y as f32;
-            m.bus.slave.device_mouse_updated = false;
-            if self.rel_pointer.is_some() {
-                self.rel_pointer = Some((self.pad_x as f64, self.pad_y as f64));
-            }
-        }
 
         if !self.disc_launched && m.bus.cdrom.is_some() && m.bus.mono4.is_none() && !self.no_autoplay && self.shell_ready_count < 240 {
             // During automatic boot sequence, let autoplay pulse click PLAY CD-I until launched or timeout
         } else {
             match self.input_device_mode {
                 InputDeviceMode::Gamepad => {
-                    const PAD_SPEED: f32 = 5.0;
+                    let pad_speed = self.bindings.pad_speed.standalone_speed();
                     let mut moved = false;
                     let mut over = (0.0f32, 0.0f32);
                     if dir_x != 0 {
-                        let x = self.pad_x_f + (dir_x.clamp(-1, 1) as f32) * PAD_SPEED;
+                        let x = self.pad_x_f + (dir_x.clamp(-1, 1) as f32) * pad_speed;
                         self.pad_x_f = x.clamp(0.0, 767.0);
                         over.0 = x - self.pad_x_f;
                         self.pad_x = self.pad_x_f.round() as i32;
                         moved = true;
                     }
                     if dir_y != 0 {
-                        let y = self.pad_y_f + (dir_y.clamp(-1, 1) as f32) * PAD_SPEED;
+                        let y = self.pad_y_f + (dir_y.clamp(-1, 1) as f32) * pad_speed;
                         self.pad_y_f = y.clamp(0.0, 559.0);
                         over.1 = y - self.pad_y_f;
                         self.pad_y = self.pad_y_f.round() as i32;
@@ -2100,8 +2276,15 @@ impl App {
         };
         if let Some(window) = &self.window {
             window.set_title(&format!(
-                "OpenCDi – {} | {} | CPU: {:.2} MIPS | CD: {} | Render: {} | WaitStates: {} | Slot: {}",
-                self.current_game_name, speed, self.measured_mips, cd_str, render_str, wait_status, self.state_slot
+                "OpenCDi – {} | {} | CPU: {:.2} MIPS | CD: {} | Render: {} | WaitStates: {} | Pad: {}/3 | Slot: {}",
+                self.current_game_name,
+                speed,
+                self.measured_mips,
+                cd_str,
+                render_str,
+                wait_status,
+                self.bindings.pad_speed.level(),
+                self.state_slot
             ));
         }
     }
@@ -2145,7 +2328,7 @@ impl App {
                 q.clear();
             }
         } else {
-            audio::feed_ring(&self.audio_ring, &self.audio_buf);
+            audio::feed_ring_capped(&self.audio_ring, &self.audio_buf, self.audio_latency.max_ring_frames());
         }
         // While fast-forwarding, present at most about 60 times a second
         let due = !self.in_modal_pump && (!self.fast_forward || self.last_present.elapsed() >= Duration::from_millis(16));
@@ -2217,8 +2400,16 @@ impl App {
         self.last_present = Instant::now();
         let (dw, dh) = (size.width as usize, size.height as usize);
         self.image_rect = image_rect(dw, dh);
+        let (interlaced, odd_field, y_offset) = self.m.bus.mcd212.display_interlace_info();
+        let fb = self.deinterlacer.process(
+            &self.m.bus.mcd212.framebuffer[..],
+            interlaced,
+            odd_field,
+            y_offset,
+            self.deinterlace,
+        );
         if let Ok(mut buffer) = surface.buffer_mut() {
-            blit_aspect(&mut buffer, dw, dh, &self.m.bus.mcd212.framebuffer[..], self.image_rect);
+            blit_aspect(&mut buffer, dw, dh, fb, self.image_rect);
             // Wayland: ties the next redraw to a frame callback, so a hidden window is never presented to
             window.pre_present_notify();
             let _ = buffer.present();
@@ -2275,6 +2466,11 @@ impl ApplicationHandler for App {
                 self.m.bus.dvc.is_fitted(),
             );
             gui::update_dvc_menu(self.m.bus.dvc.is_fitted());
+            gui::update_pad_speed_menu(self.bindings.pad_speed);
+            gui::update_gamepad_mapping_menu(&self.bindings);
+            gui::update_audio_latency_menu(self.audio_latency);
+            gui::update_exclusive_fullscreen_menu(self.exclusive_fullscreen);
+            gui::update_deinterlace_menu(self.deinterlace);
             // SetMenu takes the menu bar out of the client area; winit adds it back when sizing
             if show_menu {
                 if let Some(window) = &self.window {
@@ -2488,6 +2684,23 @@ mod tests {
         assert_eq!(v(&["disc.cue", "--fullscreen", "--monitor", "1"]), Some("disc.cue".into()));
         assert_eq!(v(&["--no-autoplay", "disc.cue"]), Some("disc.cue".into()));
         assert_eq!(v(&["disc.cue", "--no-autoplay"]), Some("disc.cue".into()));
+        assert_eq!(v(&["--exclusive-fullscreen", "--deinterlace", "disc.cue"]), Some("disc.cue".into()));
+        assert_eq!(v(&["--audio-latency", "low", "disc.cue"]), Some("disc.cue".into()));
+    }
+
+    #[test]
+    fn pad_speed_levels_cycle_and_increase_monotonically() {
+        use opencdi::input_script::PadSpeed;
+        assert_eq!(PadSpeed::Low.next(), PadSpeed::Medium);
+        assert_eq!(PadSpeed::Medium.next(), PadSpeed::High);
+        assert_eq!(PadSpeed::High.next(), PadSpeed::Low);
+        assert_eq!(PadSpeed::from_level(1), PadSpeed::Low);
+        assert_eq!(PadSpeed::from_level(2), PadSpeed::Medium);
+        assert_eq!(PadSpeed::from_level(3), PadSpeed::High);
+        assert!(PadSpeed::Low.standalone_speed() < PadSpeed::Medium.standalone_speed());
+        assert!(PadSpeed::Medium.standalone_speed() < PadSpeed::High.standalone_speed());
+        assert!(PadSpeed::Low.pixels_per_frame() < PadSpeed::Medium.pixels_per_frame());
+        assert!(PadSpeed::Medium.pixels_per_frame() < PadSpeed::High.pixels_per_frame());
     }
 
     #[test]
@@ -2529,5 +2742,16 @@ mod tests {
         assert!(read_state_file(&p, &mut n).is_err());
         assert!(read_state_file(&state_path(&dir, "missing", 0), &mut n).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quick_state_actions_preserve_current_slot_and_step_clamps() {
+        assert_eq!(resolve_state_action_slot(0, &GuiAction::QuickSaveState), 0);
+        assert_eq!(resolve_state_action_slot(4, &GuiAction::QuickLoadState), 4);
+        assert_eq!(resolve_state_action_slot(4, &GuiAction::SaveState(2)), 2);
+        assert_eq!(resolve_state_action_slot(2, &GuiAction::LoadState(5)), 5);
+        assert_eq!(step_state_slot(0, -1), 0);
+        assert_eq!(step_state_slot(0, 1), 1);
+        assert_eq!(step_state_slot(999, 1), 999);
     }
 }
