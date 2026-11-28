@@ -812,6 +812,7 @@ impl Dvc {
         self.set_fmv_word(0x5A, 0);
         self.set_fmv_word(0x08, 0);
         self.set_fmv_word(0x0A, 0);
+        self.set_fmv_word(0x0C, 0x0000);
         self.set_fmv_word(0x5C, 0x0000);
     }
 
@@ -1395,8 +1396,6 @@ impl Dvc {
                     self.pending_frame_pts = 0;
                     self.video_pts_base = 0;
                     self.video_pts_valid = false;
-                    self.min_video_pts_seen = 0;
-                    self.has_min_video_pts = false;
                     self.display_frame_counter = 0;
                     self.decoder_frame_counter = 0;
                     self.display_timecode = 0;
@@ -1405,8 +1404,12 @@ impl Dvc {
                     self.set_fmv_word(0x5A, 0);
                     self.set_fmv_word(0x08, 0);
                     self.set_fmv_word(0x0A, 0);
+                    self.set_fmv_word(0x0C, 0x0000);
+                    self.set_fmv_word(0x5C, 0x0000);
                     if self.video_decoder.as_ref().map_or(true, |d| d.is_buffer_empty()) {
                         self.video_decoder = None;
+                        self.min_video_pts_seen = 0;
+                        self.has_min_video_pts = false;
                     }
                 }
                 if value & 0x0020 != 0 || value & 0x0040 != 0 { // CONTINUE / STEP
@@ -1509,7 +1512,7 @@ impl Dvc {
             self.video_bytes_this_vsync += video_data.len();
             self.video_idle_vsyncs = 0;
             if self.frames_decoded_count == 0 {
-                if let Some(pts) = self.demux.last_video_pts.or(self.demux.first_video_pts) {
+                for pts in [self.demux.first_video_pts, self.demux.last_video_pts].into_iter().flatten() {
                     if !self.has_min_video_pts
                         || (Self::pts_diff_i64(pts, self.min_video_pts_seen) < 0
                             && Self::pts_diff_i64(pts, self.min_video_pts_seen) > -90_000)
@@ -1764,7 +1767,20 @@ impl Dvc {
             let ticks = (heard_samples.saturating_mul(90_000)) / 44_100;
             return Some(self.audio_pts_base.wrapping_add(ticks) & 0x1_FFFF_FFFF);
         }
-        self.demux.last_scr
+        match (self.demux.last_scr, self.demux.run) {
+            (Some(scr), Some(run)) => {
+                let run_90k = (run << 2) & 0x1_FFFF_FFFF;
+                let lead = Self::pts_diff_i64(run_90k, scr);
+                if (0..=5 * 90_000).contains(&lead) {
+                    Some(run_90k)
+                } else {
+                    Some(scr)
+                }
+            }
+            (Some(scr), None) => Some(scr),
+            (None, Some(run)) => Some((run << 2) & 0x1_FFFF_FFFF),
+            (None, None) => None,
+        }
     }
 
     fn is_pending_frame_due(&self) -> bool {
@@ -1804,7 +1820,7 @@ impl Dvc {
     }
 
     fn present_decoded_frame(&mut self, frame_idx: usize) -> bool {
-        let (decoded_w, decoded_h, decoded_prpa, gop_seen, seq_seen, gop_tc) = {
+        let (decoded_w, decoded_h, decoded_prpa, gop_seen, seq_seen, gop_tc, disp_pic_info, dec_pic_info) = {
             let Some(ref mut decoder) = self.video_decoder else {
                 return false;
             };
@@ -1822,11 +1838,17 @@ impl Dvc {
             let decoded_prpa = decoder.prpa();
             let target_w = (decoded_w as usize).min(FB_MAX_W).max(1);
             let target_h = (decoded_h as usize).min(FB_MAX_H).max(1);
-            decoder.frame(frame_idx).write_rgb_scaled(&mut *self.framebuffer, target_w, target_h);
+            let disp_frame = decoder.frame(frame_idx);
+            let disp_pic_info: u16 = ((disp_frame.temporal_reference & 0x03FF) << 2)
+                | ((disp_frame.picture_type as u16) & 0x0003);
+            let dec_raw: u16 = ((decoder.temporal_reference & 0x03FF) << 2)
+                | ((decoder.picture_type as u16) & 0x0003);
+            let dec_pic_info: u16 = if dec_raw != 0 { dec_raw } else { disp_pic_info };
+            disp_frame.write_rgb_scaled(&mut *self.framebuffer, target_w, target_h);
             self.video_width = target_w;
             self.video_height = target_h;
             self.has_valid_frame = true;
-            (decoded_w, decoded_h, decoded_prpa, gop_seen, seq_seen, gop_tc)
+            (decoded_w, decoded_h, decoded_prpa, gop_seen, seq_seen, gop_tc, disp_pic_info, dec_pic_info)
         };
 
         self.underflow_count = 0;
@@ -1861,8 +1883,9 @@ impl Dvc {
             self.advance_decoder_timecode();
         }
 
-        // Display status: active picture
-        self.set_fmv_word(0x5C, 0x0001);
+        // CL450 Display/Decoder Picture Info: bits 11:2 = temporal_reference, bits 1:0 = picture_coding_type (1=I,2=P,3=B)
+        self.set_fmv_word(0x5C, disp_pic_info);
+        self.set_fmv_word(0x0C, dec_pic_info);
 
         // Set FMV ISR bits
         self.or_fmv_word(FMV_ISR, FMV_IRQ_PIC);
@@ -1978,7 +2001,7 @@ impl Dvc {
             }
 
             if got_frame {
-            } else if self.frames_decoded_count > 0 && (self.video_playing || self.video_armed) {
+            } else if !self.has_pending_frame && self.frames_decoded_count > 0 && (self.video_playing || self.video_armed) {
                 let sequence_ended = self
                     .video_decoder
                     .as_mut()
@@ -1997,6 +2020,7 @@ impl Dvc {
                     if !self.fma_dma_seen && (self.audio_enabled || self.audio_armed) {
                         self.or_fma_word(FMA_ISR, FMA_IRQ_EOI);
                     }
+                    self.set_fmv_word(0x0C, 0x0000);
                     self.set_fmv_word(0x5C, 0x0000); // Return display status to idle
                     self.video_playing = false;
                     self.video_armed = false;
@@ -2060,7 +2084,9 @@ impl Dvc {
             return;
         }
         out.fill(crate::mcd212::fixed_color_out(0xFF00_0000));
-        let [pos_y, pos_x, raw_win_h, raw_win_w, off_y, off_x] = self.window.map(usize::from);
+        let raw_pos_y = self.window[0] as i16 as isize;
+        let raw_pos_x = self.window[1] as i16 as isize;
+        let [_, _, raw_win_h, raw_win_w, off_y, off_x] = self.window.map(usize::from);
         let (pic_w, pic_h) = (self.video_width, self.video_height);
         // The window is clipped to the decoded picture (mv_window adapts its size the same way).
         let off_x = off_x.min(pic_w);
@@ -2069,25 +2095,33 @@ impl Dvc {
         let win_h = raw_win_h.min(pic_h.saturating_sub(off_y));
 
         // When WIN_W/WIN_H are unconstrained (0x7FFF sentinel) or when an origin position would
-        // push the video off-screen (such as Brain Dead 13's (384, 240) centering formula on -1 dimensions),
-        // fallback to standard centered full-screen placement.
-        let mut pos_x = pos_x;
-        let mut pos_y = pos_y;
-        if raw_win_w >= 0x7FFF || pos_x >= 384 {
-            pos_x = (384usize.saturating_sub(pic_w)) / 2;
-        }
+        // push the video completely off-screen (such as Brain Dead 13's (384, 240) centering formula on -1 dimensions),
+        // fallback to standard centered full-screen placement. Otherwise allow negative signed offsets
+        // (e.g. mv_pos y=-8) and clip visible rows/columns cleanly.
+        let pos_x = if raw_win_w >= 0x7FFF || raw_pos_x >= 384 || raw_pos_x + (win_w as isize) <= 0 {
+            (384isize - pic_w as isize).max(0) / 2
+        } else {
+            raw_pos_x
+        };
         let total_active = if self.vsync_hz < 55.0 { 280 } else { 240 };
-        if raw_win_h >= 0x7FFF || pos_y >= total_active {
-            pos_y = (total_active.saturating_sub(pic_h)) / 2;
-        }
+        let pos_y = if raw_win_h >= 0x7FFF || raw_pos_y >= total_active as isize || raw_pos_y + (win_h as isize) <= 0 {
+            (total_active as isize - pic_h as isize).max(0) / 2
+        } else {
+            raw_pos_y
+        };
 
-        if active_line < pos_y || active_line >= pos_y + win_h {
+        let active_y = active_line as isize;
+        if active_y < pos_y || active_y >= pos_y + (win_h as isize) {
             return;
         }
-        let row = (off_y + active_line - pos_y) * pic_w + off_x;
+        let row = (off_y + (active_y - pos_y) as usize) * pic_w + off_x;
         // One picture pixel per normal-resolution pixel, so two high-resolution pixels each; no scaling.
         for col in 0..win_w {
-            let x = (pos_x + col) * 2;
+            let dst_x = pos_x + col as isize;
+            if dst_x < 0 {
+                continue;
+            }
+            let x = (dst_x as usize) * 2;
             if x + 1 >= 768 {
                 break;
             }
@@ -2573,6 +2607,83 @@ mod timing_tests {
         assert_ne!(d_av.get_fma_word(FMA_ISR) & FMA_IRQ_EOI, 0);
     }
 
+    fn video_packet(pts: Option<u64>, payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        match pts {
+            Some(t) => body.extend_from_slice(&[
+                0x21 | (((t >> 30) & 7) as u8) << 1,
+                (t >> 22) as u8,
+                0x01 | (((t >> 15) & 0x7F) as u8) << 1,
+                (t >> 7) as u8,
+                0x01 | ((t & 0x7F) as u8) << 1,
+            ]),
+            None => body.push(0x0F),
+        }
+        body.extend_from_slice(payload);
+        let mut p = vec![0, 0, 1, 0xE0];
+        p.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        p.extend_from_slice(&body);
+        p
+    }
+
+    #[test]
+    fn play_preserves_preroll_video_pts_base_for_buffered_stream() {
+        let mut seq = vec![0, 0, 1, 0xB3, 0x01, 0x00, 0x10, 0x13, 0xFF, 0xFF, 0xE0, 0x00];
+        seq.extend(std::iter::repeat(0).take(32));
+        let pic = |t: u8| {
+            vec![
+                0, 0, 1, 0x00, 0x00, t << 3, 0xFF, 0xF8, 0x90, 0x00,
+                0, 0, 1, 0x01, 0x08, 0x00, 0x00, 0x00,
+            ]
+        };
+        let mut first_es = seq;
+        first_es.extend([0, 0, 1, 0xB8, 0x00, 0x08, 0x00, 0x00]);
+        first_es.extend(pic(1));
+
+        let mut d = Dvc::new();
+        d.dvc_stream_fifo.extend_from_slice(&pack(60_000, 3528));
+        d.dvc_stream_fifo.extend_from_slice(&video_packet(Some(69_596), &first_es));
+        d.dvc_stream_fifo.extend_from_slice(&video_packet(Some(116_396), &pic(2)));
+        d.process_stream();
+        assert_eq!(d.min_video_pts_seen, 69_596);
+
+        // PLAY arrives while pre-rolled stream is already buffered: min_video_pts_seen must survive.
+        d.set_fmv_word(FMV_SYSCMD, 0x0008);
+        d.handle_fmv_write(FMV_SYSCMD);
+        assert!(d.has_min_video_pts && d.min_video_pts_seen == 69_596);
+
+        let mut tail = pic(2);
+        tail.extend([0, 0, 1, 0xB8, 0x00, 0x08, 0x00, 0x00]);
+        d.dvc_stream_fifo.extend_from_slice(&video_packet(Some(123_596), &tail));
+        d.process_stream();
+        d.frame_accum = 1.0;
+        d.on_vsync();
+
+        assert!(d.video_pts_valid);
+        assert_eq!(d.video_pts_base, 69_596);
+        assert_eq!(d.frames_presented_count, 1);
+    }
+
+    #[test]
+    fn scr_master_clock_advances_free_running_during_vbv_drain() {
+        let mut d = Dvc::new();
+        d.dvc_stream_fifo.extend_from_slice(&pack(513_600, 3528));
+        d.process_stream();
+        d.video_pts_valid = true;
+        d.has_pending_frame = true;
+        d.pending_frame_pts = 573_596; // +59_996 ticks (~667 ms) VBV lead after last video pack
+
+        assert!(!d.is_pending_frame_due(), "frame >500ms ahead of SCR must hold initially");
+        let step = (d.cpu_hz / 100) as u32;
+        for _ in 0..70 {
+            d.tick(step);
+        }
+        assert!(
+            d.is_pending_frame_due(),
+            "free-running SCR STC must advance across silent audio-only tail sectors so buffered VBV frames drain"
+        );
+    }
+
     #[test]
     fn display_prpa_matches_decoder_prpa_not_frame_rate_ratio() {
         // CL450 byte offset 0x56 (word 0x2B) is Display PRPA (matching Decoder PRPA at 0x06),
@@ -2725,5 +2836,101 @@ mod trick_and_sync_tests {
         d.on_vsync();
         assert_eq!(d.frames_decoded_count, 1);
         assert_eq!(d.frames_presented_count, 1);
+    }
+
+    #[test]
+    fn pending_frame_hold_does_not_fire_eod_or_ndat() {
+        let mut d = Dvc::new();
+        d.video_playing = true;
+        d.video_armed = true;
+        d.decoder_enabled = true;
+        d.frames_decoded_count = 1;
+        d.video_pts_valid = true;
+        d.video_pts_base = 90_000;
+        d.frames_presented_count = 10; // frame PTS = 90_000 + 36_000 = 126_000
+        d.demux.last_scr = Some(45_000); // lead > 45_000 so is_pending_frame_due() is false
+        d.has_pending_frame = true;
+        d.pending_frame_idx = 0;
+        d.pending_frame_pts = 126_000;
+        let mut v = Video::new(Vec::new());
+        v.sequence_end_seen = true; // simulate 0xB7 waiting behind the held frame
+        d.video_decoder = Some(v);
+        d.frame_accum = 1.0;
+
+        d.on_vsync();
+
+        assert!(d.video_playing, "holding a pending frame must not terminate playback");
+        assert!(d.video_armed);
+        assert_eq!(d.underflow_count, 0);
+        assert_eq!(d.get_fmv_word(FMV_ISR) & (FMV_IRQ_EOD | FMV_IRQ_ESI | FMV_IRQ_NDAT), 0);
+    }
+
+    #[test]
+    fn get_scanline_clips_negative_signed_pos_and_preserves_bd13_fallback() {
+        let mut d = Dvc::new();
+        d.vsync_hz = 50.0;
+        d.has_valid_frame = true;
+        d.video_width = 320;
+        d.video_height = 200;
+        for row in 0..200 {
+            d.framebuffer[row * 320..(row + 1) * 320].fill(0xFF00_0000 | (row as u32 + 1));
+        }
+
+        // Case 1: signed negative mv_pos (x=32, y=-8 as 0xFFF8), as used by Tetsuo Gaiden.
+        d.window = [0xFFF8, 32, 200, 320, 0, 0];
+        let mut out = [0u32; 768];
+        let mut present = [false; 768];
+        d.get_scanline(0, &mut out, &mut present);
+        assert!(present[64]);
+        assert_eq!(out[64], 0xFF00_0009, "active_line 0 at pos_y=-8 must sample row 8");
+        d.get_scanline(191, &mut out, &mut present);
+        assert!(present[64]);
+        assert_eq!(out[64], 0xFF00_00C8, "active_line 191 at pos_y=-8 must sample row 199");
+        d.get_scanline(192, &mut out, &mut present);
+        assert!(!present[64], "active_line 192 is past bottom of clipped -8..192 window");
+
+        // Case 2: Brain Dead 13 off-screen positive sentinel (384, 280) still falls back to centered placement.
+        d.window = [280, 384, 200, 320, 0, 0];
+        d.get_scanline(40, &mut out, &mut present); // centered y = (280-200)/2 = 40, x = (384-320)/2 = 32
+        assert!(present[64] && out[64] == 0xFF00_0001);
+    }
+
+    #[test]
+    fn fmv_picture_info_register_0x5c_exposes_temporal_reference_and_type() {
+        let mut es = vec![0, 0, 1, 0xB3, 0x01, 0x00, 0x10, 0x13, 0xFF, 0xFF, 0xE0, 0x00];
+        es.extend(std::iter::repeat(0).take(32));
+        es.extend([0, 0, 1, 0xB8, 0x00, 0x08, 0x00, 0x00]); // GOP
+        let add_pic = |buf: &mut Vec<u8>, tref: u16, ptype: u8| {
+            let b0 = ((tref >> 2) & 0xFF) as u8;
+            let b1 = (((tref & 0x03) as u8) << 6) | ((ptype & 0x07) << 3);
+            buf.extend([0, 0, 1, 0x00, b0, b1, 0xFF, 0xF8, 0x90, 0x00]);
+            buf.extend([0, 0, 1, 0x01, 0x08, 0x00, 0x00, 0x00]);
+        };
+        add_pic(&mut es, 2, 1); // I (tref=2)
+        add_pic(&mut es, 5, 2); // P (tref=5)
+        add_pic(&mut es, 3, 3); // B (tref=3)
+        add_pic(&mut es, 4, 3); // B (tref=4)
+        add_pic(&mut es, 8, 2); // P (tref=8)
+        es.extend([0, 0, 1, 0xB7]);
+
+        let mut d = Dvc::new();
+        d.video_playing = true;
+        d.decoder_enabled = true;
+        let mut v = Video::new(es);
+        let mut observed = Vec::new();
+        while let Some(idx) = v.decode() {
+            d.video_decoder = Some(v);
+            assert!(d.present_decoded_frame(idx));
+            observed.push(d.get_fmv_word(0x5C));
+            v = d.video_decoder.take().unwrap();
+        }
+        assert_eq!(
+            observed,
+            vec![(2 << 2) | 1, (3 << 2) | 3, (4 << 2) | 3, (5 << 2) | 2, (8 << 2) | 2]
+        );
+
+        d.reset();
+        assert_eq!(d.get_fmv_word(0x5C), 0);
+        assert_eq!(d.get_fmv_word(0x0C), 0);
     }
 }

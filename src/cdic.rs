@@ -112,6 +112,13 @@ pub struct Cdic {
 
     pub scramble_table: [u8; 2448],
     pub cd_byteswap: bool,
+
+    // Mode 2 stream cadence tracking for CloneCD unreadable-sector (0x55) concealment
+    pub last_mode2_data_subheader: [u8; 4],
+    pub has_last_mode2_data: bool,
+    pub last_mode2_audio_subheader: [u8; 4],
+    pub last_audio_lba: u32,
+    pub last_audio_interval: u32,
 }
 
 impl Cdic {
@@ -156,6 +163,12 @@ impl Cdic {
 
             scramble_table: generate_sector_scramble(),
             cd_byteswap: false,
+
+            last_mode2_data_subheader: [0; 4],
+            has_last_mode2_data: false,
+            last_mode2_audio_subheader: [0; 4],
+            last_audio_lba: 0,
+            last_audio_interval: 0,
         }
     }
 
@@ -196,6 +209,7 @@ impl Cdic {
         self.cycle_accumulator = 0;
         self.irq_pending = false;
         self.dma_triggered = false;
+        self.reset_concealment_state();
     }
 
     // Host/DMA writes into CDIC RAM 0x2800..0x3C00 supply a sound map rather than mirroring disc Mode 2 sectors.
@@ -403,6 +417,9 @@ impl Cdic {
             self.audio.right_state.reset();
             self.audio.main.clear();
         }
+        if is_seek || mode != 2 {
+            self.reset_concealment_state();
+        }
 
         info!(
             "CDIC init disc read: cmd=0x{:02X}, mode={}, LBA={}, is_seek={}",
@@ -418,6 +435,42 @@ impl Cdic {
         self.disc_spinup_counter = 0;
         self.cycle_accumulator = 0;
         self.cdda_playing = false;
+        self.reset_concealment_state();
+    }
+
+    fn reset_concealment_state(&mut self) {
+        self.last_mode2_data_subheader = [0; 4];
+        self.has_last_mode2_data = false;
+        self.last_mode2_audio_subheader = [0; 4];
+        self.last_audio_lba = 0;
+        self.last_audio_interval = 0;
+    }
+
+    /// Detects CloneCD unreadable-sector placeholders (`mode = 1`, bytes `16..2352` all `0x55`)
+    /// found on authentic disc dumps such as Tetris (USA).
+    fn is_clonecd_unreadable_placeholder(buf: &[u8]) -> bool {
+        buf.len() >= CD_SECTOR_RAW_SIZE
+            && buf[15] == 1
+            && buf[16..CD_SECTOR_RAW_SIZE].iter().all(|&b| b == 0x55)
+    }
+
+    fn conceal_clonecd_placeholder(&mut self, buf: &mut [u8; CD_SECTOR_RAW_SIZE]) -> bool {
+        let is_audio_slot = self.last_audio_interval > 0
+            && self.curr_lba > self.last_audio_lba
+            && (self.curr_lba - self.last_audio_lba) % self.last_audio_interval == 0;
+        let subheader = if is_audio_slot {
+            self.last_mode2_audio_subheader
+        } else if self.has_last_mode2_data {
+            self.last_mode2_data_subheader
+        } else {
+            return false;
+        };
+
+        buf[15] = 2;
+        buf[16..20].copy_from_slice(&subheader);
+        buf[20..24].copy_from_slice(&subheader);
+        buf[24..CD_SECTOR_RAW_SIZE].fill(0);
+        true
     }
 
     fn handle_cdic_command(&mut self) {
@@ -824,11 +877,23 @@ impl Cdic {
                 }
             }
 
-            // Mode 2 sector filtering (Command 0x2A only delivers Mode 2 sectors; skip non-Mode 2 gap/pad sectors)
+            // Mode 2 sector filtering (Command 0x2A only delivers Mode 2 sectors; skip non-Mode 2 gap/pad sectors,
+            // while concealing CloneCD 0x55 unreadable-sector placeholders to keep real-time frame/audio cadence intact)
             if self.disc_mode == 2 {
                 if sector_buf[15] != 2 {
-                    debug!("CDIC Read Mode 2 skipped non-Mode 2 sector: LBA={}, mode=0x{:02X}", self.curr_lba, sector_buf[15]);
-                    return;
+                    if self.command == 0x2A
+                        && Self::is_clonecd_unreadable_placeholder(&sector_buf)
+                        && self.conceal_clonecd_placeholder(&mut sector_buf)
+                    {
+                        debug!(
+                            "CDIC Read Mode 2 concealed CloneCD 0x55 placeholder at LBA={} as Mode 2 subheader={:02X?}",
+                            self.curr_lba,
+                            &sector_buf[20..24]
+                        );
+                    } else {
+                        debug!("CDIC Read Mode 2 skipped non-Mode 2 sector: LBA={}, mode=0x{:02X}", self.curr_lba, sector_buf[15]);
+                        return;
+                    }
                 }
                 let is_audio_sel = self.is_mode2_audio_selected(&sector_buf);
                 let is_sector_sel = self.is_mode2_sector_selected(&sector_buf);
@@ -845,10 +910,18 @@ impl Cdic {
                     let is_stereo = (coding & 0x03) == 0x01;
                     let is_8bit = (coding & 0x30) == 0x10;
                     let sample_rate = if (coding & 0x0C) == 0x04 { 18900 } else { 37800 };
+                    let count = get_sector_count_for_coding(coding);
 
-                    self.audio_sector_counter = get_sector_count_for_coding(coding);
+                    self.audio_sector_counter = count;
+                    self.last_mode2_audio_subheader.copy_from_slice(&sector_buf[20..24]);
+                    self.last_audio_lba = self.curr_lba;
+                    self.last_audio_interval = count as u32;
 
                     self.audio.decode_sector(&sector_buf[24..24 + 2304], is_stereo, is_8bit, sample_rate);
+                } else if is_sector_sel && (sector_buf[22] & 0x20) != 0 && (sector_buf[22] & (0x08 | 0x04 | 0x02)) != 0 {
+                    self.last_mode2_data_subheader.copy_from_slice(&sector_buf[20..24]);
+                    self.last_mode2_data_subheader[2] &= !(0x80 | 0x10 | 0x01);
+                    self.has_last_mode2_data = true;
                 }
 
                 if !is_sector_sel && !(self.command == 0x2A && is_audio_sel) {
@@ -958,6 +1031,7 @@ opencdi::impl_state!(Cdic {
     audio_sector_counter, map_on, map_next, buf_addr, buf_coding, buf_group, buf_elapsed, map_finished, map_sector_cycles, disc_audio_in_map_ram, dsp_achan, cdda_playing,
     cycle_accumulator, irq_pending, dma_triggered,
     cd_byteswap,
+    last_mode2_data_subheader, has_last_mode2_data, last_mode2_audio_subheader, last_audio_lba, last_audio_interval,
 } skip {
     scramble_table,
 });
@@ -1370,8 +1444,8 @@ mod tests {
         }
         s0[24] = 0x11;
 
-        // Sector 1: Mode 1 0x55-filled mastering gap (matches LBA 170713 in Tetris)
-        let mut s1 = [0x55u8; 2352];
+        // Sector 1: Genuine Mode 1 gap/pad sector (non-0x55 payload)
+        let mut s1 = [0u8; 2352];
         make_hdr(&mut s1, 1, 1);
 
         let mut s2 = [0u8; 2352];
@@ -1406,7 +1480,7 @@ mod tests {
         assert_ne!(c.read_reg(0x3F6) & 0x8000, 0);
         assert!(!c.irq_pending);
 
-        // Sector 1 (Mode 1 0x55 gap): must be skipped without delivering into XBUF/IRQ4 or stopping read
+        // Sector 1 (genuine Mode 1 gap): must be skipped without delivering into XBUF/IRQ4 or stopping read
         c.step_cycles(CD_SECTOR, CD_SECTOR, &mut cd);
         assert_eq!(c.x_buffer & 0x8000, 0);
         assert!(!c.irq_pending);
@@ -1417,5 +1491,92 @@ mod tests {
         assert_ne!(c.x_buffer & 0x8000, 0);
         assert!(c.irq_pending);
         assert_eq!(c.audio.total_sectors_decoded, 1);
+    }
+
+    #[test]
+    fn read_mode2_conceals_clonecd_0x55_placeholders_by_stream_cadence() {
+        let dir = std::env::temp_dir().join(format!("opencdi-mode2-conceal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let make_hdr = |sec: &mut [u8], lba: u32, mode: u8| {
+            let abs = lba + 150;
+            let bcd = |v: u32| (((v / 10) << 4) | (v % 10)) as u8;
+            sec[0..12].copy_from_slice(&crate::cdrom::CD_SYNC_HEADER);
+            sec[12] = bcd(abs / (60 * 75));
+            sec[13] = bcd((abs / 75) % 60);
+            sec[14] = bcd(abs % 75);
+            sec[15] = mode;
+        };
+        let make_mode2 = |lba: u32, subhdr: [u8; 4], fill: u8| {
+            let mut s = [fill; 2352];
+            make_hdr(&mut s, lba, 2);
+            s[16..20].copy_from_slice(&subhdr);
+            s[20..24].copy_from_slice(&subhdr);
+            s
+        };
+        let make_placeholder = |lba: u32| {
+            let mut s = [0x55u8; 2352];
+            make_hdr(&mut s, lba, 1);
+            s
+        };
+
+        // LBA 0: ADPCM Level C stereo audio (coding=0x05 -> 8-sector cadence)
+        // LBA 1..6: RL7 video (subheader 01 00 62 04); LBA 5 is a CloneCD 0x55 placeholder (video slot)
+        // LBA 7: video; LBA 8: CloneCD 0x55 placeholder on exact +8 audio slot
+        let mut bin = Vec::with_capacity(2352 * 9);
+        bin.extend_from_slice(&make_mode2(0, [0x01, 0x01, 0x64, 0x05], 0x10));
+        for lba in 1..=7 {
+            if lba == 5 {
+                bin.extend_from_slice(&make_placeholder(lba));
+            } else {
+                bin.extend_from_slice(&make_mode2(lba, [0x01, 0x00, 0x62, 0x04], 0x22));
+            }
+        }
+        bin.extend_from_slice(&make_placeholder(8));
+
+        std::fs::write(dir.join("tet.bin"), &bin).unwrap();
+        std::fs::write(dir.join("tet.cue"), "FILE \"tet.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n").unwrap();
+        let mut cd = Some(CdRom::open(dir.join("tet.cue")).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut c = Cdic::new();
+        c.file = 0x0100;
+        c.channel = 0xFFFF_FFFF;
+        c.audio_channel = 1 << 1;
+        c.write_reg(0x00, 0x2A);
+        c.write_reg(0x02, 0x0002); // LBA 0
+        c.write_reg(0x04, 0x0000);
+        c.write_reg(0x3FE, 0xC000);
+
+        // Advance LBA 0..4 (1 audio + 4 video)
+        for _ in 0..5 {
+            c.step_cycles(CD_SECTOR, CD_SECTOR, &mut cd);
+            let _ = c.read_reg(0x3F6);
+        }
+        assert_eq!(c.audio.total_sectors_decoded, 1);
+
+        // LBA 5: CloneCD 0x55 on a video slot must be concealed as Mode 2 video with zeroed payload
+        c.step_cycles(CD_SECTOR, CD_SECTOR, &mut cd);
+        assert_ne!(c.x_buffer & 0x8000, 0);
+        assert!(c.irq_pending);
+        assert_eq!(c.audio.total_sectors_decoded, 1);
+        let base = ((c.data_buffer & 0x0005) as usize) * 0x0A00;
+        assert_eq!(c.ram[base + 3], 2); // Mode 2 header
+        assert_eq!(&c.ram[base + 8..base + 12], &[0x01, 0x00, 0x62, 0x04]); // Video subheader
+        assert!(c.ram[base + 12..base + 12 + 32].iter().all(|&b| b == 0), "concealed video payload must be zeroed");
+        let _ = c.read_reg(0x3F6);
+
+        // LBA 6..7: normal video sectors
+        for _ in 0..2 {
+            c.step_cycles(CD_SECTOR, CD_SECTOR, &mut cd);
+            let _ = c.read_reg(0x3F6);
+        }
+
+        // LBA 8: CloneCD 0x55 on exact +8 audio slot must conceal as silent Mode 2 audio
+        c.step_cycles(CD_SECTOR, CD_SECTOR, &mut cd);
+        assert_ne!(c.x_buffer & 0x8000, 0);
+        assert_eq!(c.audio.total_sectors_decoded, 2);
+        assert_eq!(c.disc_command, 0x2A);
     }
 }

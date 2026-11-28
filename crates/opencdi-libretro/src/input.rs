@@ -100,6 +100,10 @@ impl Input {
         };
     }
 
+    pub fn position(&self) -> (i32, i32) {
+        (self.x, self.y)
+    }
+
     // Call after input_poll and before run_frame; only calls the slave when (x, y, buttons) changed.
     // Returns `Some(new_speed)` on the frame the user cycles the 3-level CD-i pad speed switch (L button).
     pub fn apply(&mut self, state: retro_input_state_t, bus: &mut CdiBus) -> Option<PadSpeed> {

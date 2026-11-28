@@ -9,6 +9,27 @@ L'obiettivo del progetto è preservare e rendere fruibile l'intera libreria soft
 
 ---
 
+## Novità Versione 0.4.3
+
+- **Persistenza Matte MCD-212, Timing DVC & Occultamento Settori CloneCD**:
+  - Persistenza di `weight_latch` tra scanline nell'MCD-212 e semantica NOR sulle chiavi invertite `TCR_MF0_KEY1`/`TCR_MF1_KEY1` (*Steel Machine*, #96).
+  - Preservazione di `video_pts_base` in pre-roll DVC, drain VBV a SCR free-running, flush differito del B-frame finale su `0xB7` e coordinate firmate `i16` in `FMV_SCRPOS` (*Tetsuo Gaiden*, #97).
+  - Popolati i registri Picture Info CL450 `0x5C`/`0x0C` con `temporal_reference` e `picture_coding_type` in ordine di presentazione MPEG-1, ripristinando l'interruzione immediata dell'FMV allo sparo in *Mad Dog McCree* / *Mad Dog II* (#83).
+  - Occultamento della cadenza dei settori illeggibili CloneCD `0x55` (`mode=1`) in `Read Mode 2` (`0x2A`) sul CDIC (*Tetris* Livelli 2, 5, 6, #95).
+- **Rilevamento Geometria `.iso` Universale & Subheader Sintetici Mode 2 Form 1**:
+  - Auto-rilevamento automatico `2352` / `2448` / `2336` / `2048` byte sui file `.iso`/`.bin`/`.img` e sintesi di subheader Mode 2 Form 1 Data|EOR validi sui file cooked da `2048` byte e unità CD virtuali Windows 11 (*Hotel Mario*, #102).
+- **Protezione Intro (*The 7th Guest*) & Presentazione OpenGL Windows**:
+  - Rimozione di eventuali click residui dal buffer CH0 all'avvio del disco (`clear_unread_pointer_click`) e scarto del click che conferisce focus alla finestra per non saltare l'intro FMV di *The 7th Guest* (#79).
+  - Nuovo presenter hardware OpenGL su Windows (`SwapBuffers`) con menu Win32 nascosto prima di `Exclusive Fullscreen`: supporto reale al fullscreen esclusivo su Windows 10/11 e agli overlay RivaTuner Statistics Server (RTSS).
+- **Display Scaling Standalone, Toggle Auto-Boot & Mirino Lightgun**:
+  - Aggiunti `Video -> Display Scaling` (`Fit Window`, `Fill Height 4:3`, `Integer`) (#90), toggle `File -> Auto-boot Disc from BIOS` (#93) e mirino Lightgun non distruttivo (`F3` / `Off | Auto | Always`) con indicatore chiaro `Input: Mouse` / `Input: Pad` nella barra del titolo (#83, #103).
+- **Rilevamento Regione da Disco, RTC da Ora di Sistema & NVRAM Condivisa**:
+  - Nuova Core Option `opencdi_region` (`auto | pal | ntsc`) supportata da analisi degli header MPEG-1 e dei metadati PVD del disco (#99).
+  - Inizializzazione automatica degli orologi BCD MK48T08 e DS1216 dall'ora locale del sistema ospite (#100).
+  - Nuova opzione Libretro `opencdi_nvram_mode` (`per_game | shared`) e seeding automatico dalle impostazioni condivise del BIOS Player Shell (#101).
+
+---
+
 ## Novità Versione 0.4.2
 
 - **Accuratezza External Video MCD-212 (`0xC0` `ICM_EV`)**:
@@ -117,6 +138,7 @@ L'obiettivo del progetto è preservare e rendere fruibile l'intera libreria soft
 |---|---|
 | **F1** | Informazioni e Guida Comandi |
 | **F2** | Salva Savestate nello slot corrente |
+| **F3** | Cicla Mirino Lightgun (`Off` / `Auto` / `Always`) |
 | **F4** | Carica Savestate dallo slot corrente |
 | **F6 / F7** | Slot Savestate Precedente / Successivo (0 - 999) |
 | **F5 / H** | Reset Console |
@@ -174,7 +196,7 @@ cargo build --release -p opencdi-libretro
 ```
 La libreria `opencdi_libretro.dll` (o `.so` su Linux) viene generata in `target/release/`.
 
-Le Core Options includono il rilevamento automatico della cartuccia DVC, il BIOS sperimentale CD-i 490 (Mono-IV), i livelli video (`studio`/`full`), il de-interlacing motion-adaptive per FMV (`opencdi_deinterlace`) e controlli granulari per il cursore su controller: velocità D-Pad X/Y (`opencdi_dpad_speed_x/y`), stick analogico sinistro proporzionale (`opencdi_analog_speed_x/y`) e boost temporaneo tenendo premuto `R` (`opencdi_cursor_boost`), oltre al selettore hardware a 3 livelli su `L`.
+Le Core Options includono rilevamento automatico DVC, BIOS sperimentale CD-i 490 (Mono-IV), selezione regione (`auto`/`pal`/`ntsc`), modalità NVRAM console (`per_game`/`shared`), mirino lightgun non distruttivo (`off`/`auto`/`always`), livelli video (`studio`/`full`), de-interlacing motion-adaptive per FMV (`opencdi_deinterlace`) e controlli granulari per il cursore su controller: velocità D-Pad X/Y (`opencdi_dpad_speed_x/y`), stick analogico sinistro proporzionale (`opencdi_analog_speed_x/y`) e boost temporaneo tenendo premuto `R` (`opencdi_cursor_boost`), oltre al selettore hardware a 3 livelli su `L`.
 
 ### Integrazione con ES-DE (EmulationStation Desktop Edition)
 Per avviare i giochi Philips CD-i con OpenCDi da ES-DE (`~/.emulationstation/custom_systems/es_systems.xml` su Linux/SteamOS o `%USERPROFILE%\ES-DE\custom_systems\es_systems.xml` su Windows), aggiungi:
@@ -215,12 +237,15 @@ OpenCDi calcola le frequenze di riga e di quadro a partire dai clock hardware de
   - **Gianluca ("sigsantilio")** — Coordinamento progetto, test e cura del frontend Windows. Curatore del canale YouTube retrogaming [*L'Archivio del Sig. Santilio*](https://www.youtube.com/@sigsantilio).
 - **Contributori Principali:**
   - **ArnoldDeRuiter** — Architettura del core, implementazione Libretro, emulazione chip Mono-IV e savestate deterministici in memoria.
+  - **whatever-industries** — App standalone nativa macOS e packaging (PR #74), adattamento de-interlacing FMV sotto licenza MIT e documentazione tecnica/hardware CD-i (#75).
+- **Tester della Comunità & Segnalazioni Bug:**
+  - Grazie di cuore a **ArchCZ**, **cesargranados**, **chucky3000**, **DamageInc86**, **danial**, **Gritalian**, **has2070**, **jamietuley**, **LG30**, **logi26**, **mgtroyas**, **retroindiegamer**, **Retroicky**, **Sonicadvance1**, **sub**, **Turrican2k**, **veb-xenon**, **wonderingabout** e a tutti coloro che inviano diagnosi tramite GitHub Issues e il portale tester.
 
 ## Ringraziamenti Speciali
 
 Un sincero ringraziamento a tutti coloro che hanno reso possibile lo sviluppo e l'evoluzione di OpenCDi:
 - **ArnoldDeRuiter**: per l'eccezionale e massiccio lavoro di reverse engineering, implementazione del core Libretro, savestates in memoria, chip Mono-IV (CIAP, IKAT), harness di test deterministico e innumerevoli rifiniture al timing e all'audio.
-- **whatever-industries** ([`edi_emulator`](https://github.com/whatever-industries/edi_emulator)): per l'algoritmo di de-interlacing motion-adaptive sotto licenza MIT adattato per il de-interlacing FMV opzionale di OpenCDi, la ricerca hardware CD-i e la collaborazione con la comunità.
+- **whatever-industries** ([`edi_emulator`](https://github.com/whatever-industries/edi_emulator)): per l'app standalone nativa macOS (PR #74), l'algoritmo di de-interlacing motion-adaptive sotto licenza MIT adattato per il de-interlacing FMV opzionale di OpenCDi, la ricerca hardware CD-i e la collaborazione con la comunità.
 - **Il Team di MAME / MESS**: per la fondamentale documentazione di riferimento sull'hardware personalizzato Philips e Motorola (SCC68070, MCD212, CDIC, Slave 68HC05).
 - **The World of CD-i** e l'intera comunità di preservazione CD-i per la passione, le informazioni tecniche e il supporto continuo.
 - Tutti i tester e appassionati che hanno provato l'emulatore e fornito feedback prezioso.

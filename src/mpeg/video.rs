@@ -688,6 +688,8 @@ pub struct Plane {
 pub struct Frame {
     pub width: usize,
     pub height: usize,
+    pub temporal_reference: u16,
+    pub picture_type: u8,
     pub y: Plane,
     pub cr: Plane,
     pub cb: Plane,
@@ -727,6 +729,7 @@ pub struct Video {
     pub chroma_height: usize,
 
     pub start_code: i32,
+    pub temporal_reference: u16,
     pub picture_type: i32,
 
     pub motion_forward: Motion,
@@ -803,6 +806,7 @@ impl Video {
             chroma_width: 0,
             chroma_height: 0,
             start_code: -1,
+            temporal_reference: 0,
             picture_type: 0,
             motion_forward: Motion::default(),
             motion_backward: Motion::default(),
@@ -837,7 +841,6 @@ impl Video {
             last_gop_timecode: None,
             prpa: 0x0023,
         };
-        s.sequence_end_seen = s.buffer.contains_start_code_from(0, 0xB7);
         s.try_seek_initial_header();
         s
     }
@@ -872,11 +875,7 @@ impl Video {
     }
 
     pub fn append(&mut self, data: &[u8]) {
-        let old_len = self.buffer.len_bytes();
         self.buffer.append(data);
-        if self.buffer.contains_start_code_from(old_len.saturating_sub(3), 0xB7) {
-            self.sequence_end_seen = true;
-        }
         if !self.has_sequence_header {
             self.try_seek_initial_header();
         }
@@ -979,6 +978,17 @@ impl Video {
                     }
                     self.gop_header_seen = true;
                     self.decode_gop_header();
+                } else if self.start_code == START_SEQUENCE_END {
+                    // Flush the final held reference picture before signaling 0xB7 sequence end.
+                    if self.has_reference_frame
+                        && !self.emitted_initial_ref
+                        && !self.assume_no_b_frames
+                    {
+                        self.has_reference_frame = false;
+                        self.has_fwd_reference = false;
+                        return Some(self.emit(self.bwd));
+                    }
+                    self.sequence_end_seen = true;
                 }
                 self.start_code = self.buffer.next_start_code();
             }
@@ -989,14 +999,13 @@ impl Video {
                 }
                 // Flush the last reference frame at end of stream.
                 if self.has_reference_frame
+                    && !self.emitted_initial_ref
                     && !self.assume_no_b_frames
                     && (self.buffer.has_ended() || self.sequence_end_seen)
-                    && (self.picture_type == PICTURE_TYPE_INTRA
-                        || self.picture_type == PICTURE_TYPE_PREDICTIVE)
                 {
                     self.has_reference_frame = false;
                     self.has_fwd_reference = false;
-                    return Some(self.bwd);
+                    return Some(self.emit(self.bwd));
                 }
                 return None;
             }
@@ -1189,6 +1198,7 @@ impl Video {
     fn init_sequence_buffers(&mut self) {
         self.has_reference_frame = false;
         self.has_fwd_reference = false;
+        self.emitted_initial_ref = false;
         self.mb_width = (self.width + 15) >> 4;
         self.mb_height = (self.height + 15) >> 4;
         self.mb_size = self.mb_width * self.mb_height;
@@ -1211,6 +1221,8 @@ impl Video {
         Frame {
             width: self.width,
             height: self.height,
+            temporal_reference: 0,
+            picture_type: 0,
             y: Plane {
                 width: self.luma_width,
                 height: self.luma_height,
@@ -1244,7 +1256,7 @@ impl Video {
     }
 
     fn decode_picture(&mut self) -> bool {
-        self.buffer.skip(10); // temporal_reference
+        let temporal_reference = self.buffer.read(10) as u16;
         self.picture_type = self.buffer.read(3) as i32;
         self.buffer.skip(16); // vbv_delay
 
@@ -1278,6 +1290,10 @@ impl Video {
             self.skip_picture_slices();
             return false;
         }
+
+        self.temporal_reference = temporal_reference;
+        self.frames[self.cur].temporal_reference = temporal_reference;
+        self.frames[self.cur].picture_type = self.picture_type as u8;
 
         let frame_temp = self.fwd;
         if self.picture_type == PICTURE_TYPE_INTRA || self.picture_type == PICTURE_TYPE_PREDICTIVE {
@@ -1950,11 +1966,17 @@ mod edge_mc_tests {
         [0, 0, 1, 0xB8, 0x00, 0x08, 0x00, 0x00]
     }
 
-    fn picture_and_slice(pic_type: u8) -> Vec<u8> {
+    fn picture_and_slice_with_tref(tref: u16, pic_type: u8) -> Vec<u8> {
+        let b0 = ((tref >> 2) & 0xFF) as u8;
+        let b1 = (((tref & 0x03) as u8) << 6) | ((pic_type & 0x07) << 3);
         vec![
-            0, 0, 1, 0x00, 0x00, pic_type << 3, 0xFF, 0xF8, 0x90, 0x00,
+            0, 0, 1, 0x00, b0, b1, 0xFF, 0xF8, 0x90, 0x00,
             0, 0, 1, 0x01, 0x08, 0x00, 0x00, 0x00,
         ]
+    }
+
+    fn picture_and_slice(pic_type: u8) -> Vec<u8> {
+        picture_and_slice_with_tref(0, pic_type)
     }
 
     #[test]
@@ -2024,6 +2046,70 @@ mod edge_mc_tests {
         let last = dw * dw - 1;
         assert_eq!(d[last], s[last]);
     }
+
+    #[test]
+    fn sequence_end_defers_until_all_preceding_pictures_and_ref_frame_flush() {
+        // I-frame, P-frame, then 0xB7 buffered all at once: sequence_end must wait until both emit.
+        let mut es = sequence_header(16, 16);
+        es.extend(gop_header());
+        es.extend(picture_and_slice(1));
+        es.extend(picture_and_slice(2));
+        es.extend([0, 0, 1, 0xB7]);
+
+        let mut v = Video::new(es);
+        assert!(!v.take_sequence_end(), "0xB7 in input buffer must not signal end eagerly");
+
+        assert!(v.decode_with_flush(false).is_some(), "I-frame should emit first");
+        assert!(!v.take_sequence_end(), "0xB7 must not fire before final P-frame flushes");
+
+        assert!(v.decode_with_flush(false).is_some(), "trailing P-frame should flush before 0xB7");
+        assert!(!v.take_sequence_end(), "0xB7 must not fire on the same call that emits P-frame");
+
+        assert!(v.decode_with_flush(false).is_none());
+        assert!(v.take_sequence_end(), "0xB7 must signal only once all frames have decoded");
+    }
+
+    #[test]
+    fn sequence_end_after_trailing_b_frame_flushes_final_reference_picture() {
+        let mut es = sequence_header(16, 16);
+        es.extend(gop_header());
+        es.extend(picture_and_slice(1));
+        es.extend(picture_and_slice(2));
+        es.extend(picture_and_slice(3));
+        es.extend([0, 0, 1, 0xB7]);
+
+        let mut v = Video::new(es);
+        let mut decoded = 0usize;
+        while let Some(_) = v.decode() {
+            decoded += 1;
+            assert!(
+                !v.take_sequence_end(),
+                "0xB7 must not fire before all 3 frames (including final P reference after trailing B) emit"
+            );
+        }
+        assert_eq!(decoded, 3, "I, trailing B, and held P reference must all emit");
+        assert!(v.take_sequence_end(), "0xB7 must fire once all 3 frames have been returned");
+    }
+
+    #[test]
+    fn picture_metadata_follows_b_frame_reordering() {
+        let mut es = sequence_header(16, 16);
+        es.extend(gop_header());
+        es.extend(picture_and_slice_with_tref(2, 1)); // I (tref=2)
+        es.extend(picture_and_slice_with_tref(5, 2)); // P (tref=5)
+        es.extend(picture_and_slice_with_tref(3, 3)); // B (tref=3)
+        es.extend(picture_and_slice_with_tref(4, 3)); // B (tref=4)
+        es.extend(picture_and_slice_with_tref(8, 2)); // P (tref=8)
+        es.extend([0, 0, 1, 0xB7]);
+
+        let mut v = Video::new(es);
+        let mut meta = Vec::new();
+        while let Some(idx) = v.decode() {
+            let f = v.frame(idx);
+            meta.push((f.temporal_reference, f.picture_type));
+        }
+        assert_eq!(meta, vec![(2, 1), (3, 3), (4, 3), (5, 2), (8, 2)]);
+    }
 }
 
 // Savestate: the decoder is created on demand, so a state may need one before loading into it.
@@ -2034,13 +2120,13 @@ impl Default for Video {
 }
 
 opencdi::impl_state!(Plane { width, height, data } skip {});
-opencdi::impl_state!(Frame { width, height, y, cr, cb } skip {});
+opencdi::impl_state!(Frame { width, height, temporal_reference, picture_type, y, cr, cb } skip {});
 opencdi::impl_state!(Motion { full_px, is_set, r_size, h, v } skip {});
 
 opencdi::impl_state!(Video {
     buffer, framerate, pixel_aspect_ratio, time, last_frame_time, frames_decoded,
     width, height, mb_width, mb_height, mb_size, luma_width, luma_height, chroma_width, chroma_height,
-    start_code, picture_type, motion_forward, motion_backward, has_sequence_header,
+    start_code, temporal_reference, picture_type, motion_forward, motion_backward, has_sequence_header,
     quantizer_scale, slice_begin, macroblock_address, mb_row, mb_col, macroblock_type, macroblock_intra,
     dc_predictor, frames, cur, fwd, bwd, block_data, intra_quant_matrix, non_intra_quant_matrix,
     has_reference_frame, has_fwd_reference, assume_no_b_frames, emitted_initial_ref, flush_single,

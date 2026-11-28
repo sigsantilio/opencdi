@@ -177,6 +177,14 @@ impl CdiBus {
         }
     }
 
+    /// Initializes the active NVRAM/RTC (MK48T08 or Mono-IV DS1216) from host local wall clock.
+    pub fn seed_rtc_from_host(&mut self) {
+        self.nvram.seed_clock_from_host();
+        if let Some(m4) = self.mono4.as_deref_mut() {
+            m4.nvram.clock.seed_clock_from_host();
+        }
+    }
+
     #[inline(always)]
     pub fn add_ram_wait<const PATH: usize>(&mut self) {
         if self.emulate_wait_states {

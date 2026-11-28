@@ -7,7 +7,7 @@ use opencdi::audio;
 use opencdi::bios;
 use opencdi::deinterlace::Deinterlacer;
 use opencdi::machine::Machine;
-use opencdi::mcd212::{VideoMode, SCREEN_HEIGHT, SCREEN_WIDTH};
+use opencdi::mcd212::{draw_crosshair, CrosshairMode, VideoMode, SCREEN_HEIGHT, SCREEN_WIDTH};
 use opencdi::savestate::{Reader, State};
 use std::ffi::{CStr, CString, c_char, c_uint, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -47,6 +47,9 @@ struct LoadSpec {
 
 const OPT_DVC: &CStr = c"opencdi_dvc";
 const OPT_MONO4: &CStr = c"opencdi_mono4";
+const OPT_REGION: &CStr = c"opencdi_region";
+const OPT_NVRAM_MODE: &CStr = c"opencdi_nvram_mode";
+const OPT_CROSSHAIR: &CStr = c"opencdi_crosshair";
 const OPT_LEVELS: &CStr = c"opencdi_video_levels";
 const OPT_DEINTERLACE: &CStr = c"opencdi_deinterlace";
 const OPT_DPAD_SPEED_X: &CStr = c"opencdi_dpad_speed_x";
@@ -101,7 +104,7 @@ const fn option_values(list: &[(&CStr, &CStr)]) -> [retro_core_option_value; RET
 }
 
 // Core options v1, terminated by an empty entry; frontends without v1 get VARIABLES below.
-static OPTIONS: Table<[retro_core_option_definition; 10]> = Table([
+static OPTIONS: Table<[retro_core_option_definition; 13]> = Table([
     retro_core_option_definition {
         key: OPT_DVC.as_ptr(),
         desc: c"DVC cartridge (restart)".as_ptr(),
@@ -114,6 +117,27 @@ static OPTIONS: Table<[retro_core_option_definition; 10]> = Table([
         desc: c"CD-i 490 BIOS, experimental (restart)".as_ptr(),
         info: c"on also accepts the Mono-IV system ROM (cdi490a.rom) when no Mono-I ROM is found; with impega.rom present (and the DVC option on auto) the IMPEG Digital Video cartridge is fitted. The 490 board is experimental. Takes effect when content is loaded.".as_ptr(),
         values: option_values(&[(c"off", c"off"), (c"on", c"on")]),
+        default_value: c"off".as_ptr(),
+    },
+    retro_core_option_definition {
+        key: OPT_REGION.as_ptr(),
+        desc: c"Console region / video standard (restart)".as_ptr(),
+        info: c"auto selects NTSC (60 Hz) or PAL (50 Hz) from filename tags, MPEG sequence headers, and PVD metadata; pal or ntsc forces that video standard regardless of filename. Takes effect when content is loaded.".as_ptr(),
+        values: option_values(&[(c"auto", c"auto"), (c"pal", c"PAL (50 Hz)"), (c"ntsc", c"NTSC (60 Hz)")]),
+        default_value: c"auto".as_ptr(),
+    },
+    retro_core_option_definition {
+        key: OPT_NVRAM_MODE.as_ptr(),
+        desc: c"Console NVRAM mode (restart)".as_ptr(),
+        info: c"per_game lets RetroArch keep separate .srm save RAM per disc (seeded from shared player settings when new); shared uses one console-wide NVRAM file across all games just like real CD-i hardware. Takes effect when content is loaded.".as_ptr(),
+        values: option_values(&[(c"per_game", c"per_game (separate .srm)"), (c"shared", c"shared (console-wide NVRAM)")]),
+        default_value: c"per_game".as_ptr(),
+    },
+    retro_core_option_definition {
+        key: OPT_CROSSHAIR.as_ptr(),
+        desc: c"Lightgun crosshair".as_ptr(),
+        info: c"Draws a non-destructive reticle at the CD-i pointer position: auto appears only when the game hides its hardware cursor (such as Mad Dog McCree GUN calibration/gameplay). Takes effect at once.".as_ptr(),
+        values: option_values(&[(c"off", c"off"), (c"auto", c"auto (when game hides cursor)"), (c"always", c"always")]),
         default_value: c"off".as_ptr(),
     },
     retro_core_option_definition {
@@ -167,9 +191,12 @@ static OPTIONS: Table<[retro_core_option_definition; 10]> = Table([
     },
     retro_core_option_definition { key: std::ptr::null(), desc: std::ptr::null(), info: std::ptr::null(), values: [NO_VALUE; RETRO_NUM_CORE_OPTION_VALUES_MAX], default_value: std::ptr::null() },
 ]);
-static VARIABLES: Table<[retro_variable; 10]> = Table([
+static VARIABLES: Table<[retro_variable; 13]> = Table([
     retro_variable { key: OPT_DVC.as_ptr(), value: c"DVC cartridge (restart); auto|off".as_ptr() },
     retro_variable { key: OPT_MONO4.as_ptr(), value: c"CD-i 490 BIOS, experimental (restart); off|on".as_ptr() },
+    retro_variable { key: OPT_REGION.as_ptr(), value: c"Console region / video standard (restart); auto|pal|ntsc".as_ptr() },
+    retro_variable { key: OPT_NVRAM_MODE.as_ptr(), value: c"Console NVRAM mode (restart); per_game|shared".as_ptr() },
+    retro_variable { key: OPT_CROSSHAIR.as_ptr(), value: c"Lightgun crosshair; off|auto|always".as_ptr() },
     retro_variable { key: OPT_LEVELS.as_ptr(), value: c"Video levels; studio|full".as_ptr() },
     retro_variable { key: OPT_DEINTERLACE.as_ptr(), value: c"De-interlacing (FMV / Interlaced); off|on".as_ptr() },
     retro_variable { key: OPT_DPAD_SPEED_X.as_ptr(), value: c"Cursor D-Pad speed (horizontal); 3|1|2|4|5|6|7|8|9|10|11|12".as_ptr() },
@@ -193,6 +220,12 @@ struct Core {
     state_size: usize,
     deinterlace: bool,
     deinterlacer: Deinterlacer,
+    crosshair: CrosshairMode,
+    present_fb: Vec<u32>,
+    shared_nvram_mode: bool,
+    shared_nvram_path: Option<PathBuf>,
+    is_no_game: bool,
+    rtc_seeded: bool,
 }
 
 static CALLBACKS: Mutex<Callbacks> = Mutex::new(Callbacks {
@@ -216,6 +249,12 @@ static CORE: Mutex<Core> = Mutex::new(Core {
     state_size: 0,
     deinterlace: false,
     deinterlacer: Deinterlacer::new(),
+    crosshair: CrosshairMode::Off,
+    present_fb: Vec::new(),
+    shared_nvram_mode: false,
+    shared_nvram_path: None,
+    is_no_game: false,
+    rtc_seeded: false,
 });
 static LOG: Mutex<retro_log_printf_t> = Mutex::new(None);
 static POISONED: AtomicBool = AtomicBool::new(false);
@@ -269,6 +308,18 @@ unsafe fn env_call(cmd: c_uint, data: *mut c_void) -> bool {
         Some(f) => unsafe { f(cmd, data) },
         None => false,
     }
+}
+
+fn save_directory() -> Option<PathBuf> {
+    let mut p: *const c_char = std::ptr::null();
+    // SAFETY: GET_SAVE_DIRECTORY writes a `const char *` through the pointer.
+    let ok = unsafe { env_call(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &mut p as *mut _ as *mut c_void) };
+    if !ok || p.is_null() {
+        return None;
+    }
+    // SAFETY: non-null NUL-terminated string owned by the frontend.
+    let s = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
+    if s.is_empty() { None } else { Some(PathBuf::from(s)) }
 }
 
 fn system_directory() -> Option<PathBuf> {
@@ -379,6 +430,65 @@ fn parse_boost_x10(raw: Option<&str>) -> i32 {
     }
 }
 
+fn parse_crosshair(raw: Option<&str>) -> CrosshairMode {
+    raw.and_then(CrosshairMode::from_str_opt).unwrap_or(CrosshairMode::Off)
+}
+
+fn resolve_shared_nvram_paths(sys_dir: &Path, mono4: bool) -> (PathBuf, PathBuf) {
+    let primary_name = if mono4 { "opencdi_shared_nvram490.bin" } else { "opencdi_shared_nvram.bin" };
+    let sys_fallback = if mono4 { "nvram_cdi490a.bin" } else { "nvram_mk48t08.bin" };
+    let base_dir = save_directory().unwrap_or_else(|| sys_dir.to_path_buf());
+    (base_dir.join(primary_name), sys_dir.join(sys_fallback))
+}
+
+fn load_shared_nvram_into_machine(m: &mut Machine, primary: &Path, fallback: &Path) {
+    let src = if primary.is_file() {
+        Some(primary)
+    } else if fallback.is_file() {
+        Some(fallback)
+    } else {
+        None
+    };
+    let Some(path) = src else { return };
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            if let Some(m4) = m.bus.mono4.as_deref_mut() {
+                m4.nvram.load_bytes(&bytes);
+                m4.nvram.dirty = false;
+            } else {
+                let n = bytes.len().min(m.bus.nvram.ram.len());
+                m.bus.nvram.ram[..n].copy_from_slice(&bytes[..n]);
+                m.bus.nvram.dirty = false;
+            }
+            log(RETRO_LOG_INFO, &format!("seeded console NVRAM from {}", path.display()));
+        }
+        Err(e) => log(RETRO_LOG_WARN, &format!("cannot read shared NVRAM {}: {}", path.display(), e)),
+    }
+}
+
+fn persist_shared_nvram(path: Option<&Path>, m: &mut Machine) {
+    let Some(path) = path else { return };
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let res = if let Some(m4) = m.bus.mono4.as_deref_mut() {
+        let r = std::fs::write(path, &m4.nvram.ram);
+        if r.is_ok() {
+            m4.nvram.dirty = false;
+        }
+        r
+    } else {
+        let r = std::fs::write(path, &m.bus.nvram.ram[..]);
+        if r.is_ok() {
+            m.bus.nvram.dirty = false;
+        }
+        r
+    };
+    if let Err(e) = res {
+        log(RETRO_LOG_WARN, &format!("cannot write shared NVRAM {}: {}", path.display(), e));
+    }
+}
+
 fn read_cursor_config() -> input::CursorConfig {
     input::CursorConfig {
         dpad_speed_x: parse_cursor_speed(option_value(OPT_DPAD_SPEED_X).as_deref(), input::DEFAULT_DPAD_SPEED, 1, 12),
@@ -435,10 +545,20 @@ fn find_dvc(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-fn is_ntsc_name(path: &Path, machine: &Machine) -> bool {
-    let name = path.file_stem().map(|s| s.to_string_lossy().to_uppercase()).unwrap_or_default();
-    (name.contains("(USA)") || name.contains("(JAPAN)") || name.contains("NTSC"))
-        && machine.bus.cdrom.as_ref().is_none_or(|cd| cd.disc_type != 0x20)
+fn resolve_video_mode(region_opt: Option<&str>, path: Option<&Path>, machine: &Machine) -> VideoMode {
+    match region_opt.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("pal") => VideoMode::Pal,
+        Some("ntsc") => VideoMode::Ntsc,
+        _ => {
+            let Some(p) = path else { return VideoMode::Pal };
+            let name = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            if machine.bus.cdrom.as_ref().and_then(|cd| cd.is_ntsc_hint(&name)).unwrap_or(false) {
+                VideoMode::Ntsc
+            } else {
+                VideoMode::Pal
+            }
+        }
+    }
 }
 
 fn boot(spec: &LoadSpec) -> Result<Machine, String> {
@@ -651,6 +771,7 @@ pub extern "C" fn retro_reset() {
                 core.input.reset();
                 core.deinterlacer.reset();
                 core.frames_out = 0;
+                core.rtc_seeded = false;
             }
             Err(e) => log(RETRO_LOG_ERROR, &format!("reset failed: {}", e)),
         }
@@ -691,7 +812,19 @@ pub extern "C" fn retro_run() {
             unsafe { poll() };
         }
         let mut core = lock(&CORE);
-        let Core { machine, input, uart_line, deinterlace, deinterlacer, .. } = &mut *core;
+        let Core {
+            machine,
+            input,
+            uart_line,
+            deinterlace,
+            deinterlacer,
+            crosshair,
+            present_fb,
+            shared_nvram_mode,
+            shared_nvram_path,
+            rtc_seeded,
+            ..
+        } = &mut *core;
         let Some(m) = machine.as_mut() else { return };
         if options_updated() {
             opencdi::mcd212::set_studio_levels(option_value(OPT_LEVELS).as_deref() != Some("full"));
@@ -700,18 +833,41 @@ pub extern "C" fn retro_run() {
                 *deinterlace = new_deint;
                 deinterlacer.reset();
             }
+            *crosshair = parse_crosshair(option_value(OPT_CROSSHAIR).as_deref());
             input.config = read_cursor_config();
+        }
+        // Seed host local time once on frame 0 (after frontend SAVE_RAM overlay, before frame 0 executes).
+        // Savestate capture/restore runs at frame >= 1 so determinism and --roundtrip stay intact.
+        if !*rtc_seeded {
+            m.bus.seed_rtc_from_host();
+            *rtc_seeded = true;
         }
         let speed_changed = input.apply(cb.input_state, &mut m.bus);
         m.run_frame();
+        if *shared_nvram_mode && m.bus.current_frame % 300 == 0 {
+            let dirty = m.bus.mono4.as_deref().map_or(m.bus.nvram.dirty, |m4| m4.nvram.dirty);
+            if dirty {
+                persist_shared_nvram(shared_nvram_path.as_deref(), m);
+            }
+        }
         if let Some(buf) = m.bus.uart_capture.as_mut() {
             drain_uart(buf, uart_line);
         }
         if let Some(video) = cb.video {
             let (interlaced, odd_field, y_offset) = m.bus.mcd212.display_interlace_info();
+            let hw_cursor_visible = m.bus.mcd212.hardware_cursor_visible();
             let fb = deinterlacer.process(m.framebuffer(), interlaced, odd_field, y_offset, *deinterlace);
-            // SAFETY: `fb` is SCREEN_WIDTH * SCREEN_HEIGHT XRGB8888 pixels, valid for the duration of the call.
-            unsafe { video(fb.as_ptr() as *const c_void, SCREEN_WIDTH as c_uint, SCREEN_HEIGHT as c_uint, SCREEN_WIDTH * 4) };
+            let out_ptr = if crosshair.should_draw(hw_cursor_visible) {
+                present_fb.clear();
+                present_fb.extend_from_slice(&fb[..SCREEN_WIDTH * SCREEN_HEIGHT]);
+                let (cx, cy) = input.position();
+                draw_crosshair(present_fb, SCREEN_WIDTH, SCREEN_HEIGHT, cx, cy);
+                present_fb.as_ptr()
+            } else {
+                fb.as_ptr()
+            };
+            // SAFETY: `out_ptr` points to SCREEN_WIDTH * SCREEN_HEIGHT XRGB8888 pixels valid for this call.
+            unsafe { video(out_ptr as *const c_void, SCREEN_WIDTH as c_uint, SCREEN_HEIGHT as c_uint, SCREEN_WIDTH * 4) };
         }
         send_audio(&mut core, cb.audio_batch);
         drop(core);
@@ -846,22 +1002,29 @@ fn load(game: *const retro_game_info) -> Result<(), String> {
     } else {
         find_dvc(&dir)
     };
-    let mut spec = LoadSpec { bios, dvc, disc, mode: VideoMode::Pal };
+    let region_opt = option_value(OPT_REGION);
+    let initial_mode = resolve_video_mode(region_opt.as_deref(), None, &Machine::new());
+    let mut spec = LoadSpec { bios, dvc, disc, mode: initial_mode };
     let mut m = boot(&spec)?;
-    if let Some(d) = &spec.disc {
-        if is_ntsc_name(d, &m) {
-            spec.mode = VideoMode::Ntsc;
-            m = boot(&spec)?;
-        }
+    let target_mode = resolve_video_mode(region_opt.as_deref(), spec.disc.as_deref(), &m);
+    if target_mode != spec.mode {
+        spec.mode = target_mode;
+        m = boot(&spec)?;
     }
+    let shared_nvram_mode = option_value(OPT_NVRAM_MODE).as_deref() == Some("shared");
+    let (shared_primary, shared_fallback) = resolve_shared_nvram_paths(&dir, mono4);
+    load_shared_nvram_into_machine(&mut m, &shared_primary, &shared_fallback);
+    let is_no_game = spec.disc.is_none();
     log(RETRO_LOG_INFO, &format!(
-        "BIOS {}, DVC {}, disc {}, {:?}",
+        "BIOS {}, DVC {}, disc {}, {:?}, nvram_mode={}",
         spec.bios.display(),
         spec.dvc.as_ref().map_or("none".into(), |d| d.display().to_string()),
         spec.disc.as_ref().map_or("none".into(), |d| d.display().to_string()),
-        spec.mode
+        spec.mode,
+        if shared_nvram_mode { "shared" } else { "per_game" }
     ));
     let deinterlace = option_value(OPT_DEINTERLACE).as_deref() == Some("on");
+    let crosshair = parse_crosshair(option_value(OPT_CROSSHAIR).as_deref());
     let cursor_config = read_cursor_config();
     let mut core = lock(&CORE);
     core.machine = Some(m);
@@ -871,6 +1034,11 @@ fn load(game: *const retro_game_info) -> Result<(), String> {
     core.input.config = cursor_config;
     core.deinterlace = deinterlace;
     core.deinterlacer.reset();
+    core.crosshair = crosshair;
+    core.shared_nvram_mode = shared_nvram_mode;
+    core.shared_nvram_path = Some(shared_primary);
+    core.is_no_game = is_no_game;
+    core.rtc_seeded = false;
     core.frames_out = 0;
     core.state_size = 0;
     Ok(())
@@ -879,17 +1047,31 @@ fn load(game: *const retro_game_info) -> Result<(), String> {
 fn unload() {
     let mut core = lock(&CORE);
     flush_uart_line(&mut core.uart_line);
-    if let Some(m) = core.machine.as_ref() {
+    let persist_target = if core.shared_nvram_mode || core.is_no_game {
+        core.shared_nvram_path.clone()
+    } else {
+        None
+    };
+    let frames_out = core.frames_out;
+    if let Some(m) = core.machine.as_mut() {
+        if let Some(ref p) = persist_target {
+            persist_shared_nvram(Some(p.as_path()), m);
+        }
         let a = &m.bus.cdic.audio;
         log(RETRO_LOG_INFO, &format!(
             "audio: {} frames sent; received main={} sfx={} mpeg={}; prefill restarts main={} sfx={} mpeg={}; hold warnings main={} sfx={} mpeg={}",
-            core.frames_out, a.main.frames_in, a.sfx.frames_in, a.mpeg.frames_in, a.main.restarts, a.sfx.restarts, a.mpeg.restarts, a.main.warnings, a.sfx.warnings, a.mpeg.warnings
+            frames_out, a.main.frames_in, a.sfx.frames_in, a.mpeg.frames_in, a.main.restarts, a.sfx.restarts, a.mpeg.restarts, a.main.warnings, a.sfx.warnings, a.mpeg.warnings
         ));
     }
     core.machine = None;
     core.spec = None;
+    core.shared_nvram_path = None;
+    core.shared_nvram_mode = false;
+    core.is_no_game = false;
+    core.rtc_seeded = false;
     core.state_size = 0;
     core.state_buf = Vec::new();
+    core.present_fb.clear();
     core.deinterlacer.reset();
     if let Some(p) = core.temp_disc.take() {
         let _ = std::fs::remove_file(p);
@@ -928,7 +1110,9 @@ pub extern "C" fn retro_get_region() -> c_uint {
 pub extern "C" fn retro_get_memory_data(id: c_uint) -> *mut c_void {
     guard("retro_get_memory_data", std::ptr::null_mut(), true, || {
         let mut core = lock(&CORE);
+        let shared = core.shared_nvram_mode;
         match (id, core.machine.as_mut()) {
+            (RETRO_MEMORY_SAVE_RAM, _) if shared => std::ptr::null_mut(),
             (RETRO_MEMORY_SAVE_RAM, Some(m)) => match m.bus.mono4.as_deref_mut() {
                 Some(m4) => m4.nvram.ram.as_mut_ptr() as *mut c_void,
                 None => m.bus.nvram.ram.as_mut_ptr() as *mut c_void,
@@ -944,6 +1128,7 @@ pub extern "C" fn retro_get_memory_size(id: c_uint) -> usize {
     guard("retro_get_memory_size", 0, true, || {
         let core = lock(&CORE);
         match (id, core.machine.as_ref()) {
+            (RETRO_MEMORY_SAVE_RAM, _) if core.shared_nvram_mode => 0,
             (RETRO_MEMORY_SAVE_RAM, Some(m)) => m.bus.mono4.as_deref().map_or(m.bus.nvram.ram.len(), |m4| m4.nvram.ram.len()),
             (RETRO_MEMORY_SYSTEM_RAM, Some(m)) => m.bus.mcd212.plane_a.len(),
             _ => 0,
@@ -1036,6 +1221,55 @@ mod tests {
         assert_eq!(parse_boost_x10(Some("1.5")), 15);
         assert_eq!(parse_boost_x10(Some("3.0")), 30);
         assert_eq!(parse_boost_x10(None), 20);
+        assert_eq!(parse_crosshair(Some("auto")), CrosshairMode::Auto);
+        assert_eq!(parse_crosshair(Some("always")), CrosshairMode::Always);
+        assert_eq!(parse_crosshair(None), CrosshairMode::Off);
+    }
+
+    #[test]
+    fn region_option_overrides_filename_auto_detection() {
+        let m = Machine::new();
+        let usa = Path::new("Hotel Mario (USA).chd");
+        let unk = Path::new("hotel_mario.chd");
+        assert_eq!(resolve_video_mode(Some("pal"), Some(usa), &m), VideoMode::Pal);
+        assert_eq!(resolve_video_mode(Some("ntsc"), Some(unk), &m), VideoMode::Ntsc);
+        assert_eq!(resolve_video_mode(Some("auto"), Some(unk), &m), VideoMode::Pal);
+    }
+
+    #[test]
+    fn shared_nvram_seeds_new_games_and_hides_sram_in_shared_mode() {
+        let sys_dir = temp_dir("nvram_sys");
+        let save_dir = temp_dir("nvram_save");
+        let _ = save_dir;
+        let (primary, fallback) = resolve_shared_nvram_paths(&sys_dir, false);
+        let mut seed = vec![0u8; 8192];
+        seed[42] = 0x7E;
+        std::fs::write(&fallback, &seed).unwrap();
+
+        let mut m = Machine::new();
+        load_shared_nvram_into_machine(&mut m, &primary, &fallback);
+        assert_eq!(m.bus.nvram.ram[42], 0x7E);
+
+        m.bus.nvram.ram[43] = 0xA5;
+        persist_shared_nvram(Some(&primary), &mut m);
+        assert!(primary.is_file());
+        let saved = std::fs::read(&primary).unwrap();
+        assert_eq!(saved[43], 0xA5);
+
+        let _s = lock(&SERIAL);
+        {
+            let mut c = lock(&CORE);
+            c.machine = Some(m);
+            c.shared_nvram_mode = true;
+        }
+        assert!(retro_get_memory_data(RETRO_MEMORY_SAVE_RAM).is_null());
+        assert_eq!(retro_get_memory_size(RETRO_MEMORY_SAVE_RAM), 0);
+        {
+            let mut c = lock(&CORE);
+            c.machine = None;
+            c.shared_nvram_mode = false;
+        }
+        let _ = std::fs::remove_dir_all(&sys_dir);
     }
 
     #[cfg(unix)]

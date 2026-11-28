@@ -167,19 +167,25 @@ fn main() {
                     bus.peek_long(0x0000C000u32.wrapping_add(0xFFFF9172)).unwrap_or(0)
                 };
                 if shell_state >= 2 {
-                    shell_ready_count += 1;
-                    let btn = match shell_ready_count {
-                        1 | 50 | 150 | 200 => Some(0),
-                        30 | 180 => Some(1),
-                        _ => None,
-                    };
-                    if let Some(b) = btn {
-                        bus.slave.update_mouse(575, 335, b);
-                        recorded.push(Event::Pointer { frame, x: 575, y: 335, buttons: b });
+                    if shell_ready_count < 240 {
+                        shell_ready_count += 1;
+                        let btn = match shell_ready_count {
+                            1 | 50 | 150 | 200 => Some(0),
+                            30 | 180 => Some(1),
+                            _ => None,
+                        };
+                        if let Some(b) = btn {
+                            bus.slave.update_mouse(575, 335, b);
+                            recorded.push(Event::Pointer { frame, x: 575, y: 335, buttons: b });
+                        }
                     }
+                } else if shell_ready_count > 0 {
+                    // Shell accepted PLAY CD-I click and closed; never fire a second boot click.
+                    shell_ready_count = 240;
                 }
                 if ((cpu.pc >= 0x0001_0000 && cpu.pc < 0x0030_0000) || (cpu.pc >= 0x00D0_0000 && cpu.pc < 0x00E0_0000)) && frame > 250 {
                     disc_launched = true;
+                    bus.slave.clear_unread_pointer_click();
                     bus.slave.update_mouse(384, 280, 0);
                     recorded.push(Event::Pointer { frame, x: 384, y: 280, buttons: 0 });
                 }

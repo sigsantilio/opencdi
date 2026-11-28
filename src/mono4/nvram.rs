@@ -29,6 +29,26 @@ impl Default for Ds1216 {
 }
 
 impl Ds1216 {
+    /// Sets the DS1216 SmartWatch BCD registers (hundredths..year) from `RtcDateTime`.
+    pub fn set_clock(&mut self, dt: crate::nvram::RtcDateTime) {
+        use crate::nvram::to_bcd;
+        self.regs = [
+            0x00,
+            to_bcd(dt.second.min(59)) & 0x7F,
+            to_bcd(dt.minute.min(59)) & 0x7F,
+            to_bcd(dt.hour.min(23)) & 0x3F, // 24h mode (bit 7 = 0)
+            dt.weekday.clamp(1, 7) & 0x07,  // bits 4-5 = 0 -> /RST active & oscillator running
+            to_bcd(dt.day.clamp(1, 31)),
+            to_bcd(dt.month.clamp(1, 12)),
+            to_bcd((dt.year % 100) as u8),
+        ];
+    }
+
+    /// Seeds the DS1216 clock from the host OS local wall clock.
+    pub fn seed_clock_from_host(&mut self) {
+        self.set_clock(crate::nvram::host_local_datetime());
+    }
+
     fn active(&self) -> bool {
         self.matched == 64
     }
@@ -246,5 +266,21 @@ mod tests {
         assert_eq!(n.ram[0], 0);
         let (t, d) = bios_read(&mut n);
         assert_eq!((t, d), (0x2145_3000, 0x9912_2413));
+    }
+
+    #[test]
+    fn ds1216_set_clock_programs_host_bcd_registers() {
+        let mut n = Nvram32::default();
+        n.clock.set_clock(crate::nvram::RtcDateTime {
+            year: 2026,
+            month: 11,
+            day: 28,
+            weekday: 7,
+            hour: 9,
+            minute: 42,
+            second: 7,
+        });
+        let (t, d) = bios_read(&mut n);
+        assert_eq!((t, d), (0x0942_0700, 0x2611_2807));
     }
 }

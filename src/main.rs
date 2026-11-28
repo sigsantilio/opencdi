@@ -16,7 +16,11 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 use opencdi::audio::{self, AudioLatency, Frame, HostAudioOutput};
 use opencdi::deinterlace::Deinterlacer;
-use opencdi::frontend::{load_bool_preference, load_string_preference, pop_action, push_action, save_bool_preference, save_string_preference, GuiAction, InputDeviceMode, KeyBindings};
+use opencdi::frontend::{
+    load_bool_preference, load_scale_mode, load_string_preference, pop_action, push_action,
+    save_bool_preference, save_scale_mode, save_string_preference, GuiAction, InputDeviceMode,
+    KeyBindings, ScaleMode,
+};
 #[cfg(target_os = "windows")]
 use opencdi::gui;
 use opencdi::bios;
@@ -27,6 +31,8 @@ use opencdi::savestate::{Reader, State, StateError};
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod win_gl;
 
 #[cfg(target_os = "windows")]
 #[link(name = "winmm")]
@@ -103,6 +109,7 @@ Usage: opencdi [options] [disc image (cue, chd, iso, bin)]
   --nvram <path>           Console NVRAM save file (default: bios/nvram_mk48t08.bin or nvram_mk48t08.bin; 490: nvram_cdi490a.bin)
   --fullscreen, -f         Start directly in fullscreen (borderless by default)
   --exclusive-fullscreen   Use exclusive fullscreen mode for lower latency (fallback: borderless)
+  --software-renderer      Windows: use GDI software blitter instead of hardware OpenGL presenter
   --deinterlace            Enable optional motion-adaptive de-interlacing for interlaced FMV
   --audio-latency <preset> Host audio buffer latency: low (~32ms), normal (~46ms, default), high (~93ms), safe (~186ms)
   --no-menu, --nomenu      Start without the top menu bar (useful for frontends)
@@ -722,6 +729,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("File NVRAM {:?} non presente: verrà creato automaticamente al salvataggio", resolved_nvram_path);
         }
     }
+    m.bus.seed_rtc_from_host();
 
     // 2b. Load DVC ROM (Digital Video Cartridge) by default if present
     let dvc_disabled = has_flag("--no-dvc") || has_flag("--nodvc");
@@ -828,7 +836,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     m.bus.emulate_wait_states = true; // Authentic hardware wait-states (15 MHz)
     let start_fullscreen = has_flag("--fullscreen") || has_flag("-f");
     let exclusive_fullscreen = has_flag("--exclusive-fullscreen") || load_bool_preference("exclusive_fullscreen", false);
+    let force_software_renderer = has_flag("--software-renderer");
     let deinterlace = has_flag("--deinterlace") || load_bool_preference("deinterlace", false);
+    let scale_mode = load_scale_mode();
+    let auto_boot_disc = !has_flag("--no-autoplay") && load_bool_preference("auto_boot_disc", true);
     let no_menu = has_flag("--no-menu") || has_flag("--nomenu");
     let monitor_index: Option<usize> = flag_value("--monitor").and_then(|s| {
         let n = s.parse().ok();
@@ -858,8 +869,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dvc_path: resolved_dvc_path,
         start_fullscreen,
         exclusive_fullscreen,
+        force_software_renderer,
         deinterlace,
         deinterlacer: Deinterlacer::new(),
+        scale_mode,
         no_menu,
         monitor_index,
         screenshot_dir,
@@ -867,10 +880,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mac_menu: None,
         #[cfg(target_os = "macos")]
         mac_data_dir,
-        no_autoplay: has_flag("--no-autoplay"),
+        auto_boot_disc,
+        #[cfg(target_os = "windows")]
+        gl_presenter: None,
         window: None,
         surface: None,
-        image_rect: (0, 0, SCREEN_WIDTH, SCREEN_HEIGHT),
+        present_fb: Vec::new(),
+        blit_layout: compute_blit_layout(SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_HEIGHT, scale_mode),
         windowed: None,
         restore_check: None,
         _host_audio: host_audio,
@@ -965,6 +981,16 @@ fn window_icon() -> Option<winit::window::Icon> {
     winit::window::Icon::from_rgba(buf, info.width, info.height).ok()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BlitLayout {
+    pub src_y: usize,
+    pub src_h: usize,
+    pub dst_x: isize,
+    pub dst_y: isize,
+    pub dst_w: usize,
+    pub dst_h: usize,
+}
+
 fn image_rect(dst_w: usize, dst_h: usize) -> (usize, usize, usize, usize) {
     if dst_w == 0 || dst_h == 0 {
         return (0, 0, 0, 0);
@@ -980,31 +1006,146 @@ fn image_rect(dst_w: usize, dst_h: usize) -> (usize, usize, usize, usize) {
     }
 }
 
+fn compute_blit_layout(dst_w: usize, dst_h: usize, active_h: usize, mode: ScaleMode) -> BlitLayout {
+    if dst_w == 0 || dst_h == 0 {
+        return BlitLayout {
+            src_y: 0,
+            src_h: SCREEN_HEIGHT,
+            dst_x: 0,
+            dst_y: 0,
+            dst_w: 0,
+            dst_h: 0,
+        };
+    }
+    let active_h = active_h.clamp(1, SCREEN_HEIGHT);
+    let y_off = (SCREEN_HEIGHT - active_h) / 2;
+    match mode {
+        ScaleMode::FitWindow => {
+            let (x0, y0, w, h) = image_rect(dst_w, dst_h);
+            BlitLayout {
+                src_y: 0,
+                src_h: SCREEN_HEIGHT,
+                dst_x: x0 as isize,
+                dst_y: y0 as isize,
+                dst_w: w,
+                dst_h: h,
+            }
+        }
+        ScaleMode::FitHeight => {
+            // Fill window height with the active picture using 4:3 display aspect ratio,
+            // symmetrically cropping any vertical letterbox bars and excess horizontal width.
+            let h = dst_h;
+            let w = ((dst_h as f32 * (4.0 / 3.0)).round() as usize).max(1);
+            let x0 = (dst_w as isize - w as isize) / 2;
+            BlitLayout {
+                src_y: y_off,
+                src_h: active_h,
+                dst_x: x0,
+                dst_y: 0,
+                dst_w: w,
+                dst_h: h,
+            }
+        }
+        ScaleMode::Integer => {
+            if dst_w >= SCREEN_WIDTH && dst_h >= active_h {
+                let scale = (dst_w / SCREEN_WIDTH).min(dst_h / active_h).max(1);
+                let w = SCREEN_WIDTH * scale;
+                let h = active_h * scale;
+                let x0 = (dst_w as isize - w as isize) / 2;
+                let y0 = (dst_h as isize - h as isize) / 2;
+                BlitLayout {
+                    src_y: y_off,
+                    src_h: active_h,
+                    dst_x: x0,
+                    dst_y: y0,
+                    dst_w: w,
+                    dst_h: h,
+                }
+            } else {
+                let (x0, y0, w, h) = image_rect(dst_w, dst_h);
+                BlitLayout {
+                    src_y: 0,
+                    src_h: SCREEN_HEIGHT,
+                    dst_x: x0 as isize,
+                    dst_y: y0 as isize,
+                    dst_w: w,
+                    dst_h: h,
+                }
+            }
+        }
+    }
+}
+
 // Host cursor position mapped through the letterbox onto the CD-i picture, clamped
+#[cfg_attr(not(test), allow(dead_code))]
 fn cursor_to_cdi(pos: PhysicalPosition<f64>, rect: (usize, usize, usize, usize)) -> (i32, i32) {
     let (x0, y0, w, h) = rect;
-    if w == 0 || h == 0 {
+    cursor_to_cdi_layout(
+        pos,
+        BlitLayout {
+            src_y: 0,
+            src_h: SCREEN_HEIGHT,
+            dst_x: x0 as isize,
+            dst_y: y0 as isize,
+            dst_w: w,
+            dst_h: h,
+        },
+    )
+}
+
+fn cursor_to_cdi_layout(pos: PhysicalPosition<f64>, layout: BlitLayout) -> (i32, i32) {
+    if layout.dst_w == 0 || layout.dst_h == 0 {
         return (0, 0);
     }
-    let mx = (pos.x - x0 as f64) * SCREEN_WIDTH as f64 / w as f64;
-    let my = (pos.y - y0 as f64) * SCREEN_HEIGHT as f64 / h as f64;
-    ((mx.round() as i32).clamp(0, SCREEN_WIDTH as i32 - 1), (my.round() as i32).clamp(0, SCREEN_HEIGHT as i32 - 1))
+    let mx = (pos.x - layout.dst_x as f64) * SCREEN_WIDTH as f64 / layout.dst_w as f64;
+    let my = layout.src_y as f64 + (pos.y - layout.dst_y as f64) * layout.src_h as f64 / layout.dst_h as f64;
+    (
+        (mx.round() as i32).clamp(0, SCREEN_WIDTH as i32 - 1),
+        (my.round() as i32).clamp(0, SCREEN_HEIGHT as i32 - 1),
+    )
 }
 
 // Nearest-neighbour stretch with black bars, same 10-bit fixed-point stepping as minifb's scaler
+#[cfg_attr(not(test), allow(dead_code))]
 fn blit_aspect(dst: &mut [u32], dst_w: usize, dst_h: usize, src: &[u32], rect: (usize, usize, usize, usize)) {
-    dst.fill(0);
     let (x0, y0, w, h) = rect;
-    if w == 0 || h == 0 {
+    blit_layout(
+        dst,
+        dst_w,
+        dst_h,
+        src,
+        BlitLayout {
+            src_y: 0,
+            src_h: SCREEN_HEIGHT,
+            dst_x: x0 as isize,
+            dst_y: y0 as isize,
+            dst_w: w,
+            dst_h: h,
+        },
+    );
+}
+
+fn blit_layout(dst: &mut [u32], dst_w: usize, dst_h: usize, src: &[u32], layout: BlitLayout) {
+    dst.fill(0);
+    if dst_w == 0 || dst_h == 0 || layout.dst_w == 0 || layout.dst_h == 0 || layout.src_h == 0 {
         return;
     }
-    let step_x = ((SCREEN_WIDTH as f32 / w as f32) * 1024.0) as usize;
-    let step_y = ((SCREEN_HEIGHT as f32 / h as f32) * 1024.0) as usize;
-    let mut fixed_y = 0usize;
-    for row in dst.chunks_exact_mut(dst_w).skip(y0).take(h.min(dst_h - y0)) {
-        let src_row = &src[(fixed_y >> 10).min(SCREEN_HEIGHT - 1) * SCREEN_WIDTH..][..SCREEN_WIDTH];
-        let mut fixed_x = 0usize;
-        for px in &mut row[x0..x0 + w] {
+    let vis_x0 = layout.dst_x.max(0) as usize;
+    let vis_x1 = (layout.dst_x + layout.dst_w as isize).clamp(0, dst_w as isize) as usize;
+    let vis_y0 = layout.dst_y.max(0) as usize;
+    let vis_y1 = (layout.dst_y + layout.dst_h as isize).clamp(0, dst_h as isize) as usize;
+    if vis_x0 >= vis_x1 || vis_y0 >= vis_y1 {
+        return;
+    }
+    let step_x = ((SCREEN_WIDTH as f32 / layout.dst_w as f32) * 1024.0) as usize;
+    let step_y = ((layout.src_h as f32 / layout.dst_h as f32) * 1024.0) as usize;
+    let start_fixed_x = ((vis_x0 as isize - layout.dst_x) as usize) * step_x;
+    let mut fixed_y = ((vis_y0 as isize - layout.dst_y) as usize) * step_y;
+    for row in dst.chunks_exact_mut(dst_w).skip(vis_y0).take(vis_y1 - vis_y0) {
+        let sy = (layout.src_y + (fixed_y >> 10).min(layout.src_h - 1)).min(SCREEN_HEIGHT - 1);
+        let src_row = &src[sy * SCREEN_WIDTH..][..SCREEN_WIDTH];
+        let mut fixed_x = start_fixed_x;
+        for px in &mut row[vis_x0..vis_x1] {
             *px = src_row[(fixed_x >> 10).min(SCREEN_WIDTH - 1)];
             fixed_x += step_x;
         }
@@ -1027,8 +1168,10 @@ struct App {
     dvc_path: Option<PathBuf>,
     start_fullscreen: bool,
     exclusive_fullscreen: bool,
+    force_software_renderer: bool,
     deinterlace: bool,
     deinterlacer: Deinterlacer,
+    scale_mode: ScaleMode,
     no_menu: bool,
     monitor_index: Option<usize>,
     screenshot_dir: PathBuf,
@@ -1036,9 +1179,12 @@ struct App {
     mac_menu: Option<macos::MenuBar>,
     #[cfg(target_os = "macos")]
     mac_data_dir: Option<PathBuf>,
+    #[cfg(target_os = "windows")]
+    gl_presenter: Option<win_gl::WinGlPresenter>,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
-    image_rect: (usize, usize, usize, usize),
+    present_fb: Vec<u32>,
+    blit_layout: BlitLayout,
     windowed: Option<(Option<PhysicalPosition<i32>>, PhysicalSize<u32>)>,
     restore_check: Option<Instant>,
     _host_audio: Option<HostAudioOutput>,
@@ -1064,7 +1210,7 @@ struct App {
     mouse_middle: bool,
     prev_middle: bool,
     mouse_captured: bool,
-    no_autoplay: bool,
+    auto_boot_disc: bool,
     host_input: bool,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     run_in_menu: bool,
@@ -1200,9 +1346,9 @@ impl App {
                 } else {
                     Fullscreen::Borderless(target_monitor)
                 };
-                window.set_fullscreen(Some(fs_mode));
                 #[cfg(target_os = "windows")]
                 gui::set_menu_visible(self.hwnd(), false);
+                window.set_fullscreen(Some(fs_mode));
             } else {
                 window.set_fullscreen(None);
                 #[cfg(target_os = "windows")]
@@ -1298,6 +1444,7 @@ impl App {
 
         // Full console & CPU reset
         self.m.bus.reset_system();
+        self.m.bus.seed_rtc_from_host();
         self.m.cpu.reset(&mut self.m.bus);
         self.reset_state();
         self.mouse_captured = false;
@@ -1320,6 +1467,9 @@ impl App {
             gui::update_audio_latency_menu(self.audio_latency);
             gui::update_exclusive_fullscreen_menu(self.exclusive_fullscreen);
             gui::update_deinterlace_menu(self.deinterlace);
+            gui::update_scale_mode_menu(self.scale_mode);
+            gui::update_auto_boot_menu(self.auto_boot_disc);
+            gui::update_crosshair_menu(self.bindings.crosshair);
             self.refresh_title();
         }
         true
@@ -1347,7 +1497,7 @@ impl App {
         // While grabbed the host cursor is hidden and pinned (Windows: window centre), so mouse mode follows raw motion
         self.rel_pointer = want.then(|| match self.cursor {
             Some(pos) => {
-                let (x, y) = cursor_to_cdi(pos, self.image_rect);
+                let (x, y) = cursor_to_cdi_layout(pos, self.blit_layout);
                 (x as f64, y as f64)
             }
             None => (self.pad_x as f64, self.pad_y as f64),
@@ -1473,6 +1623,7 @@ impl App {
                 C::Fullscreen => self.toggle_fullscreen(),
                 C::InputGamepad => push_action(GuiAction::SetInputDevice(InputDeviceMode::Gamepad)),
                 C::InputMouse => push_action(GuiAction::SetInputDevice(InputDeviceMode::Mouse)),
+                C::CycleCrosshair => push_action(GuiAction::CycleCrosshair),
                 C::SelectBios => push_action(GuiAction::OpenBiosDialog),
                 C::ShowBiosFolder => push_action(GuiAction::OpenBiosFolder),
                 C::SelectDvc => {
@@ -1509,6 +1660,7 @@ impl App {
         match code {
             Key::Escape => el.exit(),
             Key::F1 => push_action(GuiAction::OpenFeedback),
+            Key::F3 => push_action(GuiAction::CycleCrosshair),
             Key::F9 => {
                 let next_mode = match self.input_device_mode {
                     InputDeviceMode::Gamepad => InputDeviceMode::Mouse,
@@ -1612,6 +1764,7 @@ impl App {
                             gui::update_video_menu(mode);
 
                             self.m.bus.reset_system();
+                            self.m.bus.seed_rtc_from_host();
                             self.m.cpu.reset(&mut self.m.bus);
                             self.reset_state();
                             self.mouse_captured = false;
@@ -1644,6 +1797,7 @@ impl App {
                 GuiAction::Reset => {
                     info!("Console reset requested");
                     self.m.bus.reset_system();
+                    self.m.bus.seed_rtc_from_host();
                     self.m.cpu.reset(&mut self.m.bus);
                     self.reset_state();
                     self.mouse_captured = false;
@@ -1671,7 +1825,31 @@ impl App {
                     self.apply_grab();
                     #[cfg(target_os = "windows")]
                     gui::update_input_device_menu(mode);
+                    self.refresh_title();
                     info!("Input device mode set to: {:?}", mode);
+                }
+                GuiAction::SetCrosshair(mode) => {
+                    self.bindings.crosshair = mode;
+                    self.bindings.save_to_ini();
+                    #[cfg(target_os = "windows")]
+                    gui::update_crosshair_menu(mode);
+                    self.refresh_title();
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    info!("Lightgun crosshair set to: {}", mode.label());
+                }
+                GuiAction::CycleCrosshair => {
+                    let next = self.bindings.crosshair.next();
+                    self.bindings.crosshair = next;
+                    self.bindings.save_to_ini();
+                    #[cfg(target_os = "windows")]
+                    gui::update_crosshair_menu(next);
+                    self.refresh_title();
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    info!("Lightgun crosshair cycled to: {}", next.label());
                 }
                 GuiAction::SetMouseSensitivity(sens) => {
                     self.bindings.mouse_sensitivity = sens;
@@ -1702,6 +1880,8 @@ impl App {
                     self.bindings.save_to_ini();
                     #[cfg(target_os = "windows")]
                     gui::update_gamepad_mapping_menu(&self.bindings);
+                    #[cfg(target_os = "windows")]
+                    gui::update_crosshair_menu(self.bindings.crosshair);
                     info!("Gamepad mapping updated: {:?} -> {}", action, btn.label());
                 }
                 GuiAction::ReloadControls => {
@@ -1716,6 +1896,8 @@ impl App {
                     gui::update_pad_speed_menu(self.bindings.pad_speed);
                     #[cfg(target_os = "windows")]
                     gui::update_gamepad_mapping_menu(&self.bindings);
+                    #[cfg(target_os = "windows")]
+                    gui::update_crosshair_menu(self.bindings.crosshair);
                     self.input_device_mode = self.bindings.input_device;
                     info!(
                         "Controls reloaded from INI file. Profile: {:?}, Device: {:?}, Sensitivity: {:.2}, Pad Speed: {}, Gamepad: B1={}, B2={}, B1+2={}, Speed={}",
@@ -1786,6 +1968,24 @@ impl App {
                     gui::update_deinterlace_menu(self.deinterlace);
                     info!("De-interlacing (motion-adaptive FMV): {}", if self.deinterlace { "ENABLED" } else { "DISABLED" });
                 }
+                GuiAction::SetScaleMode(mode) => {
+                    self.scale_mode = mode;
+                    save_scale_mode(mode);
+                    #[cfg(target_os = "windows")]
+                    gui::update_scale_mode_menu(mode);
+                    self.update_blit_layout();
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    info!("Display scaling mode set to: {}", mode.label());
+                }
+                GuiAction::ToggleAutoBoot => {
+                    self.auto_boot_disc = !self.auto_boot_disc;
+                    save_bool_preference("auto_boot_disc", self.auto_boot_disc);
+                    #[cfg(target_os = "windows")]
+                    gui::update_auto_boot_menu(self.auto_boot_disc);
+                    info!("Auto-boot Disc from BIOS: {}", if self.auto_boot_disc { "ENABLED" } else { "DISABLED" });
+                }
                 GuiAction::TakeScreenshot => {
                     self.take_screenshot();
                 }
@@ -1820,6 +2020,7 @@ impl App {
                         }
                     }
                     self.m.bus.reset_system();
+                    self.m.bus.seed_rtc_from_host();
                     self.m.cpu.reset(&mut self.m.bus);
                     self.reset_state();
                 }
@@ -1854,6 +2055,7 @@ impl App {
                         }
                     }
                     self.m.bus.reset_system();
+                    self.m.bus.seed_rtc_from_host();
                     self.m.cpu.reset(&mut self.m.bus);
                     self.reset_state();
                     info!("Console memory (NVRAM) cancellata e console riavviata.");
@@ -1938,15 +2140,24 @@ impl App {
             };
 
             // The shell click targets the Mono-I shell; on the 490 the user clicks Play
-            if shell_state >= 2 && m.bus.mono4.is_none() && !self.no_autoplay {
-                self.shell_ready_count += 1;
-                let phase = self.shell_ready_count % 60;
-                if phase == 1 {
-                    info!("Shell BIOS pronta (stato {}): avvio automatico disco CD-i (click PLAY CD-I)...", shell_state);
-                    send_pointer(&mut m.bus, 575, 335, 1);
-                } else if phase == 26 {
-                    send_pointer(&mut m.bus, 575, 335, 0);
+            if shell_state >= 2 && m.bus.mono4.is_none() && self.auto_boot_disc {
+                if self.shell_ready_count < 240 {
+                    self.shell_ready_count += 1;
+                    let btn = match self.shell_ready_count {
+                        1 | 50 | 150 | 200 => Some(0),
+                        26 | 176 => Some(1),
+                        _ => None,
+                    };
+                    if let Some(b) = btn {
+                        if b == 1 {
+                            info!("Shell BIOS pronta (stato {}): avvio automatico disco CD-i (click PLAY CD-I)...", shell_state);
+                        }
+                        send_pointer(&mut m.bus, 575, 335, b);
+                    }
                 }
+            } else if self.shell_ready_count > 0 {
+                // Shell accepted the click and closed; never fire a second auto-boot click.
+                self.shell_ready_count = 240;
             }
             if ((m.cpu.pc >= 0x00010000 && m.cpu.pc < 0x00300000) || (m.cpu.pc >= 0x00D00000 && m.cpu.pc < 0x00E00000)) && self.frame_count > 250 {
                 info!("Applicazione disco in esecuzione in RAM (PC=0x{:06X}), controllo passato all'utente.", m.cpu.pc);
@@ -1954,6 +2165,10 @@ impl App {
                 self.mouse_captured = self.input_device_mode == InputDeviceMode::Mouse;
                 just_launched = true;
                 m.bus.emulate_wait_states = true;
+                m.bus.slave.clear_unread_pointer_click();
+                self.mouse_left_latched = false;
+                self.mouse_right_latched = false;
+                self.swallow_left = self.mouse_left;
                 self.pad_x = 384;
                 self.pad_y = 280;
                 self.pad_x_f = 384.0;
@@ -2123,7 +2338,7 @@ impl App {
             if let Some((x, y)) = self.rel_pointer {
                 (mouse_x, mouse_y) = (x.round() as i32, y.round() as i32);
             } else if let Some(pos) = self.cursor {
-                (mouse_x, mouse_y) = cursor_to_cdi(pos, self.image_rect);
+                (mouse_x, mouse_y) = cursor_to_cdi_layout(pos, self.blit_layout);
             }
             if self.rel_pointer.is_some() || self.cursor.is_some() {
                 self.swallow_left &= self.mouse_left;
@@ -2134,7 +2349,7 @@ impl App {
 
         let m = &mut self.m;
 
-        if !self.disc_launched && m.bus.cdrom.is_some() && m.bus.mono4.is_none() && !self.no_autoplay && self.shell_ready_count < 240 {
+        if !self.disc_launched && m.bus.cdrom.is_some() && m.bus.mono4.is_none() && self.auto_boot_disc && self.shell_ready_count < 240 {
             // During automatic boot sequence, let autoplay pulse click PLAY CD-I until launched or timeout
         } else {
             match self.input_device_mode {
@@ -2274,16 +2489,26 @@ impl App {
             let speed_pct = (self.measured_fps / m.bus.mcd212.video_mode.fps()) * 100.0;
             format!("{:.0}% ({:.1} FPS {})", speed_pct, self.measured_fps, video_mode)
         };
+        let input_str = match self.input_device_mode {
+            InputDeviceMode::Mouse => "Input: Mouse".to_string(),
+            InputDeviceMode::Gamepad => format!("Input: Pad {}/3", self.bindings.pad_speed.level()),
+        };
+        let crosshair_tag = if self.bindings.crosshair != opencdi::mcd212::CrosshairMode::Off {
+            format!(" | Crosshair: {}", self.bindings.crosshair.as_ini_str())
+        } else {
+            String::new()
+        };
         if let Some(window) = &self.window {
             window.set_title(&format!(
-                "OpenCDi – {} | {} | CPU: {:.2} MIPS | CD: {} | Render: {} | WaitStates: {} | Pad: {}/3 | Slot: {}",
+                "OpenCDi – {} | {} | CPU: {:.2} MIPS | CD: {} | Render: {} | WaitStates: {} | {}{} | Slot: {}",
                 self.current_game_name,
                 speed,
                 self.measured_mips,
                 cd_str,
                 render_str,
                 wait_status,
-                self.bindings.pad_speed.level(),
+                input_str,
+                crosshair_tag,
                 self.state_slot
             ));
         }
@@ -2390,17 +2615,26 @@ impl App {
         ran
     }
 
+    fn update_blit_layout(&mut self) {
+        if let Some(window) = &self.window {
+            let size = window.inner_size();
+            let active_h = self.m.bus.mcd212.effective_active_scanlines() * 2;
+            self.blit_layout = compute_blit_layout(size.width as usize, size.height as usize, active_h, self.scale_mode);
+        }
+    }
+
     fn present(&mut self) {
-        let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else { return };
+        let Some(window) = &self.window else { return };
         let size = window.inner_size();
-        let (Some(w), Some(h)) = (std::num::NonZeroU32::new(size.width), std::num::NonZeroU32::new(size.height)) else { return };
-        if surface.resize(w, h).is_err() {
+        if size.width == 0 || size.height == 0 {
             return;
         }
         self.last_present = Instant::now();
         let (dw, dh) = (size.width as usize, size.height as usize);
-        self.image_rect = image_rect(dw, dh);
+        let active_h = self.m.bus.mcd212.effective_active_scanlines() * 2;
+        self.blit_layout = compute_blit_layout(dw, dh, active_h, self.scale_mode);
         let (interlaced, odd_field, y_offset) = self.m.bus.mcd212.display_interlace_info();
+        let hw_cursor_visible = self.m.bus.mcd212.hardware_cursor_visible();
         let fb = self.deinterlacer.process(
             &self.m.bus.mcd212.framebuffer[..],
             interlaced,
@@ -2408,8 +2642,35 @@ impl App {
             y_offset,
             self.deinterlace,
         );
+        let out_fb: &[u32] = if self.bindings.crosshair.should_draw(hw_cursor_visible) {
+            self.present_fb.clear();
+            self.present_fb.extend_from_slice(&fb[..SCREEN_WIDTH * SCREEN_HEIGHT]);
+            opencdi::mcd212::draw_crosshair(&mut self.present_fb, SCREEN_WIDTH, SCREEN_HEIGHT, self.pad_x, self.pad_y);
+            &self.present_fb
+        } else {
+            fb
+        };
+        #[cfg(target_os = "windows")]
+        if let Some(gl) = self.gl_presenter.as_mut() {
+            if gl.present(out_fb, size.width, size.height, self.blit_layout) {
+                window.pre_present_notify();
+                return;
+            }
+            warn!("Win32 OpenGL SwapBuffers failed, falling back to softbuffer");
+            self.gl_presenter = None;
+        }
+        if self.surface.is_none() {
+            self.surface = softbuffer::Context::new(window.clone())
+                .and_then(|ctx| softbuffer::Surface::new(&ctx, window.clone()))
+                .ok();
+        }
+        let Some(surface) = &mut self.surface else { return };
+        let (Some(w), Some(h)) = (std::num::NonZeroU32::new(size.width), std::num::NonZeroU32::new(size.height)) else { return };
+        if surface.resize(w, h).is_err() {
+            return;
+        }
         if let Ok(mut buffer) = surface.buffer_mut() {
-            blit_aspect(&mut buffer, dw, dh, fb, self.image_rect);
+            blit_layout(&mut buffer, dw, dh, out_fb, self.blit_layout);
             // Wayland: ties the next redraw to a frame callback, so a hidden window is never presented to
             window.pre_present_notify();
             let _ = buffer.present();
@@ -2435,19 +2696,35 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        let surface = softbuffer::Context::new(window.clone()).and_then(|ctx| softbuffer::Surface::new(&ctx, window.clone()));
-        match surface {
-            Ok(s) => self.surface = Some(s),
-            Err(e) => {
-                error!("Cannot create the drawing surface: {}", e);
-                el.exit();
-                return;
-            }
-        }
         let size = window.inner_size();
-        self.image_rect = image_rect(size.width as usize, size.height as usize);
+        let active_h = self.m.bus.mcd212.effective_active_scanlines() * 2;
+        self.blit_layout = compute_blit_layout(size.width as usize, size.height as usize, active_h, self.scale_mode);
         self.focused = window.has_focus();
         self.window = Some(window);
+
+        #[cfg(target_os = "windows")]
+        if !self.force_software_renderer {
+            match win_gl::WinGlPresenter::new(self.hwnd()) {
+                Ok(gl) => self.gl_presenter = Some(gl),
+                Err(e) => warn!("Win32 OpenGL presenter unavailable ({}), using software blitter", e),
+            }
+        }
+        #[cfg(target_os = "windows")]
+        let need_softbuffer = self.gl_presenter.is_none();
+        #[cfg(not(target_os = "windows"))]
+        let need_softbuffer = true;
+        if need_softbuffer {
+            if let Some(w) = &self.window {
+                match softbuffer::Context::new(w.clone()).and_then(|ctx| softbuffer::Surface::new(&ctx, w.clone())) {
+                    Ok(s) => self.surface = Some(s),
+                    Err(e) => {
+                        error!("Cannot create the drawing surface: {}", e);
+                        el.exit();
+                        return;
+                    }
+                }
+            }
+        }
 
         // Attach Native Win32 Menu GUI
         #[cfg(target_os = "windows")]
@@ -2471,6 +2748,9 @@ impl ApplicationHandler for App {
             gui::update_audio_latency_menu(self.audio_latency);
             gui::update_exclusive_fullscreen_menu(self.exclusive_fullscreen);
             gui::update_deinterlace_menu(self.deinterlace);
+            gui::update_scale_mode_menu(self.scale_mode);
+            gui::update_auto_boot_menu(self.auto_boot_disc);
+            gui::update_crosshair_menu(self.bindings.crosshair);
             // SetMenu takes the menu bar out of the client area; winit adds it back when sizing
             if show_menu {
                 if let Some(window) = &self.window {
@@ -2506,18 +2786,24 @@ impl ApplicationHandler for App {
                 self.present();
             }
             WindowEvent::Resized(size) => {
-                self.image_rect = image_rect(size.width as usize, size.height as usize);
+                let active_h = self.m.bus.mcd212.effective_active_scanlines() * 2;
+                self.blit_layout = compute_blit_layout(size.width as usize, size.height as usize, active_h, self.scale_mode);
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
             }
             WindowEvent::Focused(f) => {
+                let was_focused = self.focused;
                 self.focused = f;
                 if !f {
                     self.keys.clear();
                     self.mouse_left = false;
                     self.mouse_right = false;
                     self.mouse_middle = false;
+                } else if !was_focused {
+                    // Focus-granting clicks must never leak into the emulated disc (prevents skipping intros on click-to-focus).
+                    self.swallow_left = true;
+                    self.mouse_left_latched = false;
                 }
                 self.apply_grab();
             }
@@ -2569,10 +2855,10 @@ impl ApplicationHandler for App {
     fn device_event(&mut self, _el: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
         // Relative motion in host pixels, scaled like the letterboxed picture and mouse sensitivity
         if let (DeviceEvent::MouseMotion { delta: (dx, dy) }, Some((x, y))) = (event, self.rel_pointer) {
-            let (_, _, w, h) = self.image_rect;
+            let (w, h) = (self.blit_layout.dst_w, self.blit_layout.dst_h);
             if w > 0 && h > 0 {
                 let sens = self.bindings.mouse_sensitivity as f64;
-                let (nx, ny) = (x + dx * sens * SCREEN_WIDTH as f64 / w as f64, y + dy * sens * SCREEN_HEIGHT as f64 / h as f64);
+                let (nx, ny) = (x + dx * sens * SCREEN_WIDTH as f64 / w as f64, y + dy * sens * self.blit_layout.src_h as f64 / h as f64);
                 let x = nx.clamp(0.0, (SCREEN_WIDTH - 1) as f64);
                 let y = ny.clamp(0.0, (SCREEN_HEIGHT - 1) as f64);
                 self.rel_over = (self.rel_over.0 + nx - x, self.rel_over.1 + ny - y);
@@ -2664,6 +2950,35 @@ mod tests {
         assert_eq!(cursor_to_cdi(PhysicalPosition::new(100.0, 200.0), image_rect(768, 560)), (100, 200));
         assert_eq!(cursor_to_cdi(PhysicalPosition::new(219.0 + 1481.0, 1080.0), image_rect(1920, 1080)), (767, 559));
         assert_eq!(cursor_to_cdi(PhysicalPosition::new(0.0, 0.0), image_rect(1920, 1080)), (0, 0));
+    }
+
+    #[test]
+    fn scale_modes_handle_fit_height_integer_and_clipping() {
+        // NTSC active height (480) in 16:9 1080p: FitHeight fills all 1080 lines at 4:3 (1440px wide), cropping 40px top/bottom bars.
+        let fh_ntsc = compute_blit_layout(1920, 1080, 480, ScaleMode::FitHeight);
+        assert_eq!(fh_ntsc, BlitLayout { src_y: 40, src_h: 480, dst_x: 240, dst_y: 0, dst_w: 1440, dst_h: 1080 });
+        assert_eq!(cursor_to_cdi_layout(PhysicalPosition::new(240.0, 0.0), fh_ntsc), (0, 40));
+        assert_eq!(cursor_to_cdi_layout(PhysicalPosition::new(1680.0, 1080.0), fh_ntsc), (767, 520));
+
+        // PAL active height (560) in narrow 4:3/tall window: FitHeight centers horizontally with negative dst_x and clips cleanly.
+        let fh_narrow = compute_blit_layout(800, 1080, 560, ScaleMode::FitHeight);
+        assert_eq!(fh_narrow.src_y, 0);
+        assert_eq!(fh_narrow.src_h, 560);
+        assert_eq!(fh_narrow.dst_w, 1440);
+        assert_eq!(fh_narrow.dst_x, -320);
+
+        // Blit with negative dst_x and src_y crops and samples the right active row cleanly without out-of-bounds.
+        let mut src = vec![0u32; SCREEN_WIDTH * SCREEN_HEIGHT];
+        src[40 * SCREEN_WIDTH..41 * SCREEN_WIDTH].fill(0xFF11_2233);
+        let mut dst = vec![0u32; 800 * 1080];
+        blit_layout(&mut dst, 800, 1080, &src, BlitLayout { src_y: 40, src_h: 480, dst_x: -320, dst_y: 0, dst_w: 1440, dst_h: 1080 });
+        assert_eq!(dst[0], 0xFF11_2233);
+        assert_eq!(dst[400], 0xFF11_2233);
+        assert_eq!(dst[799], 0xFF11_2233);
+
+        // Integer scaling: 2x on 1600x1200 -> 1536x960 for 480-line active height.
+        let int_480 = compute_blit_layout(1600, 1200, 480, ScaleMode::Integer);
+        assert_eq!(int_480, BlitLayout { src_y: 40, src_h: 480, dst_x: 32, dst_y: 120, dst_w: 1536, dst_h: 960 });
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use log::info;
 
-use crate::frontend::{push_action, GamepadAction, GamepadButton, GuiAction, InputDeviceMode, InputProfile, KeyBindings};
+use crate::frontend::{push_action, GamepadAction, GamepadButton, GuiAction, InputDeviceMode, InputProfile, KeyBindings, ScaleMode};
 
 pub const ID_FILE_INSERT: usize = 1000;
 pub const ID_FILE_OPEN: usize = 1001;
@@ -33,6 +33,9 @@ pub const ID_MOUSE_SENS_150: usize = 1094;
 pub const ID_PAD_SPEED_LOW: usize = 1095;
 pub const ID_PAD_SPEED_MEDIUM: usize = 1096;
 pub const ID_PAD_SPEED_HIGH: usize = 1097;
+pub const ID_CTRL_CROSSHAIR_OFF: usize = 1098;
+pub const ID_CTRL_CROSSHAIR_AUTO: usize = 1099;
+pub const ID_CTRL_CROSSHAIR_ALWAYS: usize = 1160;
 
 pub const ID_AUDIO_MUTE: usize = 1020;
 pub const ID_AUDIO_VOL_UP: usize = 1021;
@@ -53,8 +56,12 @@ pub const ID_VIDEO_PAL: usize = 1032;
 pub const ID_VIDEO_NTSC: usize = 1033;
 pub const ID_VIDEO_EXCLUSIVE_FULLSCREEN: usize = 1034;
 pub const ID_VIDEO_DEINTERLACE: usize = 1035;
+pub const ID_VIDEO_SCALE_FIT_WINDOW: usize = 1036;
+pub const ID_VIDEO_SCALE_FIT_HEIGHT: usize = 1037;
+pub const ID_VIDEO_SCALE_INTEGER: usize = 1038;
 pub const ID_EMU_WAITSTATES: usize = 1050;
 pub const ID_EMU_DVC: usize = 1051;
+pub const ID_EMU_AUTO_BOOT: usize = 1052;
 
 pub const ID_HELP_CONTROLS: usize = 1040;
 pub const ID_HELP_ABOUT: usize = 1041;
@@ -596,6 +603,64 @@ pub fn update_deinterlace_menu(enabled: bool) {
     }
 }
 
+pub fn update_scale_mode_menu(mode: ScaleMode) {
+    unsafe {
+        if !MENU_HANDLE.is_null() {
+            for (id, target) in [
+                (ID_VIDEO_SCALE_FIT_WINDOW, ScaleMode::FitWindow),
+                (ID_VIDEO_SCALE_FIT_HEIGHT, ScaleMode::FitHeight),
+                (ID_VIDEO_SCALE_INTEGER, ScaleMode::Integer),
+            ] {
+                CheckMenuItem(
+                    MENU_HANDLE,
+                    id as u32,
+                    MF_BYCOMMAND | if mode == target { MF_CHECKED } else { MF_UNCHECKED },
+                );
+            }
+            if !OWNER_HWND.is_null() {
+                DrawMenuBar(OWNER_HWND);
+            }
+        }
+    }
+}
+
+pub fn update_auto_boot_menu(enabled: bool) {
+    unsafe {
+        if !MENU_HANDLE.is_null() {
+            CheckMenuItem(
+                MENU_HANDLE,
+                ID_EMU_AUTO_BOOT as u32,
+                MF_BYCOMMAND | if enabled { MF_CHECKED } else { MF_UNCHECKED },
+            );
+            if !OWNER_HWND.is_null() {
+                DrawMenuBar(OWNER_HWND);
+            }
+        }
+    }
+}
+
+pub fn update_crosshair_menu(mode: crate::mcd212::CrosshairMode) {
+    use crate::mcd212::CrosshairMode;
+    unsafe {
+        if !MENU_HANDLE.is_null() {
+            for (id, target) in [
+                (ID_CTRL_CROSSHAIR_OFF, CrosshairMode::Off),
+                (ID_CTRL_CROSSHAIR_AUTO, CrosshairMode::Auto),
+                (ID_CTRL_CROSSHAIR_ALWAYS, CrosshairMode::Always),
+            ] {
+                CheckMenuItem(
+                    MENU_HANDLE,
+                    id as u32,
+                    MF_BYCOMMAND | if mode == target { MF_CHECKED } else { MF_UNCHECKED },
+                );
+            }
+            if !OWNER_HWND.is_null() {
+                DrawMenuBar(OWNER_HWND);
+            }
+        }
+    }
+}
+
 unsafe extern "system" fn custom_wndproc(
     hwnd: *mut std::ffi::c_void,
     msg: u32,
@@ -770,6 +835,18 @@ unsafe extern "system" fn custom_wndproc(
                 push_action(GuiAction::SetPadSpeed(crate::input_script::PadSpeed::High));
                 return 0;
             }
+            ID_CTRL_CROSSHAIR_OFF => {
+                push_action(GuiAction::SetCrosshair(crate::mcd212::CrosshairMode::Off));
+                return 0;
+            }
+            ID_CTRL_CROSSHAIR_AUTO => {
+                push_action(GuiAction::SetCrosshair(crate::mcd212::CrosshairMode::Auto));
+                return 0;
+            }
+            ID_CTRL_CROSSHAIR_ALWAYS => {
+                push_action(GuiAction::SetCrosshair(crate::mcd212::CrosshairMode::Always));
+                return 0;
+            }
             ID_CONTROLS_EDIT_INI => {
                 let _ = std::process::Command::new("notepad.exe").arg("opencdi_controls.ini").spawn();
                 push_action(GuiAction::SetProfile(InputProfile::Custom));
@@ -843,6 +920,18 @@ unsafe extern "system" fn custom_wndproc(
                 push_action(GuiAction::ToggleDeinterlace);
                 return 0;
             }
+            ID_VIDEO_SCALE_FIT_WINDOW => {
+                push_action(GuiAction::SetScaleMode(ScaleMode::FitWindow));
+                return 0;
+            }
+            ID_VIDEO_SCALE_FIT_HEIGHT => {
+                push_action(GuiAction::SetScaleMode(ScaleMode::FitHeight));
+                return 0;
+            }
+            ID_VIDEO_SCALE_INTEGER => {
+                push_action(GuiAction::SetScaleMode(ScaleMode::Integer));
+                return 0;
+            }
             ID_VIDEO_SCREENSHOT => {
                 push_action(GuiAction::TakeScreenshot);
                 return 0;
@@ -861,6 +950,10 @@ unsafe extern "system" fn custom_wndproc(
             }
             ID_EMU_DVC => {
                 push_action(GuiAction::ToggleDvc);
+                return 0;
+            }
+            ID_EMU_AUTO_BOOT => {
+                push_action(GuiAction::ToggleAutoBoot);
                 return 0;
             }
             ID_HELP_CONTROLS => {
@@ -949,6 +1042,7 @@ pub fn attach_gui_menu(
         AppendMenuW(file_menu, MF_POPUP, recent_menu as usize, to_wide("Recent Disc Images").as_ptr());
 
         AppendMenuW(file_menu, MF_STRING, ID_FILE_EJECT, to_wide("Eject Disc").as_ptr());
+        AppendMenuW(file_menu, MF_STRING | MF_CHECKED, ID_EMU_AUTO_BOOT, to_wide("Auto-boot Disc from BIOS").as_ptr());
 
         // Submenu: System BIOS
         AppendMenuW(file_menu, MF_SEPARATOR, 0, std::ptr::null());
@@ -1027,6 +1121,12 @@ pub fn attach_gui_menu(
         AppendMenuW(device_menu, MF_STRING, ID_INPUT_DEVICE_MOUSE, to_wide("Philips CD-i Mouse (Host Cursor)\tF9").as_ptr());
         AppendMenuW(controls_menu, MF_POPUP, device_menu as usize, to_wide("Input Device (Exclusive)").as_ptr());
 
+        let crosshair_menu = CreatePopupMenu();
+        AppendMenuW(crosshair_menu, MF_STRING | MF_CHECKED, ID_CTRL_CROSSHAIR_OFF, to_wide("Off\tF3").as_ptr());
+        AppendMenuW(crosshair_menu, MF_STRING, ID_CTRL_CROSSHAIR_AUTO, to_wide("Auto (When Game Hides Cursor)\tF3").as_ptr());
+        AppendMenuW(crosshair_menu, MF_STRING, ID_CTRL_CROSSHAIR_ALWAYS, to_wide("Always Visible\tF3").as_ptr());
+        AppendMenuW(controls_menu, MF_POPUP, crosshair_menu as usize, to_wide("Lightgun Crosshair (F3)").as_ptr());
+
         let sens_menu = CreatePopupMenu();
         AppendMenuW(sens_menu, MF_STRING, ID_MOUSE_SENS_25, to_wide("Very Low (25%)").as_ptr());
         AppendMenuW(sens_menu, MF_STRING, ID_MOUSE_SENS_50, to_wide("Low (50% - Recommended)").as_ptr());
@@ -1088,6 +1188,11 @@ pub fn attach_gui_menu(
         AppendMenuW(video_menu, MF_STRING, ID_VIDEO_FULLSCREEN, to_wide("Fullscreen\tF11 / Alt+Enter").as_ptr());
         AppendMenuW(video_menu, MF_STRING, ID_VIDEO_EXCLUSIVE_FULLSCREEN, to_wide("Exclusive Fullscreen (Lower Latency)").as_ptr());
         AppendMenuW(video_menu, MF_STRING, ID_VIDEO_DEINTERLACE, to_wide("De-interlacing (Motion-Adaptive FMV)").as_ptr());
+        let scale_menu = CreatePopupMenu();
+        AppendMenuW(scale_menu, MF_STRING | MF_CHECKED, ID_VIDEO_SCALE_FIT_WINDOW, to_wide(ScaleMode::FitWindow.label()).as_ptr());
+        AppendMenuW(scale_menu, MF_STRING, ID_VIDEO_SCALE_FIT_HEIGHT, to_wide(ScaleMode::FitHeight.label()).as_ptr());
+        AppendMenuW(scale_menu, MF_STRING, ID_VIDEO_SCALE_INTEGER, to_wide(ScaleMode::Integer.label()).as_ptr());
+        AppendMenuW(video_menu, MF_POPUP, scale_menu as usize, to_wide("Display Scaling").as_ptr());
         AppendMenuW(video_menu, MF_STRING, ID_VIDEO_SCREENSHOT, to_wide("Save Screenshot (PNG)\tF12").as_ptr());
         AppendMenuW(video_menu, MF_SEPARATOR, 0, std::ptr::null());
         AppendMenuW(video_menu, MF_STRING, ID_VIDEO_PAL, to_wide("PAL (50 Hz) [CD-i 220 Standard]").as_ptr());
@@ -1204,6 +1309,10 @@ pub fn show_controls_dialog(owner: *mut std::ffi::c_void) {
            • Right Click = Button 2\n\
            • Middle Click: Lock / release host mouse cursor to/from the window.\n\
            • Controls -> Mouse Sensitivity: adjust speed multiplier (25% - 150%).\n\n\
+        LIGHTGUN GAMES (MAD DOG MCCREE / MAD DOG II):\n\
+           • Select Mouse mode (F9) and press F3 to cycle the Lightgun Crosshair overlay (Off / Auto / Always).\n\
+           • When calibrating a Lightgun ('GUN' controller), shoot the 4 targets in order:\n\
+             Bottom-Right -> Top-Left -> Bottom-Right -> Top-Left.\n\n\
         USB GAMEPAD / XBOX / PLAYSTATION (Remappable via Controls -> Gamepad Button Mapping):\n\
            • D-Pad or Left Analog Stick = Movement\n\
            • Default Button 1 = A / Cross (South)\n\
@@ -1212,6 +1321,7 @@ pub fn show_controls_dialog(owner: *mut std::ffi::c_void) {
            • Default Pad Speed Switch = L1 / LB (cycles 3-level CD-i Gamepad speed)\n\n\
         KEYBOARD SHORTCUTS:\n\
            • F11 or Alt+Enter: Fullscreen (Borderless default, Exclusive optional in Video menu)\n\
+           • F3: Cycle Lightgun Crosshair overlay (Off / Auto / Always)\n\
            • Tab: Cycle 3-Level CD-i Gamepad Speed (1 Slow / 2 Medium / 3 Fast)\n\
            • F5 or H: Restart console (Reset)\n\
            • F2 / F4: Quick Save / Quick Load state (current slot)\n\
@@ -1242,14 +1352,15 @@ pub fn show_disc_error(owner: *mut std::ffi::c_void, text: &str) {
 pub fn show_about_dialog(owner: *mut std::ffi::c_void) {
     let text = to_wide(
         "OpenCDi - Philips CD-i Emulator\n\
-        Version: 0.4.2 (High Performance Edition)\n\
+        Version: 0.4.3 (High Performance Edition)\n\
         GitHub: https://github.com/sigsantilio/opencdi\n\n\
         Project Lead & Maintainer:\n\
         • Gianluca \"sigsantilio\"\n\n\
         Core Contributors:\n\
         • ArnoldDeRuiter (Libretro core, Mono-IV, Savestates, macOS standalone)\n\
-        • OpenCDi Community\n\n\
-        Built with Rust, winit & softbuffer\n\n\
+        • whatever-industries (macOS app, motion-adaptive de-interlacer, CD-i hardware research)\n\
+        • OpenCDi Community & Testers\n\n\
+        Built with Rust, winit, Win32 OpenGL & softbuffer\n\n\
         Key Emulation Features:\n\
         • Philips SCC68070 Microprocessor & OS-9 CD-RTOS kernel\n\
         • Philips MCD-212 Video Display Controller (Planes A & B, ICA/DCA display lists)\n\

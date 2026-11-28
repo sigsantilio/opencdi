@@ -189,6 +189,7 @@ pub struct Mcd212 {
     pub matte_control: [u32; 8],
     pub backdrop_color: u32,
     pub mosaic_hold: [u32; 2],
+    pub weight_latch: [u8; 2],
     pub weight_factor: [[u8; 768]; 2],
     pub matte_flag: [[bool; 768]; 2],
 
@@ -287,6 +288,7 @@ impl Mcd212 {
             matte_control: [0; 8],
             backdrop_color: 0,
             mosaic_hold: [0; 2],
+            weight_latch: [0; 2],
             weight_factor: [[0; 768]; 2],
             matte_flag: [[false; 768]; 2],
 
@@ -348,6 +350,7 @@ impl Mcd212 {
         self.matte_control = [0; 8];
         self.backdrop_color = 0;
         self.mosaic_hold = [0; 2];
+        self.weight_latch = [0; 2];
         self.weight_factor = [[0; 768]; 2];
         self.matte_flag = [[false; 768]; 2];
         self.blink_time = 0;
@@ -603,7 +606,6 @@ impl Mcd212 {
             }
             0xD0..=0xD7 => {
                 self.matte_control[(reg & 7) as usize] = val;
-                self.update_matte_arrays();
             }
             0xD8 => {
                 if PATH == 0 {
@@ -622,26 +624,27 @@ impl Mcd212 {
             }
             0xDB => {
                 if PATH == 0 {
-                    self.weight_factor[0][0] = val as u8;
-                    self.update_matte_arrays();
+                    self.weight_latch[0] = (val & 0x3F) as u8;
                 }
             }
             0xDC => {
                 if PATH == 1 {
-                    self.weight_factor[1][0] = val as u8;
-                    self.update_matte_arrays();
+                    self.weight_latch[1] = (val & 0x3F) as u8;
                 }
             }
             _ => {}
         }
     }
 
-    fn update_matte_arrays(&mut self) {
+    /// Evaluates matte weight factors and region flags for the current active scanline.
+    /// Per MCD-212 silicon (`mcd212rev0.pdf` p. 62), weight latches persist across scanlines
+    /// while matte region flags (`MF0`/`MF1`) reset to `false` at `x = 0` of each scanline.
+    fn evaluate_line_mattes(&mut self) {
         let width = 768;
         let num_mattes = if (self.image_coding_method & (1 << 19)) != 0 { 2 } else { 1 };
 
         let mut latched_mf = [false, false];
-        let mut latched_wf = [self.weight_factor[0][0], self.weight_factor[1][0]];
+        let mut latched_wf = self.weight_latch;
         let mut matte_idx = [0usize, 4usize];
 
         for x in 0..width {
@@ -673,6 +676,7 @@ impl Mcd212 {
             self.matte_flag[0][x] = latched_mf[0];
             self.matte_flag[1][x] = latched_mf[1];
         }
+        self.weight_latch = latched_wf;
     }
 
     #[inline]
@@ -1067,7 +1071,7 @@ impl Mcd212 {
 
             let mut x = 0;
             while x < width {
-                let mut rgb_tp_bit = false;
+                let mut raw_rgb_tp = false;
                 let byte = if PATH == 0 { self.plane_a[(vsr & 0x0007_FFFF) as usize] } else { self.plane_b[(vsr & 0x0007_FFFF) as usize] };
                 vsr += 1;
 
@@ -1077,7 +1081,7 @@ impl Mcd212 {
                     let blue = ((byte & 0x1F) as u32) << 3;
                     let green = (((byte & 0xE0) as u32) >> 2) + (((byte1 & 0x03) as u32) << 6);
                     let red = (((byte1 & 0x7C) as u32) >> 2) << 3;
-                    rgb_tp_bit = use_rgb_tp_bit && (((byte1 >> 7) & 1) != 0) == tp_check_parity;
+                    raw_rgb_tp = use_rgb_tp_bit && (((byte1 >> 7) & 1) != 0);
                     let c = 0xFF00_0000 | (red << 16) | (green << 8) | blue;
                     (c, c)
                 } else if icm == ICM_CLUT4 {
@@ -1102,8 +1106,8 @@ impl Mcd212 {
                     length_m = if length != 0 { length * 2 } else { width };
                 }
 
-                let color_match0 = ((mask_bits & color0) == tp_color_match) == tp_check_parity;
-                let color_match1 = ((mask_bits & color1) == tp_color_match) == tp_check_parity;
+                let raw_ck0 = (mask_bits & color0) == tp_color_match;
+                let raw_ck1 = (mask_bits & color1) == tp_color_match;
                 let end = (x + length_m).min(width);
 
                 let mut rl_index = x;
@@ -1113,9 +1117,11 @@ impl Mcd212 {
                         pixels[rl_index + 1] = color1;
                     }
                     if !fixed_tp {
-                        transparent[rl_index] = rgb_tp_bit || (use_color_key && color_match0) || (use_matte_flag && (self.matte_flag[matte_flag_index][rl_index] == tp_check_parity));
+                        let cond0 = raw_rgb_tp || (use_color_key && raw_ck0) || (use_matte_flag && self.matte_flag[matte_flag_index][rl_index]);
+                        transparent[rl_index] = cond0 == tp_check_parity;
                         if rl_index + 1 < width {
-                            transparent[rl_index + 1] = rgb_tp_bit || (use_color_key && color_match1) || (use_matte_flag && (self.matte_flag[matte_flag_index][rl_index + 1] == tp_check_parity));
+                            let cond1 = raw_rgb_tp || (use_color_key && raw_ck1) || (use_matte_flag && self.matte_flag[matte_flag_index][rl_index + 1]);
+                            transparent[rl_index + 1] = cond1 == tp_check_parity;
                         }
                     }
                     rl_index += 2;
@@ -1237,6 +1243,10 @@ impl Mcd212 {
         }
     }
 
+    pub fn hardware_cursor_visible(&self) -> bool {
+        (self.cursor_control & CURCNT_EN) != 0 && self.cursor_pattern.iter().any(|&row| row != 0)
+    }
+
     fn draw_cursor(&self, scanline: usize, out: &mut [u32; 768]) {
         if (self.cursor_control & CURCNT_EN) == 0 {
             return; // Cursor is Disabled
@@ -1275,6 +1285,7 @@ impl Mcd212 {
 
     pub fn render_scanline(&mut self, active_line: usize) {
         self.csrr[0] |= CSR1R_DA;
+        self.evaluate_line_mattes();
 
         let mut mixed_line = [0u32; 768];
         let mut plane_a = [0u32; 768];
@@ -1350,13 +1361,102 @@ impl Mcd212 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CrosshairMode {
+    #[default]
+    Off,
+    Auto,
+    Always,
+}
+
+impl CrosshairMode {
+    pub fn as_ini_str(self) -> &'static str {
+        match self {
+            CrosshairMode::Off => "Off",
+            CrosshairMode::Auto => "Auto",
+            CrosshairMode::Always => "Always",
+        }
+    }
+
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "0" | "false" | "disabled" => Some(CrosshairMode::Off),
+            "auto" => Some(CrosshairMode::Auto),
+            "always" | "on" | "1" | "true" => Some(CrosshairMode::Always),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CrosshairMode::Off => "Off",
+            CrosshairMode::Auto => "Auto (When Game Hides Cursor)",
+            CrosshairMode::Always => "Always Visible",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            CrosshairMode::Off => CrosshairMode::Auto,
+            CrosshairMode::Auto => CrosshairMode::Always,
+            CrosshairMode::Always => CrosshairMode::Off,
+        }
+    }
+
+    pub fn should_draw(self, hw_cursor_visible: bool) -> bool {
+        match self {
+            CrosshairMode::Off => false,
+            CrosshairMode::Auto => !hw_cursor_visible,
+            CrosshairMode::Always => true,
+        }
+    }
+}
+
+/// Draws a non-destructive lightgun reticle at `(x, y)` onto an XRGB8888 presentation buffer.
+pub fn draw_crosshair(fb: &mut [u32], width: usize, height: usize, x: i32, y: i32) {
+    let mut plot = |px: i32, py: i32, color: u32| {
+        if px >= 0 && py >= 0 {
+            let (ux, uy) = (px as usize, py as usize);
+            if ux < width && uy < height {
+                let idx = uy * width + ux;
+                if idx < fb.len() {
+                    fb[idx] = color;
+                }
+            }
+        }
+    };
+
+    const OUTLINE: u32 = 0xFF10_1010;
+    const ARM: u32 = 0xFFFF_FFFF;
+    const DOT: u32 = 0xFF00_E5FF;
+
+    for d in 3i32..=9i32 {
+        for &(px, py) in &[(x - d, y), (x + d, y), (x, y - d), (x, y + d)] {
+            plot(px - 1, py, OUTLINE);
+            plot(px + 1, py, OUTLINE);
+            plot(px, py - 1, OUTLINE);
+            plot(px, py + 1, OUTLINE);
+        }
+    }
+    for (ox, oy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+        plot(x + ox, y + oy, OUTLINE);
+    }
+    for d in 3i32..=9i32 {
+        plot(x - d, y, ARM);
+        plot(x + d, y, ARM);
+        plot(x, y - d, ARM);
+        plot(x, y + d, ARM);
+    }
+    plot(x, y, DOT);
+}
+
 opencdi::impl_state_enum!(VideoMode { Pal = 0, Ntsc = 1 });
 
 opencdi::impl_state!(Mcd212 {
     plane_a, plane_b,
     csrr, csrw, dcr, vsr, ddr, dcp, dca,
     clut, clut_bank, image_coding_method, transparency_control, plane_order, transparent_color, mask_color, dyuv_abs_start,
-    cursor_position, cursor_control, cursor_pattern, matte_control, backdrop_color, mosaic_hold, weight_factor, matte_flag,
+    cursor_position, cursor_control, cursor_pattern, matte_control, backdrop_color, mosaic_hold, weight_latch, weight_factor, matte_flag,
     blink_time, blink_active,
     framebuffer, interlace_field,
     scanline, scanline_cycles, vblank_irq, video_mode, external_video_line, external_video_present,
@@ -1620,6 +1720,76 @@ mod matte_and_dc_tests {
         assert_eq!(row[384], 0xFF12_3456);
         assert_eq!(row[750], 0xFF12_3456);
     }
+
+    #[test]
+    fn matte_weight_factor_persists_across_scanlines_while_region_flags_reset() {
+        let mut m = Mcd212::new();
+        m.dcr[0] = DCR_DE_BIT | DCR_CF_BIT;
+        m.dcr[1] = DCR_DE_BIT | DCR_CF_BIT;
+        m.set_register::<0>(0xDB, 63);
+        m.set_register::<1>(0xDC, 63);
+        // Steel Machine style: x=0 resets MF0=0, x=64 sets wf_B=42, x=100 sets MF0=1,
+        // x=704 sets wf_B=0, x=706 sets wf_A=0 (consecutive matte slots 0..4 so no STOP op intervenes).
+        m.set_register::<0>(0xD0, 0x08 << 20);
+        m.set_register::<0>(0xD1, (0x06 << 20) | (42 << 10) | 64);
+        m.set_register::<0>(0xD2, (0x09 << 20) | 100);
+        m.set_register::<0>(0xD3, (0x06 << 20) | (0 << 10) | 704);
+        m.set_register::<0>(0xD4, (0x04 << 20) | (0 << 10) | 706);
+
+        // Line 0 starts with ICA weights [63, 63], ends with [0, 0] at x=704..767.
+        m.evaluate_line_mattes();
+        assert_eq!(m.weight_factor[0][0], 63);
+        assert_eq!(m.weight_factor[1][0], 63);
+        assert_eq!(m.weight_factor[1][64], 42);
+        assert_eq!(m.weight_factor[1][704], 0);
+        assert_eq!(m.weight_factor[0][706], 0);
+        assert!(m.matte_flag[0][700]);
+
+        // Line 1 inherits wf=[0, 0] from end of line 0 across x=0..63, while MF0 resets to false.
+        m.evaluate_line_mattes();
+        assert_eq!(m.weight_factor[0][0..64], [0; 64]);
+        assert_eq!(m.weight_factor[1][0..64], [0; 64]);
+        assert!(!m.matte_flag[0][99]);
+        assert!(m.matte_flag[0][100]);
+        assert_eq!(m.weight_factor[1][64], 42);
+        assert_eq!(m.weight_factor[1][703], 42);
+        assert_eq!(m.weight_factor[1][704], 0);
+        assert_eq!(m.weight_factor[0][706], 0);
+    }
+
+    #[test]
+    fn inverted_combined_tcr_uses_nor_semantics() {
+        let mut m = Mcd212::new();
+        m.dcr[0] = DCR_DE_BIT | DCR_CF_BIT;
+        m.set_register::<0>(0xC0, ICM_CLUT8 as u32);
+        // Plane A uses inverted TCR_MF0_KEY1 (0x08 | 0x05 = 0x0D -> transparent iff !(ck || mf0)).
+        m.set_register::<0>(0xC1, 0x08 | (TCR_MF0_KEY1 as u32));
+        m.set_register::<0>(0xC4, 0x00FC_0000); // Color key = CLUT[2] (red)
+        m.set_register::<0>(0xC7, 0x0000_0000); // Full mask (all bits compared)
+        m.clut[1] = 0x0000_FC00; // non-key green
+        m.clut[2] = 0x00FC_0000; // color-key red
+
+        // 4 regions:
+        // x=0..15:   !ck, !mf0  -> transparent = true
+        // x=16..31:   ck, !mf0  -> transparent = false
+        // x=32..47:   ck,  mf0  -> transparent = false
+        // x=48..63:  !ck,  mf0  -> transparent = false
+        m.plane_a[0x1000..0x1008].fill(1);
+        m.plane_a[0x1008..0x1018].fill(2);
+        m.plane_a[0x1018..0x1020].fill(1);
+        m.set_vsr::<0>(0x1000);
+        m.matte_flag[0][0..32].fill(false);
+        m.matte_flag[0][32..64].fill(true);
+
+        let mut pixels = [0u32; 768];
+        let mut tp = [false; 768];
+        m.process_vsr::<0>(&mut pixels, &mut tp);
+
+        assert!(tp[..16].iter().all(|&t| t), "!ck && !mf0 must be transparent under inverted TCR_MF0_KEY1");
+        assert!(tp[16..32].iter().all(|&t| !t), "ck && !mf0 must be opaque under inverted TCR_MF0_KEY1");
+        assert!(tp[32..48].iter().all(|&t| !t), "ck && mf0 must be opaque under inverted TCR_MF0_KEY1");
+        assert!(tp[48..64].iter().all(|&t| !t), "!ck && mf0 must be opaque under inverted TCR_MF0_KEY1");
+    }
 }
 
 #[cfg(test)]
@@ -1642,5 +1812,34 @@ mod level_tests {
     fn fixed_colors_map_to_studio_range() {
         assert_eq!(full_to_studio(0), 16);
         assert_eq!(full_to_studio(255), 235);
+    }
+
+    #[test]
+    fn crosshair_modes_and_bounds_clipping() {
+        assert!(!CrosshairMode::Off.should_draw(false));
+        assert!(CrosshairMode::Auto.should_draw(false));
+        assert!(!CrosshairMode::Auto.should_draw(true));
+        assert!(CrosshairMode::Always.should_draw(true));
+        assert_eq!(CrosshairMode::Off.next(), CrosshairMode::Auto);
+        assert_eq!(CrosshairMode::Auto.next(), CrosshairMode::Always);
+        assert_eq!(CrosshairMode::Always.next(), CrosshairMode::Off);
+        assert_eq!(CrosshairMode::from_str_opt("auto"), Some(CrosshairMode::Auto));
+        assert_eq!(CrosshairMode::from_str_opt("always"), Some(CrosshairMode::Always));
+        assert_eq!(CrosshairMode::from_str_opt("off"), Some(CrosshairMode::Off));
+
+        let mut m = Mcd212::new();
+        assert!(!m.hardware_cursor_visible());
+        m.cursor_control = CURCNT_EN;
+        assert!(!m.hardware_cursor_visible(), "empty pattern means invisible cursor");
+        m.cursor_pattern[0] = 0x8000;
+        assert!(m.hardware_cursor_visible());
+
+        let mut fb = vec![0xFF20_2020u32; SCREEN_WIDTH * SCREEN_HEIGHT];
+        draw_crosshair(&mut fb, SCREEN_WIDTH, SCREEN_HEIGHT, 0, 0);
+        draw_crosshair(&mut fb, SCREEN_WIDTH, SCREEN_HEIGHT, 767, 559);
+        draw_crosshair(&mut fb, SCREEN_WIDTH, SCREEN_HEIGHT, 384, 280);
+        assert_eq!(fb[0], 0xFF00_E5FF);
+        assert_eq!(fb[280 * SCREEN_WIDTH + 384], 0xFF00_E5FF);
+        assert_eq!(fb[280 * SCREEN_WIDTH + 387], 0xFFFF_FFFF);
     }
 }

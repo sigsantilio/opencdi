@@ -264,6 +264,7 @@ pub fn string_to_key(s: &str) -> Option<Key> {
 pub struct KeyBindings {
     pub profile: InputProfile,
     pub input_device: InputDeviceMode,
+    pub crosshair: crate::mcd212::CrosshairMode,
     pub mouse_sensitivity: f32,
     pub pad_speed: crate::input_script::PadSpeed,
     pub up: Key,
@@ -284,6 +285,7 @@ impl KeyBindings {
         let mut bindings = Self {
             profile: InputProfile::Standard,
             input_device: InputDeviceMode::Gamepad,
+            crosshair: crate::mcd212::CrosshairMode::Off,
             mouse_sensitivity: 1.00,
             pad_speed: crate::input_script::PadSpeed::Medium,
             up: Key::ArrowUp,
@@ -377,6 +379,8 @@ impl KeyBindings {
             "# OpenCDi Controls Configuration\n\
              # Input Device: Gamepad | Mouse (Exclusive active input device)\n\
              input_device={}\n\
+             # Lightgun Crosshair Overlay: Off | Auto (when game hides cursor) | Always\n\
+             crosshair={}\n\
              # Mouse sensitivity multiplier (0.50 = 50% recommended for modern high-DPI mice)\n\
              mouse_sensitivity={:.2}\n\
              # Philips CD-i Gamepad (22ER9021) 3-level cursor speed: 1 (Slow) | 2 (Medium) | 3 (Fast)\n\
@@ -397,6 +401,7 @@ impl KeyBindings {
              gamepad_btn12={}\n\
              gamepad_speed_btn={}\n",
             dev_str,
+            self.crosshair.as_ini_str(),
             self.mouse_sensitivity,
             self.pad_speed.level(),
             prof_str,
@@ -430,6 +435,11 @@ impl KeyBindings {
                             "mouse" => self.input_device = InputDeviceMode::Mouse,
                             _ => self.input_device = InputDeviceMode::Gamepad,
                         },
+                        "crosshair" => {
+                            if let Some(m) = crate::mcd212::CrosshairMode::from_str_opt(parts[1]) {
+                                self.crosshair = m;
+                            }
+                        }
                         "mouse_sensitivity" | "sensitivity" => {
                             let clean = parts[1].trim_end_matches('%');
                             if let Ok(val) = clean.parse::<f32>() {
@@ -482,6 +492,41 @@ impl KeyBindings {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScaleMode {
+    #[default]
+    FitWindow,
+    FitHeight,
+    Integer,
+}
+
+impl ScaleMode {
+    pub fn as_ini_str(self) -> &'static str {
+        match self {
+            ScaleMode::FitWindow => "fit_window",
+            ScaleMode::FitHeight => "fit_height",
+            ScaleMode::Integer => "integer",
+        }
+    }
+
+    pub fn from_ini_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fit_window" | "fit" | "aspect" | "window" => Some(ScaleMode::FitWindow),
+            "fit_height" | "fill_height" | "height" | "4:3" => Some(ScaleMode::FitHeight),
+            "integer" | "pixel" => Some(ScaleMode::Integer),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ScaleMode::FitWindow => "Fit Window (Full Frame 768x560)",
+            ScaleMode::FitHeight => "Fill Height (Crop Vertical Borders, 4:3)",
+            ScaleMode::Integer => "Integer Scaling (Pixel-Perfect)",
+        }
+    }
+}
+
 pub enum GuiAction {
     InsertDisc(PathBuf),
     OpenDisc(PathBuf),
@@ -490,6 +535,8 @@ pub enum GuiAction {
     Exit,
     SetProfile(InputProfile),
     SetInputDevice(InputDeviceMode),
+    SetCrosshair(crate::mcd212::CrosshairMode),
+    CycleCrosshair,
     SetMouseSensitivity(f32),
     SetPadSpeed(crate::input_script::PadSpeed),
     CyclePadSpeed,
@@ -503,6 +550,8 @@ pub enum GuiAction {
     ToggleFullscreen,
     ToggleExclusiveFullscreen,
     ToggleDeinterlace,
+    SetScaleMode(ScaleMode),
+    ToggleAutoBoot,
     TakeScreenshot,
     SetVideoMode(crate::mcd212::VideoMode),
     ToggleWaitStates,
@@ -731,9 +780,36 @@ pub fn save_bool_preference(key: &str, value: bool) {
     save_string_preference(key, if value { "on" } else { "off" });
 }
 
+pub fn load_scale_mode() -> ScaleMode {
+    load_string_preference("scale_mode")
+        .and_then(|v| ScaleMode::from_ini_str(&v))
+        .unwrap_or_default()
+}
+
+pub fn save_scale_mode(mode: ScaleMode) {
+    save_string_preference("scale_mode", mode.as_ini_str());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scale_mode_ini_round_trip() {
+        for mode in [ScaleMode::FitWindow, ScaleMode::FitHeight, ScaleMode::Integer] {
+            assert_eq!(ScaleMode::from_ini_str(mode.as_ini_str()), Some(mode));
+        }
+        assert_eq!(ScaleMode::from_ini_str("fill_height"), Some(ScaleMode::FitHeight));
+        assert_eq!(ScaleMode::from_ini_str("unknown"), None);
+    }
+
+    #[test]
+    fn crosshair_mode_ini_round_trip() {
+        use crate::mcd212::CrosshairMode;
+        for mode in [CrosshairMode::Off, CrosshairMode::Auto, CrosshairMode::Always] {
+            assert_eq!(CrosshairMode::from_str_opt(mode.as_ini_str()), Some(mode));
+        }
+    }
 
     #[test]
     fn gamepad_button_ini_round_trip_and_aliases() {

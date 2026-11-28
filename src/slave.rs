@@ -480,6 +480,21 @@ impl SlaveHle {
 
         self.prepare_readback(0, &[b0, b1, b2, b3], 0xF7, true);
     }
+
+    /// Drops any unread CH0 pointer packet left over from BIOS shell auto-boot before the disc opens `/ptr`,
+    /// without disturbing an active multi-byte read (`out_index > 0`) or pending replies on CH1..CH3.
+    pub fn clear_unread_pointer_click(&mut self) {
+        let ch = &mut self.channels[0];
+        if ch.out_index == 0 {
+            ch.out_count = 0;
+            ch.out_cmd = 0;
+            ch.pending_count = 0;
+            ch.pending_cmd = 0;
+            ch.pending_buf = [0; 8];
+            self.input_mouse_btn = 0;
+            self.irq_pending = self.channels.iter().any(Self::channel_has_pending_irq);
+        }
+    }
 }
 
 opencdi::impl_state!(SlaveChannel {
@@ -595,5 +610,37 @@ mod tests {
             let _ = s.read(0);
         }
         assert!(s.irq_pending, "staged release packet promoted after Ch0 click drained");
+    }
+
+    #[test]
+    fn clear_unread_pointer_click_drops_stale_boot_click_but_preserves_inflight_transfer() {
+        let mut s = SlaveHle::new();
+        // Simulate BIOS shell auto-boot click queued after shell closed /ptr
+        s.update_mouse(575, 335, 1);
+        assert!(s.irq_pending);
+        s.clear_unread_pointer_click();
+        assert!(!s.irq_pending);
+
+        // Centering at disc launch must deliver button=0 (no leaked click)
+        s.update_mouse(384, 280, 0);
+        assert!(s.irq_pending);
+        let b0 = (s.read(0) & 0xFF) as u8;
+        assert_eq!(b0 & 0x38, 0x08, "disc launch pointer must have button released");
+        for _ in 0..3 { let _ = s.read(0); }
+
+        // Mid-transfer read (`out_index > 0`) must NOT be truncated by clear_unread_pointer_click
+        s.update_mouse(400, 250, 1);
+        let first = (s.read(0) & 0xFF) as u8;
+        assert_ne!(first & 0x38, 0x08);
+        s.clear_unread_pointer_click();
+        assert_eq!(s.channels[0].out_index, 1);
+        assert_eq!(s.channels[0].out_count, 3);
+        for _ in 0..3 { let _ = s.read(0); }
+
+        // Pending CH3 IRQ must be preserved when clearing CH0
+        s.update_mouse(575, 335, 1);
+        s.prepare_readback(3, &[0xB0, 0x00, 0x02, 0x15], 0xB0, true);
+        s.clear_unread_pointer_click();
+        assert!(s.irq_pending, "CH3 pending IRQ must survive CH0 clear");
     }
 }

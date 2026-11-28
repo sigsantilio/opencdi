@@ -104,7 +104,10 @@ impl Buffer {
     /// or -1 if none is found.
     pub fn next_start_code(&mut self) -> i32 {
         self.align();
-        while self.has(5 << 3) {
+        while self.has(5 << 3)
+            || (self.has(4 << 3)
+                && self.bytes[(self.bit_index >> 3) + 3] == 0xB7)
+        {
             let byte_index = self.bit_index >> 3;
             if self.bytes[byte_index] == 0x00
                 && self.bytes[byte_index + 1] == 0x00

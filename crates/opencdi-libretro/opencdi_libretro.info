@@ -1,11 +1,11 @@
 # Software Information
 display_name = "Philips - CD-i (OpenCDI)"
-authors = "sigsantilio|ArnoldDeRuiter|OpenCDI contributors"
+authors = "sigsantilio|ArnoldDeRuiter|whatever-industries|OpenCDI contributors"
 supported_extensions = "cue|chd|bin|iso"
 corename = "OpenCDI"
 license = "MIT"
 permissions = ""
-display_version = "0.4.2"
+display_version = "0.4.3"
 categories = "Emulator"
 
 # Hardware Information

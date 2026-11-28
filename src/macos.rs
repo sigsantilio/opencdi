@@ -175,7 +175,7 @@ Keyboard (Standard profile)
 
 Mouse
   Left click: button 1 (captures the mouse)  ·  Right click: button 2
-  Middle click: capture / release the mouse  ·  F9: switch gamepad ↔ mouse
+  Middle click: capture / release the mouse  ·  F9: switch gamepad ↔ mouse  ·  F3: lightgun crosshair
 
 USB gamepad (remappable in opencdi_controls.ini)
   D-pad or left stick: move  ·  A / Cross: button 1  ·  B / Circle: button 2
@@ -225,6 +225,7 @@ pub enum MenuCommand {
     Fullscreen,
     InputGamepad,
     InputMouse,
+    CycleCrosshair,
     SelectBios,
     ShowBiosFolder,
     SelectDvc,
@@ -250,6 +251,7 @@ const COMMANDS: &[(MenuCommand, &str)] = &[
     (MenuCommand::Fullscreen, "fullscreen"),
     (MenuCommand::InputGamepad, "input_gamepad"),
     (MenuCommand::InputMouse, "input_mouse"),
+    (MenuCommand::CycleCrosshair, "cycle_crosshair"),
     (MenuCommand::SelectBios, "select_bios"),
     (MenuCommand::ShowBiosFolder, "show_bios_folder"),
     (MenuCommand::SelectDvc, "select_dvc"),
@@ -326,6 +328,7 @@ impl MenuBar {
                 &item(MenuCommand::Mute, "Mute / Unmute", None),
                 &item(MenuCommand::InputGamepad, "Use Gamepad Input", None),
                 &item(MenuCommand::InputMouse, "Use Mouse Input", None),
+                &item(MenuCommand::CycleCrosshair, "Cycle Lightgun Crosshair", None),
             ],
         )?;
         let system = Submenu::with_items(

@@ -207,6 +207,93 @@ pub struct CdRom {
     pub volume_id: String,
     pub volume_set: String,
     pub publisher: String,
+    pub preparer: String,
+    pub disc_ntsc_hint: Option<bool>,
+}
+
+const CD_SWAPPED_SYNC_HEADER: [u8; 12] = [0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0x00, 0xFF];
+
+fn read_probe(file: &mut File, offset: u64, buf: &mut [u8]) -> bool {
+    file.seek(SeekFrom::Start(offset)).is_ok() && file.read_exact(buf).is_ok()
+}
+
+fn is_sync_header(hdr: &[u8]) -> bool {
+    hdr == CD_SYNC_HEADER || hdr == CD_SWAPPED_SYNC_HEADER
+}
+
+fn has_pvd_signature(sig: &[u8]) -> bool {
+    sig == b"\x01CD-I " || sig == b"\x01CD001"
+}
+
+/// Auto-detects the sector stride (2352, 2448, 2336, or 2048 bytes) of single-file `.iso`/`.bin`/`.img` dumps.
+pub(crate) fn detect_raw_sector_size(file: &mut File, file_size: u64, ext: &str) -> usize {
+    let mut hdr0 = [0u8; 12];
+    let mut hdr16 = [0u8; 12];
+    for &stride in &[CD_SECTOR_RAW_SIZE, CD_FRAME_SIZE] {
+        let s = stride as u64;
+        if read_probe(file, 0, &mut hdr0) && is_sync_header(&hdr0) {
+            if file_size < 17 * s || (read_probe(file, 16 * s, &mut hdr16) && is_sync_header(&hdr16)) {
+                let _ = file.seek(SeekFrom::Start(0));
+                return stride;
+            }
+        }
+    }
+
+    let mut sig = [0u8; 6];
+    for &(stride, data_off) in &[
+        (CD_SECTOR_RAW_SIZE, 24u64),
+        (CD_SECTOR_RAW_SIZE, 16u64),
+        (CD_FRAME_SIZE, 24u64),
+        (CD_FRAME_SIZE, 16u64),
+        (2336usize, 8u64),
+        (2048usize, 0u64),
+    ] {
+        if read_probe(file, 16 * (stride as u64) + data_off, &mut sig) && has_pvd_signature(&sig) {
+            let _ = file.seek(SeekFrom::Start(0));
+            return stride;
+        }
+    }
+
+    let _ = file.seek(SeekFrom::Start(0));
+    if ext == "iso" {
+        if file_size > 0 && file_size % (CD_SECTOR_RAW_SIZE as u64) == 0 && file_size % 2048 != 0 {
+            CD_SECTOR_RAW_SIZE
+        } else if file_size > 0 && file_size % 2336 == 0 && file_size % 2048 != 0 {
+            2336
+        } else if file_size % 2048 == 0 {
+            2048
+        } else {
+            CD_SECTOR_RAW_SIZE
+        }
+    } else if file_size > 0 && file_size % 2048 == 0 && file_size % (CD_SECTOR_RAW_SIZE as u64) != 0 {
+        2048
+    } else {
+        CD_SECTOR_RAW_SIZE
+    }
+}
+
+fn synthesize_mode2_sync_and_msf(out_sector: &mut [u8; CD_SECTOR_RAW_SIZE], lba: u32) {
+    out_sector[0..12].copy_from_slice(&CD_SYNC_HEADER);
+    let total_f = lba + 150;
+    let m = total_f / 75 / 60;
+    let s = (total_f / 75) % 60;
+    let f = total_f % 75;
+    out_sector[12] = (((m / 10) << 4) | (m % 10)) as u8;
+    out_sector[13] = (((s / 10) << 4) | (s % 10)) as u8;
+    out_sector[14] = (((f / 10) << 4) | (f % 10)) as u8;
+    out_sector[15] = 2; // Mode 2
+}
+
+fn synthesize_cooked_mode2_form1_header(out_sector: &mut [u8; CD_SECTOR_RAW_SIZE], lba: u32) {
+    synthesize_mode2_sync_and_msf(out_sector, lba);
+    // CDIC::is_mode2_sector_selected reads out_sector[20..24] (second subheader copy) and requires
+    // (submode & (0x40 | 0x20 | 0x08 | 0x04 | 0x02)) != 0. Mode 2 Form 1 Data|EOR = 0x09 (0x89 with EOF on VD terminator).
+    let is_vd_term = out_sector[24] == 0xFF
+        && (&out_sector[25..30] == b"CD-I " || &out_sector[25..30] == b"CD001");
+    let submode = if is_vd_term { 0x89 } else { 0x09 };
+    let subhdr = [0x00, 0x00, submode, 0x00];
+    out_sector[16..20].copy_from_slice(&subhdr);
+    out_sector[20..24].copy_from_slice(&subhdr);
 }
 
 fn parse_msf(s: &str) -> Option<u32> {
@@ -263,7 +350,15 @@ fn parse_cue_sheet(content: &str) -> (Vec<String>, Vec<CueTrackDef>) {
                 let tnum: u8 = parts[1].parse().unwrap_or(1);
                 let mode = parts[2].to_uppercase();
                 let control = if mode.starts_with("AUDIO") { 0x01 } else { 0x41 };
-                let sector_size = if mode.contains("2048") { 2048 } else { CD_SECTOR_RAW_SIZE };
+                let sector_size = if mode.contains("2048") {
+                    2048
+                } else if mode.contains("2336") {
+                    2336
+                } else if mode.contains("2448") {
+                    2448
+                } else {
+                    CD_SECTOR_RAW_SIZE
+                };
                 let fidx = current_file_idx.unwrap_or(0);
                 parsed_tracks.push(CueTrackDef {
                     num: tnum,
@@ -540,6 +635,8 @@ impl CdRom {
                 volume_id: String::new(),
                 volume_set: String::new(),
                 publisher: String::new(),
+                preparer: String::new(),
+                disc_ntsc_hint: None,
             };
             cdrom.detect_disc_type();
             return Ok(cdrom);
@@ -633,13 +730,15 @@ impl CdRom {
                 volume_id: String::new(),
                 volume_set: String::new(),
                 publisher: String::new(),
+                preparer: String::new(),
+                disc_ntsc_hint: None,
             };
             cdrom.detect_disc_type();
             Ok(cdrom)
         } else {
-            let file = File::open(path_ref)?;
+            let mut file = File::open(path_ref)?;
             let file_size = file.metadata()?.len();
-            let sector_size = if ext == "iso" { 2048 } else { CD_SECTOR_RAW_SIZE };
+            let sector_size = detect_raw_sector_size(&mut file, file_size, &ext);
             let total_sectors = (file_size / sector_size as u64) as u32;
 
             info!(
@@ -671,6 +770,8 @@ impl CdRom {
                 volume_id: String::new(),
                 volume_set: String::new(),
                 publisher: String::new(),
+                preparer: String::new(),
+                disc_ntsc_hint: None,
             };
             cdrom.detect_disc_type();
             Ok(cdrom)
@@ -828,6 +929,8 @@ impl CdRom {
                 volume_id: String::new(),
                 volume_set: String::new(),
                 publisher: String::new(),
+                preparer: String::new(),
+                disc_ntsc_hint: None,
             };
 
             cdrom.detect_disc_type();
@@ -855,6 +958,8 @@ impl CdRom {
             volume_id: String::new(),
             volume_set: String::new(),
             publisher: String::new(),
+            preparer: String::new(),
+            disc_ntsc_hint: None,
         }
     }
 
@@ -869,10 +974,16 @@ impl CdRom {
                 }
                 maybe_descramble_sector(&mut s16);
             }
+            let trim_pvd = |s: &[u8]| {
+                String::from_utf8_lossy(s)
+                    .trim_matches(|c: char| c == '\0' || c.is_whitespace())
+                    .to_string()
+            };
             let sys_id = &s16[24 + 8..24 + 40];
-            self.volume_id = String::from_utf8_lossy(&s16[24 + 40..24 + 72]).trim().to_string();
-            self.volume_set = String::from_utf8_lossy(&s16[24 + 318..24 + 446]).trim().to_string();
-            self.publisher = String::from_utf8_lossy(&s16[24 + 446..24 + 574]).trim().to_string();
+            self.volume_id = trim_pvd(&s16[24 + 40..24 + 72]);
+            self.volume_set = trim_pvd(&s16[24 + 190..24 + 318]);
+            self.publisher = trim_pvd(&s16[24 + 318..24 + 446]);
+            self.preparer = trim_pvd(&s16[24 + 446..24 + 574]);
             if sys_id.starts_with(b"CD-RTOS CD-BRIDGE") {
                 info!("CD-ROM: Riconosciuto disco CD-RTOS CD-BRIDGE (Video CD / White Book), disc_type = 0x20");
                 self.disc_type = 0x20;
@@ -888,31 +999,125 @@ impl CdRom {
                 info!("CD-ROM: Disc system ID: {:?}, disc_type = 0x10, volume = {:?}", String::from_utf8_lossy(sys_id).trim(), self.volume_id);
                 self.disc_type = 0x10;
             }
+            self.disc_ntsc_hint = self.probe_mpeg_ntsc().or_else(|| self.probe_pvd_ntsc());
         } else {
             let only_audio = self.tracks.iter().all(|t| (t.control & 0x40) == 0);
             if only_audio && !self.tracks.is_empty() {
                 info!("CD-ROM: Riconosciuto disco CD-DA Audio Red Book, disc_type = 0x00");
                 self.disc_type = 0x00;
             }
+            self.disc_ntsc_hint = None;
         }
     }
 
-    /// Evaluates whether this disc should run in NTSC (60 Hz) mode based on filename and Sector 16 metadata.
-    pub fn is_ntsc_hint(&self, disc_name: &str) -> Option<bool> {
-        let name_upper = disc_name.to_uppercase();
-        if name_upper.contains("(USA)") || name_upper.contains("(JAPAN)") || name_upper.contains("(US)") || name_upper.contains("NTSC") {
+    fn probe_mpeg_ntsc(&mut self) -> Option<bool> {
+        let mut ranges: [(u32, u32); 2] = [(0, 0), (18, 320.min(self.total_sectors))];
+        if self.disc_type == 0x20 && self.tracks.len() >= 2 {
+            let s = self.tracks[1].start_lba;
+            ranges[0] = (s, s.saturating_add(90).min(self.total_sectors));
+        }
+        let mut sec = [0u8; CD_SECTOR_RAW_SIZE];
+        for (start, end) in ranges {
+            if start >= end {
+                continue;
+            }
+            for lba in start..end {
+                let is_audio_track = self.track_at_lba(lba).is_some_and(|t| (t.control & 0x40) == 0);
+                if is_audio_track && self.disc_type != 0x00 {
+                    continue;
+                }
+                if !self.read_sector(lba, &mut sec) {
+                    continue;
+                }
+                let submode = sec[18] | sec[22];
+                if self.disc_type != 0x20 && (submode & 0x62) == 0 {
+                    continue;
+                }
+                for w in sec[24..2348].windows(8) {
+                    if w[0] == 0x00 && w[1] == 0x00 && w[2] == 0x01 && w[3] == 0xB3 {
+                        let width = ((w[4] as u16) << 4) | ((w[5] as u16) >> 4);
+                        let height = (((w[5] & 0x0F) as u16) << 8) | (w[6] as u16);
+                        let par = w[7] >> 4;
+                        let frc = w[7] & 0x0F;
+                        if (160..=768).contains(&width)
+                            && (120..=576).contains(&height)
+                            && (1..=14).contains(&par)
+                            && (1..=8).contains(&frc)
+                        {
+                            if frc == 3 || height == 288 || height == 576 {
+                                return Some(false);
+                            }
+                            if matches!(frc, 1 | 4 | 5) || height == 240 || height == 480 {
+                                return Some(true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn probe_pvd_ntsc(&self) -> Option<bool> {
+        let meta = format!("{} {}", self.publisher.to_uppercase(), self.preparer.to_uppercase());
+        if ["PHILIPS POV", "PIMA", "INTERACTIVE MEDIA OF AMERICA", "AMERICAN INTERACTIVE", "LOS ANGELES"]
+            .iter()
+            .any(|tag| meta.contains(tag))
+        {
             return Some(true);
         }
-        if name_upper.contains("(EUROPE)") || name_upper.contains("(PAL)") || name_upper.contains("(GERMANY)")
-            || name_upper.contains("(FRANCE)") || name_upper.contains("(UK)") || name_upper.contains("(ITALY)")
-            || name_upper.contains("(SPAIN)") || name_upper.contains("(NETHERLANDS)") {
+        if ["PIMI", "PIME", "PIMF", "INTERACTIVE MEDIA INTERNATIONAL", "US GOLD LTD", "INFOGRAMES"]
+            .iter()
+            .any(|tag| meta.contains(tag))
+        {
+            return Some(false);
+        }
+        None
+    }
+
+    /// Evaluates whether this disc should run in NTSC (60 Hz) mode based on filename and on-disc metadata.
+    pub fn is_ntsc_hint(&self, disc_name: &str) -> Option<bool> {
+        let name_upper = disc_name.to_uppercase();
+        if self.disc_type == 0x20 {
+            if let Some(ntsc) = self.disc_ntsc_hint {
+                return Some(ntsc);
+            }
+            if name_upper.contains("NTSC") {
+                return Some(true);
+            }
+            if name_upper.contains("(PAL)") {
+                return Some(false);
+            }
+            return None;
+        }
+        if name_upper.contains("(USA)")
+            || name_upper.contains("[USA]")
+            || name_upper.contains("(JAPAN)")
+            || name_upper.contains("(JPN)")
+            || name_upper.contains("(US)")
+            || name_upper.contains("NTSC")
+        {
+            return Some(true);
+        }
+        if name_upper.contains("(EUROPE)")
+            || name_upper.contains("(EU)")
+            || name_upper.contains("[EU]")
+            || name_upper.contains("(EUR)")
+            || name_upper.contains("(PAL)")
+            || name_upper.contains("(GERMANY)")
+            || name_upper.contains("(FRANCE)")
+            || name_upper.contains("(UK)")
+            || name_upper.contains("(ITALY)")
+            || name_upper.contains("(SPAIN)")
+            || name_upper.contains("(NETHERLANDS)")
+        {
             return Some(false);
         }
         let vol_upper = self.volume_id.to_uppercase();
         if vol_upper.contains("EARTH COMMAND") {
             return Some(true);
         }
-        None
+        self.disc_ntsc_hint
     }
 
     pub fn read_sector(&mut self, lba: u32, out_sector: &mut [u8; CD_SECTOR_RAW_SIZE]) -> bool {
@@ -997,8 +1202,20 @@ impl CdRom {
                     if file.seek(SeekFrom::Start(offset)).is_err() {
                         return false;
                     }
-                    if track.sector_size == CD_SECTOR_RAW_SIZE {
-                        file.read_exact(out_sector).is_ok()
+                    if track.sector_size == CD_SECTOR_RAW_SIZE || track.sector_size == CD_FRAME_SIZE {
+                        if file.read_exact(out_sector).is_err() {
+                            return false;
+                        }
+                        if out_sector[0..12] == CD_SWAPPED_SYNC_HEADER {
+                            for pair in out_sector.chunks_exact_mut(2) {
+                                pair.swap(0, 1);
+                            }
+                        }
+                        true
+                    } else if track.sector_size == 2336 {
+                        out_sector.fill(0);
+                        synthesize_mode2_sync_and_msf(out_sector, lba);
+                        file.read_exact(&mut out_sector[16..CD_SECTOR_RAW_SIZE]).is_ok()
                     } else {
                         out_sector.fill(0);
                         let mut data = [0u8; 2048];
@@ -1006,6 +1223,7 @@ impl CdRom {
                             return false;
                         }
                         out_sector[24..24 + 2048].copy_from_slice(&data);
+                        synthesize_cooked_mode2_form1_header(out_sector, lba);
                         true
                     }
                 } else {
@@ -1072,17 +1290,7 @@ impl CdRom {
                             )
                         };
                         if read_ok != 0 && bytes_read == 2048 {
-                            // Synthesize standard Mode 2 sync header
-                            out_sector[0] = 0x00;
-                            out_sector[1..11].fill(0xFF);
-                            out_sector[11] = 0x00;
-                            let m = (lba + 150) / 75 / 60;
-                            let s = ((lba + 150) / 75) % 60;
-                            let f = (lba + 150) % 75;
-                            out_sector[12] = ((m / 10) << 4 | (m % 10)) as u8;
-                            out_sector[13] = ((s / 10) << 4 | (s % 10)) as u8;
-                            out_sector[14] = ((f / 10) << 4 | (f % 10)) as u8;
-                            out_sector[15] = 2; // Mode 2
+                            synthesize_cooked_mode2_form1_header(out_sector, lba);
                             true
                         } else {
                             error!("CD-ROM Fisico: Fallita lettura settore LBA {}", lba);
@@ -1297,5 +1505,110 @@ FILE \"t3.bin\" BINARY
         assert!(tracks[0].contains_lba(16));
         assert!(tracks[0].contains_lba(69_150));
         assert!(CdRom::is_cdi_ready_layout(&tracks));
+    }
+
+    #[test]
+    fn test_iso_sector_geometry_autodetect_and_cdic_selection() {
+        let dir = std::env::temp_dir().join(format!("opencdi-iso-geom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let make_pvd = |pub_tag: &[u8], prep_tag: &[u8]| {
+            let mut pvd = vec![0u8; 2048];
+            pvd[0] = 0x01;
+            pvd[1..6].copy_from_slice(b"CD-I ");
+            pvd[8..15].copy_from_slice(b"CD-RTOS");
+            pvd[40..51].copy_from_slice(b"HOTEL_MARIO");
+            pvd[190..197].copy_from_slice(b"VOL_SET");
+            pvd[318..318 + pub_tag.len()].copy_from_slice(pub_tag);
+            pvd[446..446 + prep_tag.len()].copy_from_slice(prep_tag);
+            pvd
+        };
+        let make_vd_term = || {
+            let mut term = vec![0u8; 2048];
+            term[0] = 0xFF;
+            term[1..6].copy_from_slice(b"CD-I ");
+            term
+        };
+
+        // 1. Cooked 2048-byte .iso (e.g. IsoBuster / mounted virtual drive extraction)
+        let iso2048 = dir.join("mario_2048.iso");
+        let mut buf2048 = vec![0u8; 20 * 2048];
+        buf2048[16 * 2048..17 * 2048].copy_from_slice(&make_pvd(b"PIMA", b"PHILIPS POV"));
+        buf2048[17 * 2048..18 * 2048].copy_from_slice(&make_vd_term());
+        buf2048[18 * 2048..18 * 2048 + 4].copy_from_slice(b"DIR!");
+        std::fs::write(&iso2048, &buf2048).unwrap();
+        let mut cd2048 = CdRom::open(&iso2048).unwrap();
+        assert_eq!(cd2048.tracks[0].sector_size, 2048);
+        assert_eq!(cd2048.volume_id, "HOTEL_MARIO");
+        assert_eq!(cd2048.volume_set, "VOL_SET");
+        assert_eq!(cd2048.publisher, "PIMA");
+        assert_eq!(cd2048.preparer, "PHILIPS POV");
+        assert_eq!(cd2048.is_ntsc_hint("mario_2048"), Some(true));
+
+        let mut cdic = crate::cdic::Cdic::new();
+        cdic.channel = 0xFFFF_FFFF;
+        cdic.audio_channel = 0xFFFF;
+        let mut sec = [0u8; CD_SECTOR_RAW_SIZE];
+        assert!(cd2048.read_sector(16, &mut sec));
+        assert_eq!(sec[18], 0x09);
+        assert_eq!(sec[22], 0x09);
+        assert!(cdic.is_mode2_sector_selected(&sec));
+        assert!(cd2048.read_sector(17, &mut sec));
+        assert_eq!(sec[22], 0x89);
+        assert!(cdic.is_mode2_sector_selected(&sec));
+        assert!(cd2048.read_sector(18, &mut sec));
+        assert_eq!(&sec[24..28], b"DIR!");
+        assert!(cdic.is_mode2_sector_selected(&sec));
+
+        // 2. Raw 2352-byte .iso (TOSEC / CD-i Emu)
+        let iso2352 = dir.join("hotel_mario.iso");
+        let mut buf2352 = vec![0u8; 20 * 2352];
+        for lba in 0..20usize {
+            let base = lba * 2352;
+            buf2352[base..base + 12].copy_from_slice(&CD_SYNC_HEADER);
+            buf2352[base + 15] = 2;
+            buf2352[base + 18] = 0x08;
+            buf2352[base + 22] = 0x08;
+        }
+        buf2352[16 * 2352 + 24..16 * 2352 + 2072].copy_from_slice(&make_pvd(b"PIMI", b""));
+        // Inject PAL 25 Hz MPEG-1 sequence header on Form 2 video sector LBA 19
+        buf2352[19 * 2352 + 18] = 0x62;
+        buf2352[19 * 2352 + 22] = 0x62;
+        // 352x288 @ 25 Hz (frc=3), PAR=8
+        buf2352[19 * 2352 + 32..19 * 2352 + 40].copy_from_slice(&[0x00, 0x00, 0x01, 0xB3, 0x16, 0x01, 0x20, 0x83]);
+        std::fs::write(&iso2352, &buf2352).unwrap();
+        let cd2352 = CdRom::open(&iso2352).unwrap();
+        assert_eq!(cd2352.tracks[0].sector_size, 2352);
+        assert_eq!(cd2352.is_ntsc_hint("hotel_mario"), Some(false));
+
+        // 3. 2336-byte Mode 2 .iso (subheader + 2328 payload)
+        let iso2336 = dir.join("mario_2336.iso");
+        let mut buf2336 = vec![0u8; 20 * 2336];
+        buf2336[16 * 2336 + 2] = 0x09;
+        buf2336[16 * 2336 + 6] = 0x09;
+        buf2336[16 * 2336 + 8..16 * 2336 + 2056].copy_from_slice(&make_pvd(b"PIMA", b""));
+        std::fs::write(&iso2336, &buf2336).unwrap();
+        let mut cd2336 = CdRom::open(&iso2336).unwrap();
+        assert_eq!(cd2336.tracks[0].sector_size, 2336);
+        assert!(cd2336.read_sector(16, &mut sec));
+        assert_eq!(sec[0..12], CD_SYNC_HEADER);
+        assert_eq!(sec[22], 0x09);
+        assert!(cdic.is_mode2_sector_selected(&sec));
+
+        // 4. 2448-byte raw+subchannel .iso
+        let iso2448 = dir.join("mario_2448.iso");
+        let mut buf2448 = vec![0u8; 20 * 2448];
+        for lba in 0..20usize {
+            let base = lba * 2448;
+            buf2448[base..base + 12].copy_from_slice(&CD_SYNC_HEADER);
+            buf2448[base + 15] = 2;
+        }
+        buf2448[16 * 2448 + 24..16 * 2448 + 2072].copy_from_slice(&make_pvd(b"PIMI", b""));
+        std::fs::write(&iso2448, &buf2448).unwrap();
+        let cd2448 = CdRom::open(&iso2448).unwrap();
+        assert_eq!(cd2448.tracks[0].sector_size, 2448);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
